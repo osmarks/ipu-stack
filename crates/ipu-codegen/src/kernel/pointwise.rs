@@ -2,16 +2,17 @@
 //! broadcast repetition and supported output epilogues are explicit here.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     let inputs = match run.kernel {
-        TileKernelSpec::Gelu => 1,
-        TileKernelSpec::Add | TileKernelSpec::BiasGelu => 2,
+        MidOperationKind::Gelu => 1,
+        MidOperationKind::Add | MidOperationKind::BiasGelu => 2,
         _ => return Err(KernelAbiError::RequirementMismatch),
     };
     run.check_arity(inputs, 1)?;
     if let Some(mut arguments) = output::fp8_arguments(run)? {
-        let symbol = if run.kernel == TileKernelSpec::BiasGelu {
+        let symbol = if run.kernel == MidOperationKind::BiasGelu {
             if element_count(&run.inputs[1].extents)? != input_matrix_extent(run, true, true)? {
                 return Err(KernelAbiError::RequirementMismatch);
             }
@@ -25,7 +26,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     }
     let count = element_count(&run.outputs[0].extents)?;
     match run.kernel {
-        TileKernelSpec::Gelu => {
+        MidOperationKind::Gelu => {
             let symbol = gelu_symbol(&run.requirements)
                 .ok_or_else(|| KernelAbiError::Unavailable(run.kernel.clone()))?;
             if !count.is_multiple_of(2) {
@@ -37,7 +38,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
             }
             Ok(KernelCall::exact(symbol, vec![count]))
         }
-        TileKernelSpec::BiasGelu => {
+        MidOperationKind::BiasGelu => {
             let width = output::f16_row_width(run)?;
             if run.inputs[0].extents != run.outputs[0].extents
                 || element_count(&run.inputs[1].extents)? != width
@@ -49,7 +50,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
                 vec![count / width, width],
             ))
         }
-        TileKernelSpec::Add => {
+        MidOperationKind::Add => {
             if run.requirements.outputs[0].format.precision != Precision::F16 {
                 return Err(KernelAbiError::Unavailable(run.kernel.clone()));
             }

@@ -1,9 +1,8 @@
 //! Pack smaller panels on additional owners, then transfer packed storage.
 
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing,
+    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -138,14 +137,12 @@ fn distribute_region(
                     inputs: vec![logical],
                     results: vec![packed],
                     source: operation.source,
-                    kind: MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Rearrange {
-                            from: row_major.format.layout,
-                            to: layout,
-                        },
-                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                        output_aliases: Vec::new(),
-                    }),
+                    kind: MidOperationKind::Rearrange {
+                        from: row_major.format.layout,
+                        to: layout,
+                    },
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                    output_aliases: Vec::new(),
                 };
                 let transfer = MidOperation {
                     inputs: vec![packed],
@@ -157,6 +154,8 @@ fn distribute_region(
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 };
                 operation.results = vec![logical];
                 result.extend([operation, pack, transfer]);
@@ -249,6 +248,8 @@ mod tests {
                         },
                         reuse_local: true,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 }],
                 ..MidProgram::default()
             };
@@ -264,7 +265,7 @@ mod tests {
                 );
                 let mut packs = 0;
                 for run in &low.kernel_runs {
-                    if let TileKernelSpec::Rearrange { from, to } = &run.kernel {
+                    if let MidOperationKind::Rearrange { from, to } = &run.kernel {
                         assert_eq!(from.order, ElementOrder::RowMajor);
                         assert!(matches!(
                             to.order,

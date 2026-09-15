@@ -1,6 +1,7 @@
 use super::*;
 use crate::kernel::abi::COPY_U64_SYMBOL;
-use crate::mid::Compute;
+use crate::mid::MidOperationKind;
+
 use crate::*;
 
 fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
@@ -60,13 +61,17 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                         source: None,
                         inputs: vec![id(4)],
                         results: vec![id(5)],
-                        kind: MidOperationKind::Compute(Compute::Sum {
+                        kind: MidOperationKind::Sum {
                             axis: 0,
                             staging: ReductionStaging::Complete,
-                        }),
+                        },
+                        operands: Vec::new(),
+                        output_aliases: Vec::new(),
                     }],
                 },
             }),
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }],
         ..MidProgram::default()
     };
@@ -301,7 +306,7 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         shard,
         extents: shards[shard.index() as usize].extents.clone(),
     };
-    let kernel = TileKernelSpec::Gelu;
+    let kernel = MidOperationKind::Gelu;
     let run = KernelRun::new(
         low.repeat_runs[0].provenance,
         kernel.clone(),

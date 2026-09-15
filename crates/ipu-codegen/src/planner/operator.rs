@@ -1,7 +1,8 @@
 //! Planner family choices, dispatch parameters and operand/result requirements.
 
 use crate::graph::{AttentionOptions, GemmOptions};
-use crate::kernel::{AccumulationPrecision, TileKernelSpec};
+use crate::kernel::AccumulationPrecision;
+use crate::mid::MidOperationKind;
 use crate::mid::ReductionStaging;
 use crate::planner::catalogue::blocked_gemm_dispatch;
 use crate::tensor::{
@@ -243,15 +244,15 @@ pub(super) fn default_dispatch(operator: OperatorFamily) -> OperatorDispatch {
 }
 
 impl OperatorFamily {
-    pub(super) fn local_kernel(self) -> Option<TileKernelSpec> {
+    pub(super) fn local_kernel(self) -> Option<MidOperationKind> {
         Some(match self {
-            Self::LayerNorm => TileKernelSpec::LayerNorm,
-            Self::Gelu => TileKernelSpec::Gelu,
-            Self::Add => TileKernelSpec::Add,
+            Self::LayerNorm => MidOperationKind::LayerNorm,
+            Self::Gelu => MidOperationKind::Gelu,
+            Self::Add => MidOperationKind::Add,
             Self::FlashAttention {
                 options,
                 accumulate,
-            } => TileKernelSpec::FlashAttention {
+            } => MidOperationKind::FlashAttention {
                 options,
                 accumulate,
             },

@@ -1,9 +1,10 @@
 //! Shared graph queries and edit application for mid transformations.
 use crate::estimate::operation_cycles;
 use crate::graph::OperationId;
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
+
 use crate::low::CopyPolicy;
-use crate::mid::{Compute, MidOperation, MidOperationKind, MidValue, MidValueId, OperandIndexing};
+use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::Precision;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,16 +56,17 @@ pub(super) fn is_single_use(
 
 /// Recognize an unfused, whole-value FP16-to-FP8 local conversion.
 pub(crate) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidValueId, MidValueId)> {
-    let local = match &op.kind {
-        MidOperationKind::Compute(Compute::Kernel {
-            kernel:
-                TileKernelSpec::Cast {
+    let local = match op {
+        MidOperation {
+            kind:
+                MidOperationKind::Cast {
                     from: Precision::F16,
                     to: Precision::F8F143 { .. },
                 },
             operands,
             output_aliases,
-        }) => {
+            ..
+        } => {
             operands.len() == 1
                 && operands[0] == (OperandIndexing::Elementwise { result: 0 })
                 && output_aliases.is_empty()

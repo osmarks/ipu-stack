@@ -1,37 +1,29 @@
 //! Preserve live residuals while fusing their addition with local statistics.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
+
 use crate::low::CopyPolicy;
-use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
-    OperandIndexing,
-};
+use crate::mid::{CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::{ElementOrder, Padding, Precision, TensorAxis, TensorType};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn fuse(
+pub(super) fn run(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> bool {
     let mut changed = false;
-    for operation in &mut *operations {
-        if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
-            changed |= fuse(&mut repeat.body.operations, values, &repeat.body.yields);
-        }
-    }
     let mut removed = BTreeSet::new();
     let mut preparation = BTreeMap::new();
     for index in 0..operations.len() {
         let current = &operations[index];
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel, operands, ..
-        }) = &current.kind
-        else {
-            continue;
-        };
-        let ordinary = *kernel == TileKernelSpec::LayerNorm;
-        if (!ordinary && *kernel != TileKernelSpec::LayerNormMoments)
+        let crate::MidOperation {
+            kind: kernel,
+            operands,
+            ..
+        } = &current;
+        let ordinary = *kernel == MidOperationKind::LayerNorm;
+        if (!ordinary && *kernel != MidOperationKind::LayerNormMoments)
             || operands.iter().any(|indexing| {
                 *indexing
                     != if ordinary {
@@ -55,11 +47,12 @@ pub(super) fn fuse(
             continue;
         }
         let add = &operations[previous];
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Add,
+        let crate::MidOperation {
+            kind: MidOperationKind::Add,
             operands,
             output_aliases,
-        }) = &add.kind
+            ..
+        } = &add
         else {
             continue;
         };
@@ -126,14 +119,12 @@ pub(super) fn fuse(
         let fused = MidOperation {
             inputs: add.inputs.clone(),
             results: vec![stats, sum],
-            kind: MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::AddLayerNormMoments,
-                operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
-                output_aliases: output_aliases
-                    .iter()
-                    .map(|&(_, input)| (1, input))
-                    .collect(),
-            }),
+            kind: MidOperationKind::AddLayerNormMoments,
+            operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
+            output_aliases: output_aliases
+                .iter()
+                .map(|&(_, input)| (1, input))
+                .collect(),
             ..*add
         };
         let mut apply = current.clone();
@@ -141,18 +132,16 @@ pub(super) fn fuse(
             apply.inputs[0] = if redistributed { input } else { sum };
             apply.inputs.truncate(3);
             apply.inputs.push(stats);
-            apply.kind = MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::LayerNormApply {
-                    parts: statistic_parts,
-                },
-                operands: vec![
-                    OperandIndexing::Elementwise { result: 0 },
-                    OperandIndexing::Elementwise { result: 0 },
-                    OperandIndexing::Elementwise { result: 0 },
-                    OperandIndexing::local(),
-                ],
-                output_aliases: Vec::new(),
-            });
+            apply.kind = MidOperationKind::LayerNormApply {
+                parts: statistic_parts,
+            };
+            apply.operands = vec![
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::local(),
+            ];
+            apply.output_aliases = Vec::new();
         }
         if let Some(value) = stats_value {
             values.push(value);
@@ -184,6 +173,8 @@ pub(super) fn fuse(
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             };
             values.push(MidValue {
                 id,
@@ -317,17 +308,12 @@ mod tests {
             .with_automatic_input(gamma, Precision::F16)
             .with_automatic_input(beta, Precision::F16);
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let fused = mid
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        let fused = mid.with_fusions().unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         assert!(
             low.kernel_runs
                 .iter()
-                .any(|run| run.kernel == TileKernelSpec::AddLayerNormMoments)
+                .any(|run| run.kernel == MidOperationKind::AddLayerNormMoments)
         );
         assert!(!low.repeat_runs.is_empty());
         let placement = crate::place(&low).unwrap();
@@ -370,12 +356,12 @@ mod tests {
         }
         for (kernel, inputs, result) in [
             (
-                TileKernelSpec::Add,
+                MidOperationKind::Add,
                 vec![MidValueId(0), MidValueId(1)],
                 MidValueId(4),
             ),
             (
-                TileKernelSpec::LayerNorm,
+                MidOperationKind::LayerNorm,
                 vec![MidValueId(4), MidValueId(2), MidValueId(3)],
                 MidValueId(5),
             ),
@@ -383,21 +369,14 @@ mod tests {
             program.operations.push(MidOperation {
                 source: None,
                 results: vec![result],
-                kind: MidOperationKind::Compute(Compute::Kernel {
-                    kernel,
-                    operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
-                    output_aliases: Vec::new(),
-                }),
+                kind: kernel,
+                operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                 inputs,
+                output_aliases: Vec::new(),
             });
         }
         program.outputs = vec![MidValueId(4), MidValueId(5)];
-        let fused = program
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        let fused = program.with_fusions().unwrap();
         assert_eq!(fused.outputs, program.outputs);
         assert_eq!(
             fused.operations[0].results,
@@ -406,7 +385,7 @@ mod tests {
         assert_eq!(fused.operations[1].inputs[0], MidValueId(4));
         let mut expanded = (*crate::expand_tiles(&fused).unwrap()).clone();
         for run in &mut expanded.kernel_runs {
-            if run.kernel == TileKernelSpec::AddLayerNormMoments {
+            if run.kernel == MidOperationKind::AddLayerNormMoments {
                 std::sync::Arc::make_mut(&mut run.metadata)
                     .requirements
                     .distinct_elements
@@ -430,7 +409,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            if run.kernel == TileKernelSpec::AddLayerNormMoments {
+            if run.kernel == MidOperationKind::AddLayerNormMoments {
                 sums += 1;
                 assert_eq!(run.outputs.len(), 2);
                 let mut occupied = BTreeSet::new();
@@ -485,18 +464,15 @@ mod tests {
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             });
             *operand = value.id;
             program.values.push(value);
         }
         let norm_input = norm.inputs[0];
         program.operations.push(norm);
-        let fused = program
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        let fused = program.with_fusions().unwrap();
         assert_eq!(fused.operations[0].results[1], MidValueId(4));
         assert_eq!(fused.operations.last().unwrap().inputs[0], norm_input);
         assert_eq!(fused.outputs, program.outputs);
@@ -508,13 +484,13 @@ mod tests {
             graph
                 .kernel_runs
                 .iter()
-                .any(|run| run.kernel == TileKernelSpec::AddLayerNormMoments)
+                .any(|run| run.kernel == MidOperationKind::AddLayerNormMoments)
         );
         assert!(
             graph
                 .kernel_runs
                 .iter()
-                .any(|run| run.kernel == TileKernelSpec::LayerNormApply { parts: 1 })
+                .any(|run| run.kernel == MidOperationKind::LayerNormApply { parts: 1 })
         );
 
         // The add owns two feature partitions; the apply owns complete rows.
@@ -529,10 +505,7 @@ mod tests {
             program.values[id].tensor_type.format.layout = feature_layout.clone();
         }
         let fused = program
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
+            .with_fusions()
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         let placement = crate::place(&low).unwrap();
@@ -548,7 +521,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            if run.kernel == (TileKernelSpec::LayerNormApply { parts: 2 }) {
+            if run.kernel == (MidOperationKind::LayerNormApply { parts: 2 }) {
                 assert_eq!(call.arguments, vec![2, 9216, 2]);
                 applied += 1;
             }

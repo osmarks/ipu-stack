@@ -1,6 +1,7 @@
 //! Output epilogues implemented by kernel families. Mid rewrites use these
 //! contracts to move computation and its broadcast operands together.
 use super::*;
+use crate::mid::MidOperationKind;
 
 pub(crate) struct OutputCapability {
     /// Operand zero follows the output coordinates; the remaining operands
@@ -12,7 +13,7 @@ pub(crate) struct OutputCapability {
     pub column_multiple: u32,
 }
 
-impl TileKernelSpec {
+impl MidOperationKind {
     pub(crate) fn output_capability(&self, precision: Precision) -> Option<OutputCapability> {
         if !matches!(precision, Precision::F8F143 { .. }) {
             return None;

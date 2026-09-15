@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ShardView;
+use crate::mid::MidOperationKind;
 
 /// One contiguous workspace: optional field/component axes surround the
 /// flattened query rows. The same declaration constructs mid tensors and checks
@@ -105,7 +106,7 @@ pub(crate) fn softmax_workspaces(
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     let output = run.requirements.outputs[0].format.precision;
     let (implementation, arguments) = match run.kernel {
-        TileKernelSpec::FlashAttention { .. } => {
+        MidOperationKind::FlashAttention { .. } => {
             run.check_arity(3, 1)?;
             if output != Precision::F32
                 || run
@@ -121,7 +122,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
                 Vec::new(),
             )
         }
-        TileKernelSpec::AttentionSoftmax {
+        MidOperationKind::AttentionSoftmax {
             head_dimension,
             key_columns,
             padded_key_columns,
@@ -165,7 +166,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
                 ],
             )
         }
-        TileKernelSpec::AttentionMerge {
+        MidOperationKind::AttentionMerge {
             value_dimension,
             padded_value_dimension,
             initial,
@@ -238,7 +239,7 @@ pub(crate) struct AttentionKernelShape {
 }
 
 pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
-    let TileKernelSpec::FlashAttention {
+    let MidOperationKind::FlashAttention {
         options,
         accumulate,
     } = &run.kernel

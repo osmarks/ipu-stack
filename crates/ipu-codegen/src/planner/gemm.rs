@@ -2,7 +2,8 @@
 
 use super::fragments::{FragmentBuilder, project_grid};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode};
-use crate::mid::{Compute, MidOperationKind, MidValueId, Product, ProductAxes, ReductionStaging};
+use crate::mid::MidOperationKind;
+use crate::mid::{MidValueId, Product, ProductAxes, ReductionStaging};
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperatorFamily, OperatorPlan,
     ProductGrid,
@@ -136,16 +137,17 @@ impl FragmentBuilder {
                 let products = self.compute(
                     vec![left, weights],
                     [(partials, None)],
-                    Compute::Product(product(GemmKernelMode::Initialize)),
+                    MidOperationKind::Product(product(GemmKernelMode::Initialize)),
+                    Vec::new(),
                 )[0];
                 Some(
                     self.emit(
                         vec![products],
                         [output.clone()],
-                        MidOperationKind::Compute(Compute::Sum {
+                        MidOperationKind::Sum {
                             axis: 0,
                             staging: reduction_staging,
-                        }),
+                        },
                     )[0],
                 )
             }
@@ -178,7 +180,8 @@ impl FragmentBuilder {
                         self.compute(
                             vec![left, right],
                             [(output.clone(), None)],
-                            Compute::Product(product(GemmKernelMode::Initialize)),
+                            MidOperationKind::Product(product(GemmKernelMode::Initialize)),
+                            Vec::new(),
                         )[0],
                     );
                 }
@@ -220,11 +223,12 @@ impl FragmentBuilder {
                         self.compute(
                             vec![l, r],
                             [(output.clone(), result)],
-                            Compute::Product(product(if result.is_none() {
+                            MidOperationKind::Product(product(if result.is_none() {
                                 GemmKernelMode::Initialize
                             } else {
                                 GemmKernelMode::Accumulate
                             })),
+                            Vec::new(),
                         )[0],
                     );
                 }
@@ -360,7 +364,7 @@ impl FragmentBuilder {
         let result = self.compute(
             vec![l, r],
             [(product, None)],
-            Compute::Product(Product {
+            MidOperationKind::Product(Product {
                 multiply,
                 accumulate: if fp8_scale.is_some() {
                     AccumulationPrecision::F16
@@ -375,6 +379,7 @@ impl FragmentBuilder {
                 operands: Default::default(),
                 output_aliases: Vec::new(),
             }),
+            Vec::new(),
         )[0];
         if grid.inner > 1 {
             let mut reduced = output.clone();
@@ -382,10 +387,10 @@ impl FragmentBuilder {
             let sum = self.emit(
                 vec![result],
                 [reduced],
-                MidOperationKind::Compute(Compute::Sum {
+                MidOperationKind::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                }),
+                },
             )[0];
             Some(self.copy(sum, output.clone(), vec![]))
         } else {

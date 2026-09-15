@@ -2,45 +2,42 @@
 //! resident operands here; products and sums own their local construction.
 
 use super::*;
+use crate::mid::MidOperationKind;
 use crate::tensor::Broadcast;
-use crate::{Compute, OperandIndexing, OperandWindow};
+use crate::{OperandIndexing, OperandWindow};
 
 /// Accesses that need a canonical allocation before family construction.
 /// Sum erases a contributor axis by reinterpreting whole allocations; an
 /// in-place result likewise cannot inherit a borrowed slice's backing stride.
 pub(super) fn allocation_inputs<'a>(
-    compute: &'a Compute,
-    inputs: &'a [MidValueId],
+    operation: &'a MidOperation,
 ) -> impl Iterator<Item = &'a MidValueId> {
-    let sum_input = matches!(compute, Compute::Sum { .. }).then_some(0);
+    let sum_input = matches!(operation.kind, MidOperationKind::Sum { .. }).then_some(0);
     sum_input
         .into_iter()
-        .chain(compute.output_aliases().iter().map(|&(_, input)| input))
-        .filter_map(|index| inputs.get(index))
+        .chain(operation.output_aliases().iter().map(|&(_, input)| input))
+        .filter_map(|index| operation.inputs.get(index))
 }
 
 impl TileGraphBuilder {
     pub(super) fn build_compute(
         &mut self,
         operation: &MidOperation,
-        compute: &Compute,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        match compute {
-            Compute::Product(product) => self.build_product(operation, product, body),
-            Compute::Sum { axis, staging } => {
+        match &operation.kind {
+            MidOperationKind::Product(product) => self.build_product(operation, product, body),
+            MidOperationKind::Sum { axis, staging } => {
                 let mut batch = reduce::SumBatch::default();
                 self.prepare_sum(operation, usize::from(*axis), *staging, &mut batch)?;
                 self.append_sum_batch(batch, operation_provenance(operation), body)
             }
-            Compute::Kernel {
-                kernel,
-                operands,
-                output_aliases,
-            } => {
+            kernel => {
+                let operands = &operation.operands;
+                let output_aliases = &operation.output_aliases;
                 let donate_cast = matches!(
                     kernel,
-                    TileKernelSpec::Cast {
+                    MidOperationKind::Cast {
                         from: Precision::F16,
                         to: Precision::F8F143 { .. }
                     }

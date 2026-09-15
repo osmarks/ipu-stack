@@ -1,39 +1,40 @@
 //! Layer normalization and distributed statistics/apply call contracts.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     let inputs = match run.kernel {
-        TileKernelSpec::LayerNorm => 3,
-        TileKernelSpec::AddLayerNorm | TileKernelSpec::LayerNormApply { .. } => 4,
-        TileKernelSpec::LayerNormMoments => 1,
-        TileKernelSpec::AddLayerNormMoments => 2,
+        MidOperationKind::LayerNorm => 3,
+        MidOperationKind::AddLayerNorm | MidOperationKind::LayerNormApply { .. } => 4,
+        MidOperationKind::LayerNormMoments => 1,
+        MidOperationKind::AddLayerNormMoments => 2,
         _ => return Err(KernelAbiError::RequirementMismatch),
     };
     run.check_arity(
         inputs,
-        1 + usize::from(run.kernel == TileKernelSpec::AddLayerNormMoments),
+        1 + usize::from(run.kernel == MidOperationKind::AddLayerNormMoments),
     )?;
     if let Some(arguments) = output::fp8_arguments(run)? {
         return Ok(KernelCall::exact("layer_norm_f8", arguments));
     }
     if matches!(
         run.kernel,
-        TileKernelSpec::LayerNorm | TileKernelSpec::AddLayerNorm
+        MidOperationKind::LayerNorm | MidOperationKind::AddLayerNorm
     ) {
         if run.requirements.outputs[0].format.precision != Precision::F16 {
             return Err(KernelAbiError::Unavailable(run.kernel.clone()));
         }
         let width = output::f16_row_width(run)?;
         if matrix_extent(&run.outputs[0], false, true)? != width
-            || (run.kernel == TileKernelSpec::AddLayerNorm
+            || (run.kernel == MidOperationKind::AddLayerNorm
                 && (run.inputs[0].extents != run.outputs[0].extents
                     || run.inputs[1].extents != run.outputs[0].extents))
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
         return Ok(KernelCall::exact(
-            if run.kernel == TileKernelSpec::LayerNorm {
+            if run.kernel == MidOperationKind::LayerNorm {
                 "layer_norm_f16"
             } else {
                 "add_layer_norm_f16"
@@ -41,7 +42,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
             vec![element_count(&run.outputs[0].extents)? / width, width],
         ));
     }
-    if run.kernel == TileKernelSpec::AddLayerNormMoments
+    if run.kernel == MidOperationKind::AddLayerNormMoments
         && (run.inputs[0].extents != run.inputs[1].extents
             || run.outputs[1].extents != run.inputs[0].extents
             || run.requirements.outputs[1].format != run.requirements.inputs[0].format
@@ -70,13 +71,13 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
         return Err(KernelAbiError::RequirementMismatch);
     }
     let (symbol, arguments) = match run.kernel {
-        TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
+        MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
             if run.requirements.outputs[0].format.precision != Precision::F32
                 || element_count(&run.outputs[0].extents)? != statistics
             {
                 return Err(KernelAbiError::RequirementMismatch);
             }
-            if run.kernel == TileKernelSpec::LayerNormMoments {
+            if run.kernel == MidOperationKind::LayerNormMoments {
                 (
                     "layer_norm_moments",
                     vec![
@@ -92,7 +93,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
                 )
             }
         }
-        TileKernelSpec::LayerNormApply { parts } => {
+        MidOperationKind::LayerNormApply { parts } => {
             let statistics = statistics
                 .checked_mul(u32::from(parts))
                 .ok_or(KernelAbiError::ElementCountOverflow)?;

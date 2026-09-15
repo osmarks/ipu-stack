@@ -1,6 +1,8 @@
 //! Choose default persistent parameter homes before mid binds operand movement.
 
 use crate::PipelineConfig;
+#[cfg(test)]
+use crate::mid::MidOperationKind;
 use crate::mid::{MidValue, MidValueId};
 use crate::planner::error::LoweringResult;
 #[cfg(test)]
@@ -212,7 +214,7 @@ fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
     use crate::low::default_copy_policy;
-    use crate::mid::{CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram};
+    use crate::mid::{CoordinateMapping, MidInput, MidOperation, MidProgram};
     use crate::tensor::{MemoryClass, Precision, TensorShape};
 
     use super::*;
@@ -272,6 +274,8 @@ mod tests {
                                 &output.format.layout,
                             ),
                         },
+                        operands: Vec::new(),
+                        output_aliases: Vec::new(),
                     }],
                     outputs: vec![MidValueId::from_index(1)],
                     ..Default::default()

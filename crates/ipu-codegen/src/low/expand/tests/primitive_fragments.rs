@@ -1,5 +1,6 @@
 use super::*;
-use crate::mid::Compute;
+use crate::mid::MidOperationKind;
+
 use crate::{GraphInputKind, MidInput, MidValue, OperandIndexing, ValueId};
 
 #[test]
@@ -39,14 +40,12 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     source: None,
                     inputs: vec![input],
                     results: vec![output],
-                    kind: MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Cast {
-                            from: Precision::F32,
-                            to: Precision::F16,
-                        },
-                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                        output_aliases: vec![],
-                    }),
+                    kind: MidOperationKind::Cast {
+                        from: Precision::F32,
+                        to: Precision::F16,
+                    },
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                    output_aliases: vec![],
                 }],
                 ..MidProgram::default()
             };
@@ -82,11 +81,9 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     });
                     norm.operations[0].inputs.push(id);
                 }
-                norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::LayerNorm,
-                    operands: vec![OperandIndexing::local(); 3],
-                    output_aliases: vec![],
-                });
+                norm.operations[0].kind = MidOperationKind::LayerNorm;
+                norm.operations[0].operands = vec![OperandIndexing::local(); 3];
+                norm.operations[0].output_aliases = vec![];
                 let expanded = expand_tiles(&norm, false).unwrap();
                 for run in &expanded.kernel_runs {
                     assert_eq!(run.inputs[0].extents, run.outputs[0].extents);
@@ -100,10 +97,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
 #[test]
 fn reduction_can_place_its_result_outside_the_partial_owners() {
     use crate::graph::{GraphInputKind, ValueId};
-    use crate::mid::{
-        Compute, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-        ReductionStaging,
-    };
+    use crate::mid::{MidInput, MidOperation, MidProgram, MidValue, MidValueId, ReductionStaging};
     use crate::tensor::{AxisTiling, Layout, OwnerMap, Padding, Precision, TensorAxis, TensorType};
     let mut layout = Layout::row_sharded(3);
     layout.tiling.axes = vec![AxisTiling::new(
@@ -143,10 +137,12 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
             source: None,
             inputs: vec![id(0)],
             results: vec![id(1)],
-            kind: MidOperationKind::Compute(Compute::Sum {
+            kind: MidOperationKind::Sum {
                 axis: 0,
                 staging: ReductionStaging::Complete,
-            }),
+            },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }],
         ..MidProgram::default()
     };
@@ -163,7 +159,7 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
         .filter(|run| {
             matches!(
                 run.kernel,
-                crate::kernel::TileKernelSpec::ReductionSum { .. }
+                crate::mid::MidOperationKind::ReductionSum { .. }
             )
         })
         .collect::<Vec<_>>();

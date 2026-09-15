@@ -3,6 +3,7 @@
 //! Geometry helpers describe coverage; explicit policies constrain realization.
 
 use super::*;
+use crate::mid::MidOperationKind;
 use crate::tensor::{BlockMajorOrder, TensorFormat};
 
 /// Work needed to populate ordinary destination blocks at one exchange boundary.
@@ -211,7 +212,7 @@ impl TileGraphBuilder {
             })?;
             let run = self.bind_kernel(
                 provenance,
-                TileKernelSpec::Rearrange { from, to },
+                MidOperationKind::Rearrange { from, to },
                 vec![source_view],
                 vec![self.full_view(staging)],
             )?;
@@ -252,7 +253,7 @@ impl TileGraphBuilder {
             let tile = destination.tile;
             let run = self.bind_kernel(
                 operation_provenance(operation),
-                TileKernelSpec::Rearrange {
+                MidOperationKind::Rearrange {
                     from: source.tensor_type.format.layout.clone(),
                     to: destination.tensor_type.format.layout.clone(),
                 },
@@ -867,7 +868,7 @@ impl TileGraphBuilder {
 struct CopyStaging {
     tensor_type: TensorType,
     extents: Vec<ShardExtent>,
-    kernel: Option<TileKernelSpec>,
+    kernel: Option<MidOperationKind>,
 }
 
 /// Select destination work from measured geometry and the copy's requested
@@ -935,7 +936,7 @@ fn select_destination_packing(
             ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
                 | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
         ))
-    .then(|| TileKernelSpec::Rearrange {
+    .then(|| MidOperationKind::Rearrange {
         from: tensor_type.format.layout.clone(),
         to: destination.format.layout.clone(),
     });

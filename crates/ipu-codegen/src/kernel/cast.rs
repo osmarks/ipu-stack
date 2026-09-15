@@ -3,12 +3,13 @@
 //! whether the extra prefix saves storage belongs to the mid donation rewrite.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 /// Packed FP16-to-FP8 calls carry the readable prefix and physical row bounds used by the
 /// assembly loops, without a separate scalar getter recipe.
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     run.check_arity(1, 1)?;
-    let TileKernelSpec::Cast { from, to } = run.kernel else {
+    let MidOperationKind::Cast { from, to } = run.kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
     let symbol = symbol(from, to).ok_or_else(|| KernelAbiError::Unavailable(run.kernel.clone()))?;

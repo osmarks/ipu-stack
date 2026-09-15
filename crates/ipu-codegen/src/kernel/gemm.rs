@@ -1,10 +1,11 @@
 //! GEMM assembly specializations, paired by physical row count.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     run.check_arity(2, 1)?;
-    let TileKernelSpec::Gemm {
+    let MidOperationKind::Gemm {
         multiply,
         accumulate,
         weights,
@@ -55,7 +56,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
 pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool, KernelAbiError> {
     if !matches!(
         run.kernel,
-        TileKernelSpec::Gemm {
+        MidOperationKind::Gemm {
             multiply: Precision::F16,
             ..
         }

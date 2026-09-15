@@ -1,6 +1,7 @@
 //! Structured repeat bodies and carried/iterated block bindings.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 impl TileGraphBuilder {
     pub(super) fn build_repeat(
@@ -114,13 +115,10 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    if let MidOperationKind::Compute(compute) = &operation.kind {
-        return compute.output_aliases().iter().any(|&(output, input)| {
-            operation.results[output] == value
-                && value_can_alias(operation.inputs[input], target, operations)
-        });
-    }
-    false
+    operation.output_aliases().iter().any(|&(output, input)| {
+        operation.results[output] == value
+            && value_can_alias(operation.inputs[input], target, operations)
+    })
 }
 
 fn repeat_yield_can_alias(
@@ -152,15 +150,14 @@ fn repeat_yield_can_alias(
                 // Internal copies may become local views during expansion.
                 aliases.extend(operation.results.iter().copied());
             }
-            MidOperationKind::Compute(compute) => {
-                let output_aliases = compute.output_aliases();
+            _ => {
+                let output_aliases = operation.output_aliases();
                 for &(output, input) in output_aliases {
                     if aliases.contains(&operation.inputs[input]) {
                         aliases.insert(operation.results[output]);
                     }
                 }
             }
-            _ => {}
         }
     }
     true
@@ -169,7 +166,7 @@ fn repeat_yield_can_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Compute, CoordinateMapping, OperandIndexing};
+    use crate::{CoordinateMapping, OperandIndexing};
 
     #[test]
     fn carried_storage_remains_live_through_reused_copy_inputs() {
@@ -178,15 +175,15 @@ mod tests {
             source: None,
             inputs: vec![id(input)],
             results: vec![id(output)],
-            kind: kind,
+            operands: if matches!(kind, MidOperationKind::Gelu) {
+                vec![OperandIndexing::Elementwise { result: 0 }]
+            } else {
+                vec![]
+            },
+            kind,
+            output_aliases: Vec::new(),
         };
-        let gelu = || {
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Gelu,
-                operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                output_aliases: vec![],
-            })
-        };
+        let gelu = || MidOperationKind::Gelu;
         for reuse_local in [false, true] {
             let operations = vec![
                 op(

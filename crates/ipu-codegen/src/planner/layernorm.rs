@@ -1,6 +1,7 @@
 //! Distributed feature statistics followed by local affine normalization.
 use super::fragments::FragmentBuilder;
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
+
 use crate::mid::{MidValueId, OperandIndexing};
 use crate::tensor::{Precision, TensorAxis, TensorType, broadcast_operand_tiling};
 
@@ -32,7 +33,7 @@ impl FragmentBuilder {
         let partials = self.kernel(
             vec![inputs[0]],
             moments.clone(),
-            TileKernelSpec::LayerNormMoments,
+            MidOperationKind::LayerNormMoments,
             None,
             vec![OperandIndexing::local()],
         );
@@ -50,7 +51,7 @@ impl FragmentBuilder {
         Some(self.kernel(
             inputs,
             output.clone(),
-            TileKernelSpec::LayerNormApply { parts },
+            MidOperationKind::LayerNormApply { parts },
             None,
             vec![
                 OperandIndexing::Elementwise { result: 0 },

@@ -3,9 +3,9 @@
 use crate::PipelineConfig;
 use crate::estimate::{CostModel, MemoryPeaks};
 use crate::graph::{ComputeGraph, GraphInputKind, Operation, OperationKind, Repeat, ValueId};
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion, MidRepeat,
-    MidValueId,
+    CoordinateMapping, MidInput, MidOperation, MidProgram, MidRegion, MidRepeat, MidValueId,
 };
 use crate::planner::bind::{ValueBuilder, canonical, emit_selected, ensure_format, flat, lookup};
 use crate::planner::cache::FragmentCache;
@@ -32,12 +32,16 @@ pub(crate) fn baseline(
     }
     program.compose_copies();
     if !config.diagnostic_checkpoints {
-        program = program
-            .with_elementwise_fusions(
+        if let Some(fused) = program.with_fusions()
+            && let Some((before, _)) = crate::estimate::analyze_mid(&program, &BTreeMap::new())
+            && fused.estimated_cycles < before.total
+            && fused.peak_memory.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
             )
-            .unwrap_or(program);
+        {
+            program = fused;
+        }
         if config.packing_rows != 0 {
             program = program
                 .with_distributed_packing(config.packing_rows)
@@ -408,6 +412,8 @@ impl<C: CostModel> Builder<'_, C> {
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 });
                 *input = result;
             }
@@ -535,6 +541,8 @@ impl<C: CostModel> Builder<'_, C> {
                     yields,
                 },
             }),
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         });
         Ok(())
     }

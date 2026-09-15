@@ -164,7 +164,7 @@ pub(crate) fn package_multiply_precisions(
     low.kernel_runs
         .iter()
         .filter_map(|run| {
-            let crate::TileKernelSpec::Gemm { multiply, .. } = run.kernel else {
+            let crate::MidOperationKind::Gemm { multiply, .. } = run.kernel else {
                 return None;
             };
             Some((run.provenance.operation?, multiply))

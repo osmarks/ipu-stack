@@ -1,8 +1,9 @@
 //! Distributed attention stages and bounded key-block materialization.
 
 use super::fragments::{FragmentBuilder, project_grid};
-use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
-use crate::mid::{Compute, MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode};
+use crate::mid::MidOperationKind;
+use crate::mid::{MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes};
 use crate::planner::operator::ProductGrid;
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder,
@@ -185,7 +186,7 @@ impl FragmentBuilder {
                 self.compute(
                     vec![query_buffer, k],
                     [(scores_type.clone(), None)],
-                    Compute::Product(product(
+                    MidOperationKind::Product(product(
                         query_width,
                         key_block,
                         ProductAxes {
@@ -193,6 +194,7 @@ impl FragmentBuilder {
                             ..qk_axes
                         },
                     )),
+                    Vec::new(),
                 )[0]
             };
             let workspaces = crate::kernel::softmax_workspaces(&weights_type, valid != key_block)?;
@@ -206,15 +208,12 @@ impl FragmentBuilder {
             let softmax = self.compute(
                 vec![scores],
                 outputs,
-                Compute::Kernel {
-                    kernel: TileKernelSpec::AttentionSoftmax {
-                        head_dimension: query.shape.0[2],
-                        key_columns: valid,
-                        padded_key_columns: key_block,
-                    },
-                    operands: vec![OperandIndexing::local()],
-                    output_aliases: Vec::new(),
+                MidOperationKind::AttentionSoftmax {
+                    head_dimension: query.shape.0[2],
+                    key_columns: valid,
+                    padded_key_columns: key_block,
                 },
+                vec![OperandIndexing::local()],
             );
             weights = Some(softmax[0]);
             statistics = Some(softmax[1]);
@@ -240,7 +239,7 @@ impl FragmentBuilder {
                 self.compute(
                     vec![weights_id, v],
                     [(product_type.clone(), None)],
-                    Compute::Product(Product {
+                    MidOperationKind::Product(Product {
                         operands: [
                             OperandWindow(vec![(2, 0, key_block)]),
                             OperandWindow::default(),
@@ -254,6 +253,7 @@ impl FragmentBuilder {
                             },
                         )
                     }),
+                    Vec::new(),
                 )[0]
             };
             let final_block = materialized || start + key_block >= key_rows;
@@ -272,7 +272,7 @@ impl FragmentBuilder {
                 } else {
                     output.clone()
                 },
-                TileKernelSpec::AttentionMerge {
+                MidOperationKind::AttentionMerge {
                     value_dimension: final_output.shape.0[2],
                     padded_value_dimension: value_width,
                     initial: start == 0,
@@ -395,7 +395,7 @@ mod tests {
         let softmax = expanded
             .kernel_runs
             .iter()
-            .find(|run| matches!(run.kernel, TileKernelSpec::AttentionSoftmax { .. }))
+            .find(|run| matches!(run.kernel, MidOperationKind::AttentionSoftmax { .. }))
             .unwrap();
         let probabilities = softmax.outputs[0].shard;
         let statistics = softmax.outputs[1].shard;

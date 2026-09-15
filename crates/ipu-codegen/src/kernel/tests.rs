@@ -1,5 +1,6 @@
 use super::*;
 use crate::estimate::Ipu21CostModel;
+use crate::mid::MidOperationKind;
 use crate::planner::test_support::lower;
 use crate::{
     AccumulationPrecision, ComputeGraph, KernelAccess, KernelRequirements, Layout, MemoryClass,
@@ -30,7 +31,7 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
         .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
         .collect();
     for run in &low.kernel_runs {
-        if matches!(run.kernel, TileKernelSpec::Add) {
+        if matches!(run.kernel, MidOperationKind::Add) {
             materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
             assert_eq!(
                 run.inputs[1].extents.last().unwrap().physical_end
@@ -69,7 +70,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
         .collect();
     let mut packed_adds = 0;
     for run in &low.kernel_runs {
-        if matches!(run.kernel, TileKernelSpec::Add) {
+        if matches!(run.kernel, MidOperationKind::Add) {
             assert_eq!(
                 run.requirements.outputs[0].format.layout.order,
                 ElementOrder::Amp(AmpOrder::Left)
@@ -117,7 +118,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
             };
             let run = &low.kernel_runs[run.0 as usize];
             match run.kernel {
-                TileKernelSpec::Cast { to, .. } if to == fp8 => {
+                MidOperationKind::Cast { to, .. } if to == fp8 => {
                     casts += 1;
                     assert_eq!(
                         run.requirements.inputs[0].format.layout.order,
@@ -130,7 +131,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     let abi = run.call().unwrap();
                     assert!(abi.arguments[3] > 0);
                 }
-                TileKernelSpec::Gemm {
+                MidOperationKind::Gemm {
                     multiply,
                     accumulate,
                     ..
@@ -142,7 +143,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     assert_eq!(run.call().unwrap().arguments, vec![(-8i32) as u32]);
                     let mut rescaled = run.clone();
                     let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
-                    if let TileKernelSpec::Gemm { multiply, .. } = &mut metadata.kernel {
+                    if let MidOperationKind::Gemm { multiply, .. } = &mut metadata.kernel {
                         *multiply = Precision::F8F143 { scale_exponent: 1 };
                     }
                     for input in &mut metadata.requirements.inputs {
@@ -189,7 +190,7 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                 value: None,
                 reason: WorkReason::OperatorKernel,
             },
-            TileKernelSpec::Gemm {
+            MidOperationKind::Gemm {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
                 mode: GemmKernelMode::Initialize,
@@ -354,7 +355,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             for rows in [1, 3, 7] {
                 for keys in [1, padded / 2, padded] {
                     stages.push((
-                        TileKernelSpec::AttentionSoftmax {
+                        MidOperationKind::AttentionSoftmax {
                             head_dimension: head,
                             key_columns: keys,
                             padded_key_columns: padded,
@@ -368,7 +369,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     for values in [16, 32] {
         for rows in [1, 3, 7] {
             stages.push((
-                TileKernelSpec::AttentionMerge {
+                MidOperationKind::AttentionMerge {
                     value_dimension: values,
                     padded_value_dimension: values,
                     initial: true,
@@ -381,7 +382,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     let mut calls = Vec::new();
     for (kernel, rows) in stages {
         let (inputs, outputs, expected) = match kernel {
-            TileKernelSpec::AttentionSoftmax {
+            MidOperationKind::AttentionSoftmax {
                 key_columns,
                 padded_key_columns,
                 ..
@@ -397,7 +398,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 );
                 (vec![probability], outputs, vec![rows, key_columns, 0])
             }
-            TileKernelSpec::AttentionMerge {
+            MidOperationKind::AttentionMerge {
                 value_dimension, ..
             } => (
                 vec![
@@ -566,7 +567,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
             value: None,
             reason: WorkReason::LayoutRearrangement,
         },
-        TileKernelSpec::FillZero {
+        MidOperationKind::FillZero {
             offset: 16,
             bytes: 56,
             padding_only: false,
@@ -607,7 +608,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
     for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
         let run = KernelRun::new(
             run.provenance,
-            TileKernelSpec::FillZero {
+            MidOperationKind::FillZero {
                 offset,
                 bytes,
                 padding_only: false,
@@ -652,7 +653,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
                 .collect();
             let mut products = 0;
             for run in &low.kernel_runs {
-                if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
+                if !matches!(run.kernel, MidOperationKind::Gemm { .. }) {
                     continue;
                 }
                 products += 1;
@@ -707,7 +708,7 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
                 value: None,
                 reason: WorkReason::PrecisionCast,
             },
-            TileKernelSpec::Cast {
+            MidOperationKind::Cast {
                 from: Precision::F32,
                 to: Precision::F16,
             },
@@ -809,18 +810,18 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
         layout: Layout::row_sharded(1),
     };
     for (kernel, inputs) in [
-        (TileKernelSpec::Add, 2),
-        (TileKernelSpec::LayerNorm, 3),
-        (TileKernelSpec::Gelu, 1),
+        (MidOperationKind::Add, 2),
+        (MidOperationKind::LayerNorm, 3),
+        (MidOperationKind::Gelu, 1),
         (
-            TileKernelSpec::Cast {
+            MidOperationKind::Cast {
                 from: Precision::F16,
                 to: Precision::F32,
             },
             1,
         ),
         (
-            TileKernelSpec::Rearrange {
+            MidOperationKind::Rearrange {
                 from: format.layout.clone(),
                 to: format.layout.clone(),
             },
@@ -875,7 +876,7 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
             })
             .collect(),
     };
-    let kernel = TileKernelSpec::BiasGelu;
+    let kernel = MidOperationKind::BiasGelu;
     let mut run = KernelRun::new(
         WorkProvenance {
             operation: None,
@@ -931,7 +932,7 @@ fn binding_checks_backing_strides_before_placement() {
                 .collect::<Vec<_>>();
             let bound = KernelRun::bind(
                 provenance,
-                TileKernelSpec::Gelu,
+                MidOperationKind::Gelu,
                 vec![views[0].clone()],
                 vec![views[1].clone()],
                 &shards,
@@ -962,7 +963,7 @@ fn binding_checks_backing_strides_before_placement() {
     assert!(matches!(
         KernelRun::bind(
             provenance,
-            TileKernelSpec::Gelu,
+            MidOperationKind::Gelu,
             vec![ShardView {
                 shard: shards[0].id,
                 extents: extents.clone()
@@ -975,7 +976,7 @@ fn binding_checks_backing_strides_before_placement() {
             &mut Vec::new(),
         ),
         Err(KernelError::Abi(KernelAbiError::Unavailable(
-            TileKernelSpec::Gelu
+            MidOperationKind::Gelu
         )))
     ));
 }

@@ -2,10 +2,11 @@
 //! Distributed contributor grouping and staging belong to low reduction expansion.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     run.check_arity(2, 1)?;
-    let TileKernelSpec::ReductionSum { partials } = run.kernel else {
+    let MidOperationKind::ReductionSum { partials } = run.kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
     if run.requirements.outputs[0].format.precision != Precision::F16 {

@@ -3,6 +3,7 @@
 use super::*;
 use crate::low::{KernelRun, ShardView};
 use crate::low::{KernelRunMetadata, WorkProvenance};
+use crate::mid::MidOperationKind;
 use crate::tensor::TensorFormat;
 use std::sync::Arc;
 
@@ -40,12 +41,12 @@ pub struct KernelRequirements {
 
 impl KernelRequirements {
     pub fn new(
-        kernel: &TileKernelSpec,
+        kernel: &MidOperationKind,
         inputs: impl IntoIterator<Item = TensorFormat>,
         outputs: impl IntoIterator<Item = TensorFormat>,
     ) -> Self {
         let alignment = match kernel {
-            TileKernelSpec::Gemm { .. } => 32,
+            MidOperationKind::Gemm { .. } => 32,
             // Includes rearrangement fast paths: these use 64-bit accesses
             // even when the tensor elements are F16.
             _ => 8,
@@ -61,7 +62,7 @@ impl KernelRequirements {
                 .collect(),
             distinct_elements: Vec::new(),
         };
-        if let TileKernelSpec::Gemm { multiply, .. } = kernel
+        if let MidOperationKind::Gemm { multiply, .. } = kernel
             && let Some(left) = requirements.inputs.first_mut()
         {
             left.storage.access_tail_bytes = 8 * multiply.bytes() as u32;
@@ -82,7 +83,7 @@ pub enum KernelAbiError {
     #[error("kernel run has {actual} pointer operands, ABI requires {expected}")]
     PointerArity { expected: usize, actual: usize },
     #[error("kernel {0:?} has no device implementation")]
-    Unavailable(TileKernelSpec),
+    Unavailable(MidOperationKind),
     #[error("GEMM output view does not have a matrix row axis")]
     MissingGemmRows,
     #[error("kernel element count overflowed")]
@@ -156,7 +157,7 @@ impl KernelRun {
     /// Metadata interning shares formats and access contracts across tile calls.
     pub(crate) fn bind(
         provenance: WorkProvenance,
-        kernel: TileKernelSpec,
+        kernel: MidOperationKind,
         inputs: Vec<ShardView>,
         outputs: Vec<ShardView>,
         shards: &[BlockValue],
@@ -236,7 +237,7 @@ pub(super) fn view_offset(
         spans: spans.span_count() as usize,
     })?;
     if operand == MemoryOperand::Output(0)
-        && let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel
+        && let MidOperationKind::FillZero { offset, bytes, .. } = run.kernel
     {
         if !offset.is_multiple_of(8) || offset.checked_add(bytes).is_none_or(|end| end > span.bytes)
         {
@@ -259,7 +260,7 @@ pub(super) fn element_count(extents: &[crate::ShardExtent]) -> Result<u32, Kerne
 }
 
 pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
-    if let TileKernelSpec::FillZero { bytes, .. } = run.kernel {
+    if let MidOperationKind::FillZero { bytes, .. } = run.kernel {
         return Ok(bytes);
     }
     let precision = run.requirements.outputs[0].format.precision;
@@ -329,22 +330,23 @@ impl KernelRun {
             return Err(KernelAbiError::RequirementMismatch);
         }
         match self.kernel {
-            TileKernelSpec::Gemm { .. } => gemm::call(self),
-            TileKernelSpec::FlashAttention { .. }
-            | TileKernelSpec::AttentionSoftmax { .. }
-            | TileKernelSpec::AttentionMerge { .. } => attention::call(self),
-            TileKernelSpec::Cast { .. } => cast::call(self),
-            TileKernelSpec::Rearrange { .. } => rearrange::call(self),
-            TileKernelSpec::Gelu | TileKernelSpec::BiasGelu | TileKernelSpec::Add => {
+            MidOperationKind::Gemm { .. } => gemm::call(self),
+            MidOperationKind::FlashAttention { .. }
+            | MidOperationKind::AttentionSoftmax { .. }
+            | MidOperationKind::AttentionMerge { .. } => attention::call(self),
+            MidOperationKind::Cast { .. } => cast::call(self),
+            MidOperationKind::Rearrange { .. } => rearrange::call(self),
+            MidOperationKind::Gelu | MidOperationKind::BiasGelu | MidOperationKind::Add => {
                 pointwise::call(self)
             }
-            TileKernelSpec::LayerNorm
-            | TileKernelSpec::AddLayerNorm
-            | TileKernelSpec::LayerNormMoments
-            | TileKernelSpec::AddLayerNormMoments
-            | TileKernelSpec::LayerNormApply { .. } => normalization::call(self),
-            TileKernelSpec::ReductionSum { .. } => reduce::call(self),
-            TileKernelSpec::FillZero { .. } => fill_call(self),
+            MidOperationKind::LayerNorm
+            | MidOperationKind::AddLayerNorm
+            | MidOperationKind::LayerNormMoments
+            | MidOperationKind::AddLayerNormMoments
+            | MidOperationKind::LayerNormApply { .. } => normalization::call(self),
+            MidOperationKind::ReductionSum { .. } => reduce::call(self),
+            MidOperationKind::FillZero { .. } => fill_call(self),
+            _ => Err(KernelAbiError::RequirementMismatch),
         }
     }
 

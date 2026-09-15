@@ -1,63 +1,30 @@
 //! Fuse compatible whole-device primitives before physical expansion.
 use super::rewrite::{apply_edits, single_use_producers};
-use crate::kernel::TileKernelSpec;
-use crate::mid::{
-    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, OperandIndexing,
-};
+use crate::mid::MidOperationKind;
+
+use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::{ElementOrder, Precision, TensorType};
 use std::collections::{BTreeMap, BTreeSet};
 
-impl MidProgram {
-    pub(crate) fn with_elementwise_fusions(
-        &self,
-        support_reservation: u64,
-        memory_budget: u64,
-    ) -> Option<Self> {
-        let mut result = self.clone();
-        let residual =
-            super::residual::fuse(&mut result.operations, &mut result.values, &result.outputs);
-        if !fuse_region(&mut result.operations, &mut result.values, &result.outputs) && !residual {
-            return None;
-        }
-        let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
-        result.refresh_estimates()?;
-        if result.estimated_cycles >= before.total
-            || !result
-                .peak_memory
-                .fits_ipu21_with_budget(support_reservation, memory_budget)
-        {
-            return None;
-        }
-        Some(result)
-    }
-}
-
-fn fuse_region(
+pub(super) fn run(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> bool {
     let mut changed = false;
-    for operation in &mut *operations {
-        if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
-            changed |= fuse_region(&mut repeat.body.operations, values, &repeat.body.yields);
-        }
-    }
     let producers = single_use_producers(operations, required);
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
         let current = &operations[index];
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel,
+        let crate::MidOperation {
+            kind: kernel,
             operands,
             output_aliases: consumer_aliases,
-        }) = &current.kind
-        else {
-            continue;
-        };
+            ..
+        } = &current;
         let fused = match kernel {
-            TileKernelSpec::Gelu => TileKernelSpec::BiasGelu,
-            TileKernelSpec::LayerNorm => TileKernelSpec::AddLayerNorm,
+            MidOperationKind::Gelu => MidOperationKind::BiasGelu,
+            MidOperationKind::LayerNorm => MidOperationKind::AddLayerNorm,
             _ => continue,
         };
         if operands
@@ -76,11 +43,12 @@ fn fuse_region(
             continue;
         }
         let add = &operations[previous];
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Add,
+        let crate::MidOperation {
+            kind: MidOperationKind::Add,
             operands: add_operands,
             output_aliases: add_aliases,
-        }) = &add.kind
+            ..
+        } = &add
         else {
             continue;
         };
@@ -108,7 +76,7 @@ fn fuse_region(
             continue;
         }
         if !compatible_fusion(&fused, &left.tensor_type, &right.tensor_type, output_type)
-            || (fused == TileKernelSpec::AddLayerNorm && right.owners != output_value.owners)
+            || (fused == MidOperationKind::AddLayerNorm && right.owners != output_value.owners)
         {
             continue;
         }
@@ -159,13 +127,11 @@ fn fuse_region(
         let arity = inputs.len();
         let mut replacement = current.clone();
         replacement.inputs = inputs;
-        replacement.kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: fused.clone(),
-            operands: vec![OperandIndexing::Elementwise { result: 0 }; arity],
-            output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
-        });
+        replacement.kind = fused.clone();
+        replacement.operands = vec![OperandIndexing::Elementwise { result: 0 }; arity];
+        replacement.output_aliases = reuse_input.map(|input| (0, input)).into_iter().collect();
         if !super::rewrite::fusion_pays(
-            if fused == TileKernelSpec::BiasGelu {
+            if fused == MidOperationKind::BiasGelu {
                 "BiasGelu"
             } else {
                 "AddLayerNorm"
@@ -182,11 +148,11 @@ fn fuse_region(
         changed = true;
     }
     apply_edits(operations, &removed, BTreeMap::new());
-    changed | super::output_fusion::fuse(operations, values, required)
+    changed
 }
 
 fn compatible_fusion(
-    kernel: &TileKernelSpec,
+    kernel: &MidOperationKind,
     left: &TensorType,
     right: &TensorType,
     output: &TensorType,
@@ -199,20 +165,21 @@ fn compatible_fusion(
         return false;
     }
     match kernel {
-        TileKernelSpec::BiasGelu => {
+        MidOperationKind::BiasGelu => {
             right.shape.0.last() == output.shape.0.last()
                 && !right.shape.0.is_empty()
                 && right.shape.0[..right.shape.0.len() - 1]
                     .iter()
                     .all(|&size| size == 1)
         }
-        TileKernelSpec::AddLayerNorm => right == output,
+        MidOperationKind::AddLayerNorm => right == output,
         _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::mid::MidProgram;
     use crate::PipelineConfig;
     use crate::estimate::Ipu21CostModel;
     use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
@@ -256,7 +223,13 @@ mod tests {
             source: None,
             inputs: vec![MidValueId(input)],
             results: vec![MidValueId(result)],
+            operands: if matches!(kind, MidOperationKind::Copy { .. }) {
+                vec![]
+            } else {
+                vec![OperandIndexing::Elementwise { result: 0 }]
+            },
             kind,
+            output_aliases: Vec::new(),
         };
         let mut program = MidProgram {
             tile_count: 12,
@@ -267,15 +240,7 @@ mod tests {
             }],
             values,
             operations: vec![
-                operation(
-                    0,
-                    1,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Gelu,
-                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                        output_aliases: vec![],
-                    }),
-                ),
+                operation(0, 1, MidOperationKind::Gelu),
                 operation(
                     1,
                     2,
@@ -289,31 +254,20 @@ mod tests {
                 operation(
                     2,
                     3,
-                    MidOperationKind::Compute(Compute::cast(
-                        retiled.format.precision,
-                        packed.format.precision,
-                    )),
+                    MidOperationKind::Cast {
+                        from: retiled.format.precision,
+                        to: packed.format.precision,
+                    },
                 ),
             ],
             outputs: vec![MidValueId(3)],
             ..MidProgram::default()
         };
-        let fused = program
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        let fused = program.with_fusions().unwrap();
         assert_eq!(fused.operations.len(), 2);
         assert_eq!(fused.operations[0].inputs, [MidValueId(0)]);
         assert_eq!(fused.operations[1].inputs, [MidValueId(2)]);
-        assert!(matches!(
-            fused.operations[1].kind,
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Gelu,
-                ..
-            })
-        ));
+        assert!(matches!(fused.operations[1].kind, MidOperationKind::Gelu));
         let graph = crate::expand_tiles(&fused).unwrap();
         for run in &graph.kernel_runs {
             run.call().unwrap();
@@ -328,23 +282,9 @@ mod tests {
         independent.outputs.push(extra.id);
         independent.values.push(extra);
         independent.operations.insert(2, work);
-        assert!(
-            independent
-                .with_elementwise_fusions(
-                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
-                )
-                .is_some()
-        );
+        assert!(independent.with_fusions().is_some());
         independent.values.last_mut().unwrap().storage_group = MidValueId(0);
-        assert!(
-            independent
-                .with_elementwise_fusions(
-                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
-                )
-                .is_none()
-        );
+        assert!(independent.with_fusions().is_none());
 
         let mut norm = program.clone();
         for _ in 0..2 {
@@ -367,44 +307,24 @@ mod tests {
             });
             norm.operations[0].inputs.push(id);
         }
-        norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::LayerNorm,
-            operands: vec![OperandIndexing::Elementwise { result: 0 }; 3],
-            output_aliases: vec![],
-        });
-        let fused_norm = norm
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        norm.operations[0].kind = MidOperationKind::LayerNorm;
+        norm.operations[0].operands = vec![OperandIndexing::Elementwise { result: 0 }; 3];
+        norm.operations[0].output_aliases = vec![];
+        let fused_norm = norm.with_fusions().unwrap();
         assert_eq!(fused_norm.operations.len(), 4); // activation, gamma, beta copies + LN
         let last = fused_norm.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 3);
-        assert!(matches!(
-            last.kind,
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::LayerNorm,
-                ..
-            })
-        ));
+        assert!(matches!(last.kind, MidOperationKind::LayerNorm));
         let graph = crate::expand_tiles(&fused_norm).unwrap();
         for run in &graph.kernel_runs {
             run.call().unwrap();
         }
         let mut bias = norm.clone();
         bias.operations[0].inputs.truncate(2);
-        bias.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::BiasGelu,
-            operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
-            output_aliases: vec![],
-        });
-        let fused_bias = bias
-            .with_elementwise_fusions(
-                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-            )
-            .unwrap();
+        bias.operations[0].kind = MidOperationKind::BiasGelu;
+        bias.operations[0].operands = vec![OperandIndexing::Elementwise { result: 0 }; 2];
+        bias.operations[0].output_aliases = vec![];
+        let fused_bias = bias.with_fusions().unwrap();
         assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
         let last = fused_bias.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 2);
@@ -414,14 +334,7 @@ mod tests {
             run.call().unwrap();
         }
         program.outputs.push(MidValueId(1));
-        assert!(
-            program
-                .with_elementwise_fusions(
-                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
-                )
-                .is_none()
-        );
+        assert!(program.with_fusions().is_none());
     }
 
     #[test]
@@ -457,16 +370,14 @@ mod tests {
                 let producer = MidOperation {
                     source: None,
                     results: vec![MidValueId(3)],
-                    kind: MidOperationKind::Compute(Compute::Kernel {
-                        kernel: if norm {
-                            TileKernelSpec::LayerNorm
-                        } else {
-                            TileKernelSpec::Gelu
-                        },
-                        operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
-                        output_aliases: Vec::new(),
-                    }),
+                    kind: if norm {
+                        MidOperationKind::LayerNorm
+                    } else {
+                        MidOperationKind::Gelu
+                    },
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                     inputs,
+                    output_aliases: Vec::new(),
                 };
                 let mut identity = values[3].clone();
                 identity.id = MidValueId(5);
@@ -493,15 +404,19 @@ mod tests {
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 };
                 let cast = MidOperation {
                     source: None,
                     inputs: vec![MidValueId(5)],
                     results: vec![MidValueId(4)],
-                    kind: MidOperationKind::Compute(Compute::cast(
-                        Precision::F16,
-                        output.format.precision,
-                    )),
+                    kind: MidOperationKind::Cast {
+                        from: Precision::F16,
+                        to: output.format.precision,
+                    },
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                    output_aliases: Vec::new(),
                 };
                 let mut program = MidProgram {
                     tile_count: 1,
@@ -517,10 +432,7 @@ mod tests {
                     outputs: vec![MidValueId(4)],
                     ..MidProgram::default()
                 };
-                let fused = program.with_elementwise_fusions(
-                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-                );
+                let fused = program.with_fusions();
                 // The faster FP16 affine path makes separate LN + cast
                 // cheaper at this width, even for one row.
                 assert_eq!(fused.is_some(), !norm);
@@ -537,16 +449,7 @@ mod tests {
                     assert_eq!(call.arguments, expected);
                 }
                 program.outputs.push(MidValueId(3));
-                assert!(
-                    program
-                        .with_elementwise_fusions(
-                            u64::from(
-                                ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES
-                            ),
-                            u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
-                        )
-                        .is_none()
-                );
+                assert!(program.with_fusions().is_none());
             }
         }
     }
@@ -607,10 +510,7 @@ mod tests {
                     config = config.with_input(x, format.clone()).with_input(rhs, format);
                 }
                 let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                let fused = mid.with_elementwise_fusions(
-                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
-                );
+                let fused = mid.with_fusions();
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {
                     if !norm {
@@ -624,35 +524,25 @@ mod tests {
                         // delaying the bias read can then increase the live peak.
                         let mut fresh = mid.clone();
                         for op in &mut fresh.operations {
-                            if let MidOperationKind::Compute(Compute::Kernel {
-                                kernel: TileKernelSpec::Gelu,
+                            if let crate::MidOperation {
+                                kind: MidOperationKind::Gelu,
                                 output_aliases,
                                 ..
-                            }) = &mut op.kind
+                            } = op
                             {
                                 output_aliases.clear();
                             }
                         }
                         let (_, memory) =
                             crate::estimate::analyze_mid(&fresh, &BTreeMap::new()).unwrap();
-                        let unconstrained = fresh
-                            .with_elementwise_fusions(
-                                config.standard_memory_reservation_bytes,
-                                config.tile_memory_budget_bytes,
-                            )
-                            .unwrap();
+                        let unconstrained = fresh.with_fusions().unwrap();
                         assert!(unconstrained.peak_memory.total > memory.total);
-                        let mut tight = config.clone();
-                        tight.standard_memory_reservation_bytes = 0;
-                        tight.tile_memory_budget_bytes = memory.total;
-                        assert!(memory.fits_ipu21_with_budget(0, tight.tile_memory_budget_bytes));
+                        // Feasibility is the planner's decision, not a fusion constraint.
+                        assert!(memory.fits_ipu21_with_budget(0, memory.total));
                         assert!(
-                            fresh
-                                .with_elementwise_fusions(
-                                    tight.standard_memory_reservation_bytes,
-                                    tight.tile_memory_budget_bytes
-                                )
-                                .is_none()
+                            !unconstrained
+                                .peak_memory
+                                .fits_ipu21_with_budget(0, memory.total)
                         );
                     }
                     assert!(
@@ -670,7 +560,7 @@ mod tests {
                     for run in &low.kernel_runs {
                         if matches!(
                             run.kernel,
-                            TileKernelSpec::BiasGelu | TileKernelSpec::AddLayerNorm
+                            MidOperationKind::BiasGelu | MidOperationKind::AddLayerNorm
                         ) {
                             run.call().unwrap();
                             count += 1;

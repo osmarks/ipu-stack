@@ -6,9 +6,9 @@
 //! by writes, copies and allocation reuse. This second proof cannot apply to
 //! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
 
-use crate::kernel::TileKernelSpec;
 use crate::low::storage::storage_root;
 use crate::low::*;
+use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, Precision};
 use std::collections::BTreeSet;
 
@@ -62,14 +62,14 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
         for view in &run.inputs {
             let block = &shards[view.shard.index() as usize];
             let columns = view.extents.last();
-            let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
+            let ignores_padding = matches!(run.kernel, MidOperationKind::Cast {
                 from: Precision::F16, to: Precision::F8F143 { .. }
-            } | TileKernelSpec::Gelu)
+            } | MidOperationKind::Gelu)
                 && matches!(run.requirements.outputs[0].format.precision, Precision::F8F143 { .. })
                 && block.tensor_type.format.precision == Precision::F16
                 && block.tensor_type.format.layout.order == ElementOrder::RowMajor
                 && matches!(run.requirements.outputs[0].format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
-                && (run.kernel == TileKernelSpec::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
+                && (run.kernel == MidOperationKind::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
                 && view.extents == block.extents
                 && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
                 // Matrix-row padding is skipped by the packed row bounds;
@@ -77,7 +77,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                 && view.extents.iter().rev().skip(2).all(|axis| axis.logical_end == axis.physical_end)
                 && (view.extents.len() < 2 || {
                     let rows = view.extents[view.extents.len()-2];
-                    rows.logical_end == rows.physical_end || (matches!(run.kernel, TileKernelSpec::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
+                    rows.logical_end == rows.physical_end || (matches!(run.kernel, MidOperationKind::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
                 });
             if ignores_padding {
                 candidates.insert(root(view.shard));
@@ -85,7 +85,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                 forbidden.insert(root(view.shard));
             }
         }
-        if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
+        if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
             forbidden.extend(run.outputs.iter().map(|view| root(view.shard)));
         }
     }
@@ -96,7 +96,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
             let run = &kernels[id.0 as usize];
             if matches!(
                 run.kernel,
-                TileKernelSpec::FillZero {
+                MidOperationKind::FillZero {
                     padding_only: true,
                     ..
                 }
@@ -156,7 +156,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
             }
             BlockOperation::Compute { run, .. } => {
                 let run = &program.kernel_runs[run.0 as usize];
-                if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
+                if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
                     // Arithmetic results are not known-zero-padded parameters.
                     for output in run.outputs.iter() {
                         incoming
@@ -192,7 +192,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
         // Parameter packing supplies exact zero coefficients beyond logical K.
         // Only the activation operand can therefore tolerate arbitrary finite K
         // padding. Missing logical values and explicit reduction zeros cannot.
-        let finite_left = matches!(run.kernel, TileKernelSpec::Gemm { .. })
+        let finite_left = matches!(run.kernel, MidOperationKind::Gemm { .. })
             && run.inputs.len() == 2
             && parameter_storage.contains(&root(run.inputs[1].shard));
         for (index, view) in run.inputs.iter().enumerate() {
@@ -202,7 +202,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                 forbidden.insert(root(view.shard));
             }
         }
-        if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
+        if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
             forbidden.extend(run.outputs.iter().map(|output| root(output.shard)));
         }
     }
@@ -214,7 +214,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
     let mut keep = |operation: &BlockOperation| {
         if let BlockOperation::Compute { run: id, .. } = operation {
             let run = &kernels[id.0 as usize];
-            if let TileKernelSpec::FillZero {
+            if let MidOperationKind::FillZero {
                 offset,
                 bytes,
                 padding_only: true,
@@ -347,7 +347,7 @@ mod tests {
             },
             kernel_runs: vec![
                 run(
-                    TileKernelSpec::FillZero {
+                    MidOperationKind::FillZero {
                         offset: 96,
                         bytes: 32,
                         padding_only: true,
@@ -356,7 +356,7 @@ mod tests {
                     0,
                 ),
                 run(
-                    TileKernelSpec::Gemm {
+                    MidOperationKind::Gemm {
                         multiply: Precision::F16,
                         accumulate: AccumulationPrecision::F32,
                         mode: GemmKernelMode::Initialize,
@@ -379,7 +379,7 @@ mod tests {
     fn has_clear(program: &TileGraph) -> bool {
         program
             .kernel_calls()
-            .any(|run| matches!(run.kernel, TileKernelSpec::FillZero { .. }))
+            .any(|run| matches!(run.kernel, MidOperationKind::FillZero { .. }))
     }
 
     #[test]
@@ -464,7 +464,7 @@ mod tests {
         run.inputs.truncate(1);
         run.inputs[0].extents[1].logical_end = 48;
         let metadata = Arc::make_mut(&mut run.metadata);
-        metadata.kernel = TileKernelSpec::Cast {
+        metadata.kernel = MidOperationKind::Cast {
             from: Precision::F16,
             to: Precision::F8F143 { scale_exponent: -4 },
         };
@@ -482,7 +482,8 @@ mod tests {
                 2 => graph.outputs.push(MidValueId::from_index(1)),
                 3 => append_copy(graph, 0, 1, 128),
                 5 | 6 => {
-                    Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel = TileKernelSpec::Gelu;
+                    Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel =
+                        MidOperationKind::Gelu;
                     if case == 6 {
                         graph.shards[0].extents[0].logical_end = 1;
                         graph.kernel_runs[1].inputs[0].extents[0].logical_end = 1;
@@ -490,7 +491,7 @@ mod tests {
                 }
                 4 => {
                     Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
-                        TileKernelSpec::FillZero {
+                        MidOperationKind::FillZero {
                             offset: 96,
                             bytes: 32,
                             padding_only: false,
@@ -551,7 +552,7 @@ mod tests {
                 1 => graph.shards[2].tensor_type.format.precision = Precision::F32,
                 2 => {
                     Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
-                        TileKernelSpec::FillZero {
+                        MidOperationKind::FillZero {
                             offset: 96,
                             bytes: 32,
                             padding_only: false,
@@ -560,7 +561,7 @@ mod tests {
                 3 => {
                     graph.shards[0].extents[0].logical_end = 1;
                     Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
-                        TileKernelSpec::FillZero {
+                        MidOperationKind::FillZero {
                             offset: 224,
                             bytes: 32,
                             padding_only: true,

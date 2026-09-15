@@ -1,12 +1,13 @@
 //! Ordinary block allocations, ownership lookup, and views.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 impl TileGraphBuilder {
     pub(super) fn bind_kernel(
         &mut self,
         provenance: WorkProvenance,
-        kernel: TileKernelSpec,
+        kernel: MidOperationKind,
         inputs: Vec<ShardView>,
         outputs: Vec<ShardView>,
     ) -> ExpansionResult<KernelRun> {

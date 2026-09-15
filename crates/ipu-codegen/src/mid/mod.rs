@@ -2,20 +2,21 @@
 //! Planner choices/configuration live outside this language. Mid owns binding,
 //! composition and explicit transformations of already selected work.
 use crate::estimate::MemoryPeaks;
+use crate::graph::AttentionOptions;
 use crate::graph::{GraphInputKind, OperationId, ValueId};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode, GemmWeightLoad};
+use crate::tensor::{Layout, Precision};
 use crate::tensor::{OwnerMap, TensorType};
 use std::collections::BTreeMap;
 pub(crate) mod cast;
 pub(crate) mod cast_order;
 mod compute;
 mod copy;
-mod elementwise;
 mod fragment;
+mod fusion;
 mod grouping;
-mod output_fusion;
 pub(crate) mod ownership;
 mod packing;
-mod residual;
 pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
@@ -68,7 +69,65 @@ pub enum MidOperationKind {
         policy: crate::CopyPolicy,
         packing: crate::PackingPolicy,
     },
-    Compute(Compute),
+    Product(Product),
+    Sum {
+        axis: u16,
+        staging: ReductionStaging,
+    },
+    /// Physical byte range initialized during tile expansion.
+    FillZero {
+        offset: u32,
+        bytes: u32,
+        /// Copy mappings cover every logical element; only padding needs initialization.
+        padding_only: bool,
+    },
+    Gemm {
+        multiply: Precision,
+        accumulate: AccumulationPrecision,
+        mode: GemmKernelMode,
+        weights: GemmWeightLoad,
+        inner_block: u32,
+        output_columns: u32,
+    },
+    Gelu,
+    BiasGelu,
+    AddLayerNorm,
+    LayerNorm,
+    /// FP32 mean and variance for each feature shard.
+    LayerNormMoments,
+    /// Produce FP32 moments and an explicit F16 residual sum.
+    AddLayerNormMoments,
+    /// Combine equal-width feature shards' moments and apply normalization.
+    LayerNormApply {
+        parts: u16,
+    },
+    ReductionSum {
+        partials: u16,
+    },
+    Add,
+    FlashAttention {
+        options: AttentionOptions,
+        accumulate: AccumulationPrecision,
+    },
+    AttentionSoftmax {
+        head_dimension: u32,
+        key_columns: u32,
+        padded_key_columns: u32,
+    },
+    AttentionMerge {
+        value_dimension: u32,
+        padded_value_dimension: u32,
+        initial: bool,
+        final_block: bool,
+    },
+    Cast {
+        from: Precision,
+        to: Precision,
+    },
+    Rearrange {
+        from: Layout,
+        to: Layout,
+    },
     Repeat(MidRepeat),
 }
 
@@ -78,6 +137,8 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
+    pub operands: Vec<OperandIndexing>,
+    pub output_aliases: Vec<(usize, usize)>,
 }
 
 impl MidOperation {

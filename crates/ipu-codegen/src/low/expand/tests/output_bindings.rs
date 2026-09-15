@@ -1,5 +1,6 @@
 use super::*;
-use crate::mid::Compute;
+use crate::mid::MidOperationKind;
+
 use crate::{
     CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandIndexing, TensorAxis, ValueId,
 };
@@ -42,6 +43,8 @@ fn copied_columns(columns: u32) -> MidProgram {
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }],
         ..MidProgram::default()
     }
@@ -184,6 +187,8 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
                 policy: CopyPolicy::DirectRetile,
                 packing: crate::PackingPolicy::Automatic,
             },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         });
         mid.outputs.push(value.id);
         mid.values.push(value);
@@ -275,11 +280,9 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         source: None,
         inputs: vec![mid.values[0].id, mid.values[1].id],
         results: vec![result.id],
-        kind: MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Add,
-            operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
-            output_aliases: vec![],
-        }),
+        kind: MidOperationKind::Add,
+        operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
+        output_aliases: vec![],
     });
     mid.values.push(result);
     let graph = expand_tiles(&mid, false).unwrap();
@@ -287,7 +290,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
     let run = graph
         .kernel_runs
         .iter()
-        .find(|run| run.kernel == TileKernelSpec::Add)
+        .find(|run| run.kernel == MidOperationKind::Add)
         .unwrap();
     run.call().unwrap();
     let scalar = &run.inputs[1];
@@ -344,11 +347,9 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 source: None,
                 inputs: vec![MidValueId::from_index(0), MidValueId::from_index(1)],
                 results: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
-                kind: MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::AddLayerNormMoments,
-                    operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
-                    output_aliases: vec![(1, 0)],
-                }),
+                kind: MidOperationKind::AddLayerNormMoments,
+                operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
+                output_aliases: vec![(1, 0)],
             }],
             outputs: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
             ..MidProgram::default()
@@ -360,7 +361,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut covered = std::collections::BTreeSet::new();
         for run in low.kernel_calls() {
-            if run.kernel != TileKernelSpec::AddLayerNormMoments {
+            if run.kernel != MidOperationKind::AddLayerNormMoments {
                 continue;
             }
             crate::materialize_kernel_run(
@@ -388,12 +389,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
         assert_eq!(covered, (0..rows).collect());
 
         let mut wrong_domain = mid;
-        let MidOperationKind::Compute(Compute::Kernel { operands, .. }) =
-            &mut wrong_domain.operations[0].kind
-        else {
-            unreachable!()
-        };
-        operands[0] = OperandIndexing::Elementwise { result: 0 };
+        wrong_domain.operations[0].operands[0] = OperandIndexing::Elementwise { result: 0 };
         assert!(
             wrong_domain.validate().is_err(),
             "feature data cannot broadcast into statistics"
@@ -427,17 +423,19 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             inputs: vec![mid.values[1].id],
             results: vec![result.id],
             kind: if sum {
-                MidOperationKind::Compute(Compute::Sum {
+                MidOperationKind::Sum {
                     axis: 0,
                     staging: crate::ReductionStaging::Complete,
-                })
+                }
             } else {
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gelu,
-                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                    output_aliases: vec![(0, 0)],
-                })
+                MidOperationKind::Gelu
             },
+            operands: if sum {
+                vec![]
+            } else {
+                vec![OperandIndexing::Elementwise { result: 0 }]
+            },
+            output_aliases: if sum { vec![] } else { vec![(0, 0)] },
         });
         mid.values.push(result);
         let graph = expand_tiles(&mid, false).unwrap();

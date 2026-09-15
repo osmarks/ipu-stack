@@ -2,8 +2,9 @@
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
 use crate::graph::OperationId;
-use crate::kernel::{CopyRun, TileKernelSpec};
+use crate::kernel::CopyRun;
 use crate::kernel::{KernelRequirements, MemoryOperand};
+use crate::mid::MidOperationKind;
 use crate::mid::{MidInput, MidValue, MidValueId};
 use crate::storage::CopyOrder;
 use crate::tensor::{ShardExtent, TensorType};
@@ -138,7 +139,7 @@ pub struct WorkProvenance {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
-    pub kernel: TileKernelSpec,
+    pub kernel: MidOperationKind,
     pub requirements: KernelRequirements,
 }
 
@@ -163,7 +164,7 @@ impl KernelRun {
     #[cfg(test)]
     pub fn new(
         provenance: WorkProvenance,
-        kernel: TileKernelSpec,
+        kernel: MidOperationKind,
         inputs: Vec<ShardView>,
         outputs: Vec<ShardView>,
         requirements: KernelRequirements,

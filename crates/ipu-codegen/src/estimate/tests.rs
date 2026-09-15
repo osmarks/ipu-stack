@@ -1,4 +1,5 @@
 use super::*;
+use crate::mid::MidOperationKind;
 use crate::planner::operator::{GemmDistribution, OperatorDispatch};
 use crate::{AMP_INNER_BLOCK, TensorAxis};
 use std::collections::BTreeSet;
@@ -296,8 +297,7 @@ fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
 #[test]
 fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
-        MidValue, ValueId,
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidProgram, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let mut program = MidProgram {
@@ -330,6 +330,8 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
                 mapping: CoordinateMapping::default(),
                 reuse_local: false,
             },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }],
         outputs: vec![id(1), id(2)],
         ..MidProgram::default()
@@ -393,8 +395,8 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
 #[test]
 fn memory_retains_repeat_yields_until_the_backedge() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
-        MidRegion, MidRepeat, MidValue, ValueId,
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidProgram, MidRegion,
+        MidRepeat, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let copy = |input, output| MidOperation {
@@ -407,6 +409,8 @@ fn memory_retains_repeat_yields_until_the_backedge() {
             mapping: CoordinateMapping::default(),
             reuse_local: false,
         },
+        operands: Vec::new(),
+        output_aliases: Vec::new(),
     };
     let mut program = MidProgram {
         tile_count: 1,
@@ -445,6 +449,8 @@ fn memory_retains_repeat_yields_until_the_backedge() {
                     yields: vec![id(4), id(6)],
                 },
             }),
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }];
         let (_, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
         // Both carried buffers, the earlier yield, and the final copy's input
@@ -467,9 +473,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
 
 #[test]
 fn explicit_zero_copy_offsets_have_identity_cost() {
-    use crate::{
-        CoordinateMapping, MidOperation, MidOperationKind, MidValue, TensorTiling, ValueId,
-    };
+    use crate::{CoordinateMapping, MidOperation, MidValue, TensorTiling, ValueId};
     let values = [
         Layout::row_major(TensorTiling::replicated(1)),
         Layout::row_major(TensorTiling::sharded(TensorAxis::FromEnd(1), 4)),
@@ -498,6 +502,8 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
                 },
                 reuse_local: false,
             },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         };
         let (cost, _, rows) = operation_cost(&op, &values).unwrap();
         (cost.total, cost.exchange, rows)

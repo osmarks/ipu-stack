@@ -2,7 +2,7 @@
 //! No setup, address arithmetic, worker skew, or non-overlapped operand loads
 //! enter arithmetic numerators. These are estimates, not instruction counters.
 use super::*;
-use crate::TileKernelSpec;
+use crate::mid::MidOperationKind;
 
 pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'static str)> {
     let logical: u64 = run.outputs[0]
@@ -29,7 +29,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
     let affine_issue_slots = if quad_affine { 1.5 } else { 2.0 };
 
     let (useful, issued, scale, basis) = match run.kernel {
-        TileKernelSpec::Gemm { multiply, .. } => {
+        MidOperationKind::Gemm { multiply, .. } => {
             let [useful, physical] = run.product_flops?;
             let peak = match multiply {
                 Precision::F16 => 128.0,
@@ -44,7 +44,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         }
         // GELU_TWO_PAIRS: ten v4 arithmetic instructions and two v2 tanhs
         // per four values (including the finite-range clamp).
-        TileKernelSpec::Gelu => (
+        MidOperationKind::Gelu => (
             logical,
             physical,
             if matches!(precision, Precision::F8F143 { .. }) {
@@ -54,14 +54,14 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
             },
             "GeLU arithmetic and optional FP8 conversion",
         ),
-        TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
+        MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
             let elements: u64 = run.inputs[0]
                 .extents
                 .iter()
                 .map(|e| u64::from(e.logical_end - e.start))
                 .product();
             let slots = statistics_issue_slots
-                + if run.kernel == TileKernelSpec::AddLayerNormMoments {
+                + if run.kernel == MidOperationKind::AddLayerNormMoments {
                     0.25
                 } else {
                     0.0
@@ -72,7 +72,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
                 "layernorm: FP32 sum and centered squares, including vector accumulation",
             ));
         }
-        TileKernelSpec::LayerNormApply { .. } => (
+        MidOperationKind::LayerNormApply { .. } => (
             logical,
             physical,
             affine_issue_slots,
@@ -80,7 +80,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         ),
         // Vector path: bias add, clamp, square/cube, MIX, two tanhs and
         // three final arithmetic issues. GACC is data movement.
-        TileKernelSpec::BiasGelu => (
+        MidOperationKind::BiasGelu => (
             logical,
             physical,
             if matches!(precision, Precision::F8F143 { .. }) {
@@ -90,7 +90,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
             },
             "bias add, MIX GeLU and optional FP8 conversion",
         ),
-        TileKernelSpec::AddLayerNorm => (
+        MidOperationKind::AddLayerNorm => (
             logical,
             physical,
             statistics_issue_slots
@@ -99,7 +99,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
                 + if quad_affine { 0.25 } else { 0.5 },
             "residual add and layernorm arithmetic",
         ),
-        TileKernelSpec::LayerNorm => (
+        MidOperationKind::LayerNorm => (
             logical,
             physical,
             statistics_issue_slots
@@ -111,7 +111,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
                 },
             "layernorm: FP32 statistics/normalization and affine arithmetic",
         ),
-        TileKernelSpec::Add => (
+        MidOperationKind::Add => (
             logical,
             physical,
             match precision {
@@ -121,7 +121,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
             },
             "vector add issue slots",
         ),
-        TileKernelSpec::ReductionSum { partials } => {
+        MidOperationKind::ReductionSum { partials } => {
             let lanes = match precision {
                 Precision::F16 => 4.0,
                 Precision::F32 => 2.0,
@@ -134,13 +134,13 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
                 "vector reduction add issue slots",
             )
         }
-        TileKernelSpec::Rearrange { .. } => (
+        MidOperationKind::Rearrange { .. } => (
             logical,
             physical,
             precision.bytes() as f64 / 4.0,
             "dense copy baseline: 8-byte load + store / 2 issue slots",
         ),
-        TileKernelSpec::Cast { from, to }
+        MidOperationKind::Cast { from, to }
             if matches!(
                 (from, to),
                 (Precision::F16, Precision::F32) | (Precision::F32, Precision::F16)
@@ -148,7 +148,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         {
             (logical, physical, 0.5, "one vector conversion / 2 elements")
         }
-        TileKernelSpec::Cast {
+        MidOperationKind::Cast {
             from: Precision::F16,
             to: Precision::F8F143 { .. },
         } => (
@@ -157,7 +157,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
             0.125,
             "one vector conversion / 8 elements",
         ),
-        TileKernelSpec::Cast {
+        MidOperationKind::Cast {
             from: Precision::F8F143 { .. },
             to: Precision::F16,
         } => (
@@ -166,10 +166,10 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
             0.25,
             "one vector conversion / 4 elements",
         ),
-        TileKernelSpec::FillZero {
+        MidOperationKind::FillZero {
             padding_only: true, ..
         } => return Some((0.0, 0.0, "padding initialization: no useful tensor work")),
-        TileKernelSpec::AttentionSoftmax {
+        MidOperationKind::AttentionSoftmax {
             key_columns,
             padded_key_columns,
             ..

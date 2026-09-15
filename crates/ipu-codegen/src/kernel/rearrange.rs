@@ -1,6 +1,7 @@
 //! Layout-specific rearrangement workers and assembly fast paths.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RearrangeTarget {
@@ -69,7 +70,7 @@ pub(crate) fn supported(from: ElementOrder, to: ElementOrder, precision: Precisi
 
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     run.check_arity(1, 1)?;
-    let TileKernelSpec::Rearrange { from, to } = &run.kernel else {
+    let MidOperationKind::Rearrange { from, to } = &run.kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
     if !supported(

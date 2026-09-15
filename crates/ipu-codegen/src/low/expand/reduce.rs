@@ -3,6 +3,7 @@
 //! can be supplied through explicit copies/rearrangements before this builder.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 #[derive(Default)]
 pub(super) struct SumBatch {
@@ -300,7 +301,7 @@ impl TileGraphBuilder {
                         owner.tile,
                         self.bind_kernel(
                             provenance,
-                            TileKernelSpec::ReductionSum {
+                            MidOperationKind::ReductionSum {
                                 partials: u16::try_from(chunk.len() + 1)
                                     .map_err(|_| ExpansionError::IdOverflow)?,
                             },
@@ -544,7 +545,7 @@ mod tests {
                     }
                     BlockOperation::Compute { run, .. } => {
                         let run = &builder.kernel_runs[run.0 as usize];
-                        let TileKernelSpec::ReductionSum { partials } = run.kernel else {
+                        let MidOperationKind::ReductionSum { partials } = run.kernel else {
                             panic!("unexpected compute block");
                         };
                         let initial = &memory[run.inputs[0].shard.index() as usize];

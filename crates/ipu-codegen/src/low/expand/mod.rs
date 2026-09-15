@@ -1,5 +1,6 @@
 //! Expand selected whole-device primitives into tile-local calls and movement.
 
+use crate::mid::MidOperationKind;
 mod emit;
 use crate::storage::GeometryCache;
 mod compute;
@@ -17,14 +18,14 @@ mod repeat;
 use super::{view_byte_spans, view_byte_traversal};
 use crate::graph::OperationId;
 use crate::low::*;
-use crate::mid::Compute;
+
 #[cfg(test)]
 use crate::storage::ByteSpan;
 use crate::storage::StorageError;
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
-    LayoutError, MemoryClass, MidOperation, MidOperationKind, MidProgram, MidRepeat, MidValueId,
-    Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
+    LayoutError, MemoryClass, MidOperation, MidProgram, MidRepeat, MidValueId, Precision,
+    ShardExtent, TensorTiling, TensorType,
 };
 use copies::*;
 
@@ -175,10 +176,7 @@ impl TileGraphBuilder {
         ) {
             for operation in operations {
                 used.extend(operation.read_values().chain(&operation.results).copied());
-                if let MidOperationKind::Compute(compute) = &operation.kind {
-                    bindings
-                        .extend(compute::allocation_inputs(compute, &operation.inputs).copied());
-                }
+                bindings.extend(compute::allocation_inputs(operation).copied());
                 if let MidOperationKind::Repeat(repeat) = &operation.kind {
                     used.extend(
                         repeat
@@ -257,8 +255,7 @@ impl TileGraphBuilder {
             let lowered = if sums > 1 {
                 let mut batch = reduce::SumBatch::default();
                 for operation in &operations[index..index + sums] {
-                    let MidOperationKind::Compute(Compute::Sum { axis, staging }) = operation.kind
-                    else {
+                    let MidOperationKind::Sum { axis, staging } = operation.kind else {
                         unreachable!()
                     };
                     self.prepare_sum(operation, usize::from(axis), staging, &mut batch)?;
@@ -290,15 +287,13 @@ impl TileGraphBuilder {
                 self.append_materialization(batch, provenance, &mut tiles)
             } else {
                 match &operation.kind {
-                    MidOperationKind::Compute(compute) => {
-                        self.build_compute(operation, compute, &mut tiles)
-                    }
                     MidOperationKind::Copy { .. } => {
                         unreachable!("copy prefix includes its first operation")
                     }
                     MidOperationKind::Repeat(repeat) => {
                         self.build_repeat(operation, repeat, &mut tiles)
                     }
+                    _ => self.build_compute(operation, &mut tiles),
                 }
             };
             if let Err(error) = lowered {
@@ -406,7 +401,7 @@ impl TileGraphBuilder {
         {
             let run = self.bind_kernel(
                 provenance,
-                TileKernelSpec::FillZero {
+                MidOperationKind::FillZero {
                     offset: range.offset,
                     bytes: range.bytes,
                     padding_only,
@@ -424,17 +419,14 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
         operation: operation.source,
         value: operation.results.first().copied(),
         reason: match &operation.kind {
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Cast { .. },
-                ..
-            }) => WorkReason::PrecisionCast,
+            MidOperationKind::Cast { .. } => WorkReason::PrecisionCast,
             MidOperationKind::Copy {
                 policy: CopyPolicy::Automatic,
                 ..
             } => WorkReason::OperatorInputs,
             MidOperationKind::Copy { .. } => WorkReason::LayoutRearrangement,
-            MidOperationKind::Compute(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
+            _ => WorkReason::OperatorKernel,
         },
     }
 }

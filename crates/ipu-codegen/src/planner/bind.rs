@@ -3,11 +3,11 @@
 use crate::PipelineConfig;
 use crate::estimate::CostModel;
 use crate::graph::{Operation, OperationId, OperationKind, ValueId};
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
+
 use crate::low::default_copy_policy;
 use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
-    OperandIndexing, cast_order,
+    CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing, cast_order,
 };
 
 use crate::planner::cache::FragmentCache;
@@ -228,9 +228,12 @@ pub(super) fn flat(shape: &TensorShape, precision: Precision, tiles: u16) -> Lay
 
 fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValueId> {
     (operation.inputs.as_slice() == [input]
-        && matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Cast { .. }, operands, output_aliases, ..
-        }) if operands.len() == 1 && operands[0] == (OperandIndexing::Elementwise { result: 0 }) && output_aliases.is_empty()))
+        && matches!(operation, MidOperation {
+kind: MidOperationKind::Cast { .. },
+operands,
+output_aliases,
+..
+} if operands.len() == 1 && operands[0] == (OperandIndexing::Elementwise { result: 0 }) && output_aliases.is_empty()))
     .then(|| operation.results[0])
 }
 
@@ -372,10 +375,10 @@ pub(super) fn ensure_format(
             inputs: vec![value],
             results: vec![result],
             kind: if cast {
-                MidOperationKind::Compute(Compute::cast(
-                    input.format.precision,
-                    output.format.precision,
-                ))
+                MidOperationKind::Cast {
+                    from: input.format.precision,
+                    to: output.format.precision,
+                }
             } else {
                 MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
@@ -384,6 +387,12 @@ pub(super) fn ensure_format(
                     packing: crate::PackingPolicy::Automatic,
                 }
             },
+            operands: if cast {
+                vec![OperandIndexing::Elementwise { result: 0 }]
+            } else {
+                vec![]
+            },
+            output_aliases: Vec::new(),
         });
         value = result;
     }

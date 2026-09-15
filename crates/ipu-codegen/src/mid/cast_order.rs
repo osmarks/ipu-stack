@@ -1,9 +1,8 @@
 //! Move eligible FP8 conversions ahead of copies on executable mid.
 
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing,
+    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -200,14 +199,12 @@ fn reorder_region(
                 source: cast.source,
                 inputs: vec![input],
                 results: vec![id],
-                kind: MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Cast {
-                        from: Precision::F16,
-                        to: values[id.index() as usize].tensor_type.format.precision,
-                    },
-                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                    output_aliases: vec![],
-                }),
+                kind: MidOperationKind::Cast {
+                    from: Precision::F16,
+                    to: values[id.index() as usize].tensor_type.format.precision,
+                },
+                operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                output_aliases: vec![],
             };
             before.entry(at).or_default().push(early);
             shared.push((input, id, at));
@@ -230,14 +227,7 @@ fn reorder_region(
 }
 
 fn may_write_existing_storage(op: &MidOperation) -> bool {
-    match &op.kind {
-        MidOperationKind::Compute(compute) => {
-            let output_aliases = compute.output_aliases();
-            !output_aliases.is_empty()
-        }
-        MidOperationKind::Repeat(_) => true,
-        _ => false,
-    }
+    !op.output_aliases().is_empty() || matches!(op.kind, MidOperationKind::Repeat(_))
 }
 
 #[cfg(test)]
@@ -280,10 +270,10 @@ mod tests {
                 policy: CopyPolicy::Automatic,
                 packing: crate::PackingPolicy::Automatic,
             },
-            MidOperationKind::Compute(Compute::cast(
-                Precision::F16,
-                Precision::F8F143 { scale_exponent: -4 },
-            )),
+            MidOperationKind::Cast {
+                from: Precision::F16,
+                to: Precision::F8F143 { scale_exponent: -4 },
+            },
         ];
         MidProgram {
             tile_count: 4,
@@ -300,7 +290,13 @@ mod tests {
                     source: Some(source),
                     inputs: vec![MidValueId(i as u32)],
                     results: vec![MidValueId(i as u32 + 1)],
+                    operands: if matches!(kind, MidOperationKind::Cast { .. }) {
+                        vec![crate::OperandIndexing::Elementwise { result: 0 }]
+                    } else {
+                        Vec::new()
+                    },
                     kind,
+                    output_aliases: Vec::new(),
                 })
                 .collect(),
             outputs: vec![MidValueId(2)],
@@ -326,11 +322,9 @@ mod tests {
                 source: None,
                 inputs: vec![source],
                 results: vec![alias.id],
-                kind: MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gelu,
-                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                    output_aliases: vec![(0, 0)],
-                }),
+                kind: MidOperationKind::Gelu,
+                operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                output_aliases: vec![(0, 0)],
             },
         );
         mid.values.push(alias);
@@ -358,6 +352,8 @@ mod tests {
                     yields: yields.clone(),
                 },
             }),
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         }];
         mid.reorder_casts();
         let MidOperationKind::Repeat(repeat) = &mid.operations[0].kind else {
@@ -388,6 +384,8 @@ mod tests {
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
                 },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             },
         );
         mid.values.push(original);

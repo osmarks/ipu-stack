@@ -1,6 +1,6 @@
 //! Distributed arithmetic and its operand windows. Tile calls are enumerated in low.
 
-use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode};
 use crate::tensor::{Precision, TensorAxis};
 use serde::{Deserialize, Serialize};
 
@@ -83,62 +83,28 @@ pub struct Product {
     pub output_aliases: Vec<(usize, usize)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Compute {
-    Product(Product),
-    /// Invoke the selected kernel over the output distribution.
-    Kernel {
-        kernel: TileKernelSpec,
-        operands: Vec<OperandIndexing>,
-        /// (Result index, input index) pairs sharing an allocation. Inputs may
-        /// include lifetime dependencies beyond the kernel's explicit operands.
-        /// Shrinking casts donate storage with a displacement chosen in low;
-        /// other kernels use the same byte origin.
-        output_aliases: Vec<(usize, usize)>,
-    },
-    /// Independent partials occupy an explicit tensor axis. The selected
-    /// reduction policy determines whether remote contributors arrive together
-    /// or in successive bounded stages.
-    Sum {
-        axis: u16,
-        staging: ReductionStaging,
-    },
-}
-
-impl Compute {
+impl super::MidOperation {
     pub(crate) fn operand_window(&self, index: usize) -> Option<&OperandWindow> {
-        match self {
-            Self::Product(product) => product.operands.get(index),
-            Self::Kernel { operands, .. } => match operands.get(index)? {
-                OperandIndexing::Local(window) => Some(window),
-                OperandIndexing::Elementwise { .. } => None,
-            },
-            Self::Sum { .. } => None,
+        if let super::MidOperationKind::Product(product) = &self.kind {
+            return product.operands.get(index);
+        }
+        match self.operands.get(index)? {
+            OperandIndexing::Local(window) => Some(window),
+            OperandIndexing::Elementwise { .. } => None,
         }
     }
 
     pub(crate) fn input_count(&self) -> usize {
-        match self {
-            Self::Product(product) => product.operands.len(),
-            Self::Kernel { operands, .. } => operands.len(),
-            Self::Sum { .. } => 0,
+        match &self.kind {
+            super::MidOperationKind::Product(product) => product.operands.len(),
+            _ => self.operands.len(),
         }
     }
 
     pub(crate) fn output_aliases(&self) -> &[(usize, usize)] {
-        match self {
-            Self::Product(product) => &product.output_aliases,
-            Self::Kernel { output_aliases, .. } => output_aliases,
-            Self::Sum { .. } => &[],
-        }
-    }
-
-    /// Whole-value numerical conversion; ownership is unchanged by this call.
-    pub fn cast(from: Precision, to: Precision) -> Self {
-        Self::Kernel {
-            kernel: TileKernelSpec::Cast { from, to },
-            operands: vec![OperandIndexing::Elementwise { result: 0 }],
-            output_aliases: Vec::new(),
+        match &self.kind {
+            super::MidOperationKind::Product(product) => &product.output_aliases,
+            _ => &self.output_aliases,
         }
     }
 }

@@ -1,10 +1,11 @@
 use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
 use crate::graph::{ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId};
-use crate::kernel::{AccumulationPrecision, TileKernelSpec};
+use crate::kernel::AccumulationPrecision;
 use crate::low::CopyPolicy;
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    Compute, CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue,
-    MidValueId, Product, ProductAxes, ReductionStaging, cast_order, expand_tiles,
+    CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, Product,
+    ProductAxes, ReductionStaging, cast_order, expand_tiles,
 };
 use crate::planner::cache::FragmentCache;
 use crate::planner::candidates::{
@@ -119,23 +120,21 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
         .with_automatic_input(gamma, Precision::F16)
         .with_automatic_input(beta, Precision::F16);
     let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
-    assert!(mid.operations.iter().any(|op| matches!(
-        op.kind,
-        MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::LayerNormApply { .. },
-            ..
-        })
-    )));
+    assert!(
+        mid.operations
+            .iter()
+            .any(|op| matches!(op.kind, MidOperationKind::LayerNormApply { .. }))
+    );
     let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
     let mut moments = 0;
     let mut applies = 0;
     for run in &low.kernel_runs {
-        if matches!(run.kernel, TileKernelSpec::LayerNormMoments) {
+        if matches!(run.kernel, MidOperationKind::LayerNormMoments) {
             assert_eq!(run.requirements.outputs[0].format.precision, Precision::F32);
             run.call().unwrap();
             moments += 1;
         }
-        if matches!(run.kernel, TileKernelSpec::LayerNormApply { .. }) {
+        if matches!(run.kernel, MidOperationKind::LayerNormApply { .. }) {
             run.call().unwrap();
             applies += 1;
         }
@@ -306,13 +305,10 @@ fn fp8_conversion_precedes_operand_replication() {
     let cast = &mid.operations[0];
     assert!(matches!(
         cast.kind,
-        MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Cast {
-                from: Precision::F16,
-                to: Precision::F8F143 { .. }
-            },
-            ..
-        })
+        MidOperationKind::Cast {
+            from: Precision::F16,
+            to: Precision::F8F143 { .. }
+        }
     ));
     let packed = &value(&mid, cast.results[0]).tensor_type.format;
     assert_eq!(packed.layout, input_layout);
@@ -650,10 +646,7 @@ fn assert_conversions_are_explicit(lowered: &MidProgram, operations: &[MidOperat
         let before = &value(lowered, *input).tensor_type;
         let after = &value(lowered, *result).tensor_type;
         match &operation.kind {
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Cast { from, to },
-                ..
-            }) => {
+            MidOperationKind::Cast { from, to } => {
                 assert_eq!(before.format.precision, *from);
                 assert_eq!(after.format.precision, *to);
                 assert_eq!(before.shape, after.shape);
@@ -826,18 +819,13 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let operator = lowered
             .operations
             .iter()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Compute(Compute::Product(Product { .. }))
-                )
-            })
+            .find(|operation| matches!(operation.kind, MidOperationKind::Product(Product { .. })))
             .unwrap();
-        let MidOperationKind::Compute(Compute::Product(Product {
+        let MidOperationKind::Product(Product {
             multiply: selected_multiply,
             accumulate: selected_accumulate,
             ..
-        })) = operator.kind
+        }) = operator.kind
         else {
             panic!("random case {case}: expected GEMM");
         };
@@ -921,9 +909,7 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             .operations
             .iter()
             .filter_map(|operation| match operation.kind {
-                MidOperationKind::Compute(Compute::Product(Product { multiply, .. })) => {
-                    Some(multiply)
-                }
+                MidOperationKind::Product(Product { multiply, .. }) => Some(multiply),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -990,15 +976,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
         let consumer = compact
             .operations
             .iter()
-            .find(|op| {
-                matches!(
-                    op.kind,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::AttentionSoftmax { .. },
-                        ..
-                    })
-                )
-            })
+            .find(|op| matches!(op.kind, MidOperationKind::AttentionSoftmax { .. }))
             .unwrap();
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
@@ -1007,23 +985,16 @@ fn randomized_single_use_views_compose_into_panel_copies() {
                 ..
             }
         )));
-        assert!(compact.operations.iter().any(|op| matches!(
-            op.kind,
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::AttentionSoftmax { .. },
-                ..
-            })
-        )));
+        assert!(
+            compact
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, MidOperationKind::AttentionSoftmax { .. }))
+        );
         for op in &compact.operations {
             if matches!(
                 op.kind,
-                MidOperationKind::Compute(
-                    Compute::Product(_)
-                        | Compute::Kernel {
-                            kernel: TileKernelSpec::AttentionSoftmax { .. },
-                            ..
-                        }
-                )
+                MidOperationKind::Product(_) | MidOperationKind::AttentionSoftmax { .. }
             ) {
                 assert_eq!(
                     compact.values[op.results[0].index() as usize]
@@ -1202,7 +1173,7 @@ fn blocked_attention_reserves_online_state_between_accumulator_rows() {
     let low = crate::expand_tiles(&mid).unwrap();
     let mut intermediate = 0;
     for run in &low.kernel_runs {
-        if let TileKernelSpec::AttentionMerge {
+        if let MidOperationKind::AttentionMerge {
             value_dimension,
             final_block: false,
             ..
@@ -1248,14 +1219,14 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .find(|op| {
             matches!(
                 op.kind,
-                MidOperationKind::Compute(Compute::Product(Product {
+                MidOperationKind::Product(Product {
                     inner_block: 128,
                     axes: ProductAxes {
                         right_inner: TensorAxis::FromEnd(2),
                         ..
                     },
                     ..
-                }))
+                })
             )
         })
         .unwrap();
@@ -1652,7 +1623,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
         if scales[1].is_some() {
             assert!(tiles.kernel_runs.iter().any(|run| matches!(
                 run.kernel,
-                TileKernelSpec::AttentionSoftmax { .. }
+                MidOperationKind::AttentionSoftmax { .. }
             ) && matches!(
                 run.requirements.outputs[0].format.precision,
                 Precision::F8F143 { .. }
@@ -1660,7 +1631,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
             // Quantization precedes query replication on unreplicated V panels.
             assert!(tiles.kernel_runs.iter().any(|run| matches!(
                 run.kernel,
-                TileKernelSpec::Cast {
+                MidOperationKind::Cast {
                     from: Precision::F16,
                     to: Precision::F8F143 { .. }
                 }
@@ -1859,7 +1830,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         let calls: Vec<_> = low
             .kernel_runs
             .iter()
-            .filter(|run| matches!(run.kernel, TileKernelSpec::Cast { .. }))
+            .filter(|run| matches!(run.kernel, MidOperationKind::Cast { .. }))
             .collect();
         assert_eq!(calls.len(), 1);
         let arguments = calls[0].call().unwrap().arguments;
@@ -2075,10 +2046,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
     ));
     assert!(matches!(
         resolved.operations[1].kind,
-        MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Cast { .. },
-            ..
-        })
+        MidOperationKind::Cast { .. }
     ));
     let low = crate::lower_to_tiles(&crate::expand_tiles(&resolved).unwrap(), false);
     let written = low
@@ -2102,7 +2070,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         )
         .collect::<BTreeSet<_>>();
     for run in &low.kernel_runs {
-        if matches!(run.kernel, TileKernelSpec::Cast { .. }) {
+        if matches!(run.kernel, MidOperationKind::Cast { .. }) {
             assert!(run.inputs.iter().all(|view| {
                 written.contains(&crate::low::storage::storage_root(&low.shards, view.shard))
             }));
@@ -2147,7 +2115,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
             match &op.kind {
-                MidOperationKind::Compute(Compute::Product(Product { multiply, .. })) => {
+                MidOperationKind::Product(Product { multiply, .. }) => {
                     assert!(op.inputs.iter().take(2).all(|id| {
                         values[id.index() as usize].tensor_type.format.precision == *multiply
                     }));

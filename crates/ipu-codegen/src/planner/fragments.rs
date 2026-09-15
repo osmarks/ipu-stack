@@ -2,10 +2,10 @@
 //! Family algorithms share this value/operation builder; binding and costing
 //! consume the resulting MidProgram without another template expansion.
 use crate::graph::{GraphInputKind, ValueId};
-use crate::kernel::TileKernelSpec;
+use crate::mid::MidOperationKind;
+
 use crate::mid::{
-    Compute, CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue,
-    MidValueId, OperandIndexing,
+    CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
 };
 use crate::planner::operator::{OperatorDispatch, OperatorFamily, OperatorPlan};
 use crate::tensor::{
@@ -26,7 +26,7 @@ pub(crate) fn build_fragment(
             let kernel = plan.operator.local_kernel()?;
             // The fused attention callable consumes already-selected local
             // Q/K/V panels. Its row domains differ from the result's domain.
-            let indexing = if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
+            let indexing = if matches!(kernel, MidOperationKind::FlashAttention { .. }) {
                 OperandIndexing::local()
             } else {
                 OperandIndexing::Elementwise { result: 0 }
@@ -46,7 +46,7 @@ pub(crate) fn build_fragment(
                 })
             });
             let mut kernel_output = output.clone();
-            if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
+            if matches!(kernel, MidOperationKind::FlashAttention { .. }) {
                 kernel_output.format.precision = Precision::F32;
             }
             let indexing = vec![indexing; operands.len()];
@@ -172,6 +172,8 @@ impl FragmentBuilder {
             inputs,
             results: results.clone(),
             kind,
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         });
         results
     }
@@ -186,7 +188,7 @@ impl FragmentBuilder {
         self.kernel(
             vec![input],
             output,
-            TileKernelSpec::Cast {
+            MidOperationKind::Cast {
                 from,
                 to: precision,
             },
@@ -243,19 +245,11 @@ impl FragmentBuilder {
 
         inputs: Vec<MidValueId>,
         output: TensorType,
-        kernel: TileKernelSpec,
+        kernel: MidOperationKind,
         reuse: Option<MidValueId>,
         operands: Vec<OperandIndexing>,
     ) -> MidValueId {
-        self.compute(
-            inputs,
-            [(output, reuse)],
-            Compute::Kernel {
-                kernel,
-                operands,
-                output_aliases: Vec::new(),
-            },
-        )[0]
+        self.compute(inputs, [(output, reuse)], kernel, operands)[0]
     }
 
     pub(super) fn compute(
@@ -263,22 +257,26 @@ impl FragmentBuilder {
 
         mut inputs: Vec<MidValueId>,
         outputs: impl IntoIterator<Item = (TensorType, Option<MidValueId>)>,
-        mut compute: Compute,
+        mut kind: MidOperationKind,
+        operands: Vec<OperandIndexing>,
     ) -> Vec<MidValueId> {
         let mut types = Vec::new();
+        let mut output_aliases = Vec::new();
         for (output, reuse) in outputs {
             if let Some(value) = reuse {
-                let aliases = match &mut compute {
-                    Compute::Product(product) => &mut product.output_aliases,
-                    Compute::Kernel { output_aliases, .. } => output_aliases,
-                    Compute::Sum { .. } => unreachable!("sum output ownership is independent"),
-                };
-                aliases.push((types.len(), inputs.len()));
+                output_aliases.push((types.len(), inputs.len()));
                 inputs.push(value);
             }
             types.push(output);
         }
-        self.emit(inputs, types, MidOperationKind::Compute(compute))
+        if let MidOperationKind::Product(product) = &mut kind {
+            product.output_aliases = output_aliases.clone();
+        }
+        let results = self.emit(inputs, types, kind);
+        let operation = self.program.operations.last_mut().unwrap();
+        operation.operands = operands;
+        operation.output_aliases = output_aliases;
+        results
     }
 }
 

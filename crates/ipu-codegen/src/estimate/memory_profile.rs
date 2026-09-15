@@ -1,6 +1,7 @@
 //! Opt-in explanations of the planner's existing memory estimate.
 use super::*;
-use crate::{Compute, ComputeGraph, MidOperationKind, PipelineConfig};
+use crate::mid::MidOperationKind;
+use crate::{ComputeGraph, PipelineConfig};
 use ipu_target::ipu21::memory::{IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES};
 use serde::Serialize;
 
@@ -98,12 +99,11 @@ impl mid::MemoryObserver for Timeline {
         tile_scratch: &[MemoryUsage],
     ) {
         let description = match &operation.kind {
-            MidOperationKind::Compute(Compute::Kernel { kernel, .. }) => format!("{kernel:?}"),
             MidOperationKind::Copy {
                 policy, packing, ..
             } => format!("Copy {policy:?} {packing:?}"),
-            MidOperationKind::Compute(compute) => format!("{compute:?}"),
             MidOperationKind::Repeat(repeat) => format!("Repeat {} boundary", repeat.count),
+            kind => format!("{kind:?}"),
         };
         let mut roots = BTreeMap::new();
         for value in &self.values {

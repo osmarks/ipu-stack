@@ -2,7 +2,8 @@
 //! and final scheduled tile timelines. No tile IR is needed to evaluate them.
 
 use super::*;
-use crate::{TensorFormat, TileKernelSpec};
+use crate::TensorFormat;
+use crate::mid::MidOperationKind;
 
 pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64, panel_rows: u64) -> u64 {
     match (from, to) {
@@ -72,7 +73,7 @@ impl<'a> Geometry<'a> {
 }
 
 pub(crate) fn kernel_cycles<'a>(
-    kernel: &TileKernelSpec,
+    kernel: &MidOperationKind,
     inputs: impl Fn(usize) -> Option<Geometry<'a>>,
     output: Geometry<'a>,
 ) -> u64 {
@@ -90,7 +91,7 @@ pub(crate) fn kernel_cycles<'a>(
             return u64::MAX;
         };
         let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
-        if *kernel == TileKernelSpec::BiasGelu {
+        if *kernel == MidOperationKind::BiasGelu {
             return crate::kernel::cost::fp8_bias_gelu_cycles(
                 input.elements().checked_div(width).unwrap_or(0),
                 width,
@@ -98,14 +99,14 @@ pub(crate) fn kernel_cycles<'a>(
             );
         }
         return crate::kernel::cost::fp8_elementwise_cycles(
-            matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::BiasGelu),
+            matches!(kernel, MidOperationKind::Gelu | MidOperationKind::BiasGelu),
             input.elements().checked_div(width).unwrap_or(0),
             width,
             output.format().layout.order == ElementOrder::Amp(crate::AmpOrder::Left),
         );
     }
     let work = match kernel {
-        TileKernelSpec::Gemm {
+        MidOperationKind::Gemm {
             multiply,
             inner_block,
             output_columns,
@@ -167,11 +168,11 @@ pub(crate) fn kernel_cycles<'a>(
                 ),
             );
         }
-        TileKernelSpec::FillZero { bytes, .. } => u64::from(*bytes).div_ceil(48),
-        TileKernelSpec::Gelu if output.format().precision == Precision::F16 => {
+        MidOperationKind::FillZero { bytes, .. } => u64::from(*bytes).div_ceil(48),
+        MidOperationKind::Gelu if output.format().precision == Precision::F16 => {
             return crate::kernel::cost::f16_gelu_cycles(elements);
         }
-        TileKernelSpec::AttentionSoftmax {
+        MidOperationKind::AttentionSoftmax {
             key_columns,
             padded_key_columns,
             ..
@@ -183,52 +184,52 @@ pub(crate) fn kernel_cycles<'a>(
                 matches!(output.format().precision, Precision::F8F143 { .. }),
             );
         }
-        TileKernelSpec::Gelu => elements.saturating_mul(10),
-        TileKernelSpec::Add if output.format().precision == Precision::F16 => {
+        MidOperationKind::Gelu => elements.saturating_mul(10),
+        MidOperationKind::Add if output.format().precision == Precision::F16 => {
             return crate::kernel::cost::f16_add_cycles(
                 elements,
                 inputs(0).map_or(elements, Geometry::elements),
                 inputs(1).map_or(elements, Geometry::elements),
             );
         }
-        TileKernelSpec::Add => elements.saturating_mul(3),
-        TileKernelSpec::BiasGelu => {
+        MidOperationKind::Add => elements.saturating_mul(3),
+        MidOperationKind::BiasGelu => {
             return crate::kernel::cost::f16_bias_gelu_cycles(
                 rows,
                 elements.checked_div(rows).unwrap_or(0),
             );
         }
-        TileKernelSpec::AddLayerNorm | TileKernelSpec::LayerNorm => {
+        MidOperationKind::AddLayerNorm | MidOperationKind::LayerNorm => {
             return crate::kernel::cost::f16_layernorm_cycles(
                 rows,
                 u64::from(output.trailing_dimension(0).unwrap_or(0)),
-                matches!(kernel, TileKernelSpec::AddLayerNorm),
+                matches!(kernel, MidOperationKind::AddLayerNorm),
             );
         }
-        TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
+        MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
             let Some(input) = inputs(0) else {
                 return u64::MAX;
             };
             let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
             let rows = input.elements().checked_div(width).unwrap_or(0);
-            let extra = if matches!(kernel, TileKernelSpec::AddLayerNormMoments) {
+            let extra = if matches!(kernel, MidOperationKind::AddLayerNormMoments) {
                 rows * (108 + width.div_ceil(48) * 24)
             } else {
                 0
             };
             return crate::kernel::cost::f16_layernorm_moments_cycles(rows, width) + extra;
         }
-        TileKernelSpec::LayerNormApply { parts } => {
+        MidOperationKind::LayerNormApply { parts } => {
             return crate::kernel::cost::f16_layernorm_apply_cycles(
                 rows,
                 u64::from(output.trailing_dimension(0).unwrap_or(0)),
                 *parts,
             );
         }
-        TileKernelSpec::ReductionSum { partials } => {
+        MidOperationKind::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
-        TileKernelSpec::Cast { from, to } => {
+        MidOperationKind::Cast { from, to } => {
             let columns = u64::from(output.trailing_dimension(0).unwrap_or(1));
             let panel_rows = output
                 .format()
@@ -240,7 +241,7 @@ pub(crate) fn kernel_cycles<'a>(
                 && inputs(0).is_some_and(|input| input.elements() == elements);
             return cast_cycles(*from, *to, elements, if linear { 0 } else { panel_rows });
         }
-        TileKernelSpec::Rearrange { from, .. } => {
+        MidOperationKind::Rearrange { from, .. } => {
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
                 && output.format().precision == Precision::F16
                 && output.format().layout.order == ElementOrder::RowMajor
@@ -264,7 +265,7 @@ pub(crate) fn kernel_cycles<'a>(
                 super::cycles::pack_geometry_cycles(output, elements)
             };
         }
-        TileKernelSpec::AttentionMerge {
+        MidOperationKind::AttentionMerge {
             value_dimension,
             initial,
             final_block,
@@ -278,7 +279,7 @@ pub(crate) fn kernel_cycles<'a>(
                 output.format().precision == Precision::F16,
             );
         }
-        TileKernelSpec::FlashAttention { .. } => {
+        MidOperationKind::FlashAttention { .. } => {
             let (Some(query), Some(key), Some(value), None) =
                 (inputs(0), inputs(1), inputs(2), inputs(3))
             else {
@@ -300,6 +301,7 @@ pub(crate) fn kernel_cycles<'a>(
                 .div_ceil(6)
                 .saturating_add(target.kernel_launch_cycles);
         }
+        _ => return u64::MAX,
     };
     work.saturating_add(target.kernel_launch_cycles)
 }

@@ -1,7 +1,8 @@
 //! Relabel device tiles and bind compute operands to their result ownership.
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing, ProgramError,
+    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
+    ProgramError,
 };
 use crate::tensor::OwnerMap;
 impl MidProgram {
@@ -77,20 +78,24 @@ pub(crate) fn bind_owners(
                     }
                 }
             }
-            MidOperationKind::Compute(compute) => {
+            compute => {
                 for (index, input) in operation.inputs.iter_mut().enumerate() {
                     let result = match compute {
-                        Compute::Kernel { operands, .. } => {
-                            operands.get(index).map(|operand| match operand {
-                                OperandIndexing::Elementwise { result } => *result,
-                                OperandIndexing::Local(_) => 0,
-                            })
+                        MidOperationKind::Product(product) => {
+                            (index < product.operands.len()).then_some(0)
                         }
-                        Compute::Product(product) => (index < product.operands.len()).then_some(0),
-                        Compute::Sum { .. } => None,
+                        MidOperationKind::Sum { .. } => None,
+                        _ => operation.operands.get(index).map(|operand| match operand {
+                            OperandIndexing::Elementwise { result } => *result,
+                            OperandIndexing::Local(_) => 0,
+                        }),
                     };
                     let mut result = result;
-                    for &(output, alias_input) in compute.output_aliases() {
+                    let aliases = match compute {
+                        MidOperationKind::Product(product) => &product.output_aliases,
+                        _ => &operation.output_aliases,
+                    };
+                    for &(output, alias_input) in aliases {
                         if alias_input != index {
                             continue;
                         }
@@ -122,7 +127,6 @@ pub(crate) fn bind_owners(
                     }
                 }
             }
-            _ => {}
         }
         rewritten.push(operation);
     }
@@ -146,7 +150,6 @@ fn append_owner_copy(
     values.push(value);
     operations.push(MidOperation {
         source,
-
         inputs: vec![input],
         results: vec![id],
         kind: MidOperationKind::Copy {
@@ -155,6 +158,8 @@ fn append_owner_copy(
             mapping: CoordinateMapping::default(),
             reuse_local: true,
         },
+        operands: Vec::new(),
+        output_aliases: Vec::new(),
     });
     id
 }

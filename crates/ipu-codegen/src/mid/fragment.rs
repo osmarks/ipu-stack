@@ -1,6 +1,7 @@
 //! Bind executable work to enclosing inputs and return its actual result values.
-use super::{MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId};
+use super::{MidOperation, MidProgram, MidValue, MidValueId};
 use crate::graph::{OperationId, ValueId};
+use crate::mid::MidOperationKind;
 use crate::tensor::OwnerMap;
 
 /// Inputs keep their existing ownership groups; new groups use the working
@@ -133,9 +134,9 @@ fn remap_operations(
 mod tests {
     use super::*;
     use crate::graph::{GraphInputKind, ValueId};
-    use crate::kernel::TileKernelSpec;
+
     use crate::low::{CopyPolicy, PackingPolicy};
-    use crate::mid::{Compute, CoordinateMapping, MidInput, MidRegion, MidRepeat, OperandIndexing};
+    use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat, OperandIndexing};
     use crate::tensor::{Layout, Precision, TensorType};
 
     fn id(i: u32) -> MidValueId {
@@ -170,11 +171,9 @@ mod tests {
             source: None,
             inputs: vec![id(4), id(5)],
             results: vec![id(6)],
-            kind: MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Add,
-                operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
-                output_aliases: vec![(0, 0)],
-            }),
+            kind: MidOperationKind::Add,
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
+            output_aliases: vec![(0, 0)],
         };
         let mut program = MidProgram {
             tile_count: 4,
@@ -196,6 +195,8 @@ mod tests {
                         yields: vec![id(6)],
                     },
                 }),
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             }],
             ..MidProgram::default()
         };
@@ -226,10 +227,9 @@ mod tests {
         for op in operations {
             let result = match &op.kind {
                 MidOperationKind::Copy { .. } => vec![values[op.inputs[0].index() as usize]],
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Add,
-                    ..
-                }) => vec![op.inputs.iter().map(|i| values[i.index() as usize]).sum()],
+                MidOperationKind::Add => {
+                    vec![op.inputs.iter().map(|i| values[i.index() as usize]).sum()]
+                }
                 MidOperationKind::Repeat(repeat) => {
                     let mut arguments = op
                         .inputs
@@ -282,10 +282,7 @@ mod tests {
             unreachable!()
         };
         let add = repeat.body.operations.last_mut().unwrap();
-        let MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) = &mut add.kind
-        else {
-            unreachable!()
-        };
+        let output_aliases = &mut add.output_aliases;
         output_aliases.clear();
         program.values[6].storage_group = id(6);
         program.values[6].owners = crate::tensor::OwnerMap::embedded(vec![3]);
@@ -328,7 +325,6 @@ mod tests {
         for index in 0..2 {
             fragment.operations.push(MidOperation {
                 source: None,
-
                 inputs: vec![id(index)],
                 results: vec![id(index + 1)],
                 kind: MidOperationKind::Copy {
@@ -337,6 +333,8 @@ mod tests {
                     policy: CopyPolicy::Automatic,
                     packing: PackingPolicy::Automatic,
                 },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             });
         }
         let mut bound = MidProgram {
@@ -442,10 +440,7 @@ mod tests {
             let weight = &bound.values[repeat.body.arguments[1].index() as usize];
             assert_eq!(weight.storage_group, id(3));
             assert_eq!(weight.owners, bound.values[3].owners);
-            let MidOperationKind::Compute(compute) = &repeat.body.operations.last().unwrap().kind
-            else {
-                panic!()
-            };
+            let compute = repeat.body.operations.last().unwrap();
             assert_eq!(compute.output_aliases(), &[(0, 0)]);
         }
     }

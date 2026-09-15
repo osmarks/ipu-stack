@@ -1,9 +1,9 @@
 //! Fuse supported producer epilogues before or after redistribution.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
 use crate::low::CopyPolicy;
+use crate::mid::MidOperationKind;
 use crate::mid::{
-    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
-    OperandIndexing, cast_order,
+    CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing, cast_order,
 };
 use crate::tensor::{ElementOrder, TensorFormat};
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // A producer may write a cast's explicit result when its F16 intermediate
 // has no other readers. Keep the separate path whenever it costs less.
 // Price both legal execution locations with the same matching/safety rules.
-pub(super) fn fuse(
+pub(super) fn run(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
@@ -64,12 +64,11 @@ fn fuse_fp8_outputs_at(
             continue;
         }
         let producer = &operations[previous];
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel, operands, ..
-        }) = &producer.kind
-        else {
-            continue;
-        };
+        let crate::MidOperation {
+            kind: kernel,
+            operands,
+            ..
+        } = &producer;
         let Some(capability) = kernel.output_capability(
             values[cast.results[0].index() as usize]
                 .tensor_type
@@ -177,11 +176,9 @@ fn fuse_fp8_outputs_at(
             value.storage_group = value.id;
             let mut fused = producer.clone();
             fused.results = vec![value.id];
-            fused.kind = MidOperationKind::Compute(Compute::Kernel {
-                kernel: kernel.clone(),
-                operands: operands.clone(),
-                output_aliases: vec![],
-            });
+            fused.kind = kernel.clone();
+            fused.operands = operands.clone();
+            fused.output_aliases = vec![];
             let copy = MidOperation {
                 inputs: vec![value.id],
                 kind: MidOperationKind::Copy {
@@ -191,6 +188,8 @@ fn fuse_fp8_outputs_at(
                     packing: crate::PackingPolicy::Automatic,
                 },
                 results: cast.results.clone(),
+                operands: vec![],
+                output_aliases: vec![],
                 ..*cast
             };
             values.push(value);
@@ -217,11 +216,9 @@ fn fuse_fp8_outputs_at(
         if redistributed {
             replacement.inputs = cast.inputs.clone();
         }
-        replacement.kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: kernel.clone(),
-            operands: operands.clone(),
-            output_aliases: Vec::new(),
-        });
+        replacement.kind = kernel.clone();
+        replacement.operands = operands.clone();
+        replacement.output_aliases = Vec::new();
         let original_value_count = values.len();
         let mut new_values = Vec::new();
         let mut copies = vec![];
@@ -277,6 +274,8 @@ fn fuse_fp8_outputs_at(
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 });
                 replacement.inputs.push(value.id);
                 new_values.push(value);

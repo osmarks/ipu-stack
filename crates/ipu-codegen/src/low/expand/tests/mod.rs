@@ -1,4 +1,4 @@
-use crate::mid::Compute;
+use crate::mid::MidOperationKind;
 use crate::planner::catalogue::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
 fn lower_to_tiles(
@@ -19,7 +19,7 @@ use crate::planner::operator::{
 use crate::planner::test_support::lower;
 use crate::{
     AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GridOrder, Layout, MemoryClass,
-    Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec,
+    Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
 };
 use std::collections::BTreeSet;
 
@@ -326,7 +326,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
     let run = builder
         .bind_kernel(
             provenance,
-            TileKernelSpec::Gelu,
+            MidOperationKind::Gelu,
             vec![source_view.clone()],
             vec![source_view.clone()],
         )
@@ -338,7 +338,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
         builder
             .bind_kernel(
                 provenance,
-                TileKernelSpec::Gelu,
+                MidOperationKind::Gelu,
                 vec![outside],
                 vec![run.outputs[0].clone()]
             )
@@ -350,7 +350,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
     assert!(matches!(
         builder.bind_kernel(
             provenance,
-            TileKernelSpec::Gelu,
+            MidOperationKind::Gelu,
             vec![builder.full_view(unavailable)],
             vec![builder.full_view(source)]
         ),
@@ -395,15 +395,7 @@ fn panel_construction_keeps_both_operand_casts_materialized() {
     let casts = mid
         .operations
         .iter()
-        .filter(|op| {
-            matches!(
-                op.kind,
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Cast { .. },
-                    ..
-                })
-            )
-        })
+        .filter(|op| matches!(op.kind, MidOperationKind::Cast { .. }))
         .collect::<Vec<_>>();
     assert_eq!(casts.len(), 2);
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
@@ -585,12 +577,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let sum = compact
             .operations
             .iter()
-            .find(|op| {
-                matches!(
-                    op.kind,
-                    MidOperationKind::Compute(Compute::Sum { axis: 0, .. })
-                )
-            })
+            .find(|op| matches!(op.kind, MidOperationKind::Sum { axis: 0, .. }))
             .unwrap();
         assert_eq!(
             compact.values[sum.inputs[0].index() as usize]
@@ -612,14 +599,14 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let reduction_runs = low
             .kernel_runs
             .iter()
-            .filter(|run| matches!(run.kernel, TileKernelSpec::ReductionSum { .. }))
+            .filter(|run| matches!(run.kernel, MidOperationKind::ReductionSum { .. }))
             .collect::<Vec<_>>();
         assert!(!reduction_runs.is_empty(), "case {case}");
         assert!(
             reduction_runs.iter().all(|run| {
                 matches!(
                     run.kernel,
-                    TileKernelSpec::ReductionSum { partials }
+                    MidOperationKind::ReductionSum { partials }
                         if partials == match reduction_staging {
                             crate::ReductionStaging::Complete => inner_partitions,
                             crate::ReductionStaging::Streamed => 2,
@@ -648,7 +635,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .kernel_runs
             .iter()
             .filter(|run| {
-                matches!(run.kernel, TileKernelSpec::Gemm { .. })
+                matches!(run.kernel, MidOperationKind::Gemm { .. })
                     && parameter_shards.contains(&run.inputs[1].shard)
             })
             .count();
@@ -837,7 +824,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
                 BlockOperation::Compute { run, .. }
                     if matches!(
                         low.kernel_runs[run.0 as usize].kernel,
-                        TileKernelSpec::Gemm { .. }
+                        MidOperationKind::Gemm { .. }
                     ) =>
                 {
                     Some(&low.kernel_runs[run.0 as usize])
@@ -859,7 +846,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
             );
         }
         for run in &low.kernel_runs {
-            if matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
+            if matches!(run.kernel, MidOperationKind::Gemm { .. }) {
                 let input = &run.inputs[0];
                 assert_ne!(
                     low.shards[input.shard.index() as usize].definition,
@@ -867,7 +854,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
                     "case {case}"
                 );
                 let inner = input.extents.last().unwrap();
-                let TileKernelSpec::Gemm { inner_block, .. } = &run.kernel else {
+                let MidOperationKind::Gemm { inner_block, .. } = &run.kernel else {
                     continue;
                 };
                 assert!(
@@ -1490,7 +1477,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
                     BlockOperation::Compute { run, .. }
                         if matches!(
                             low.kernel_runs[run.0 as usize].kernel,
-                            TileKernelSpec::Add
+                            MidOperationKind::Add
                         ) =>
                     {
                         Some(&low.kernel_runs[run.0 as usize])
@@ -1562,7 +1549,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                     BlockOperation::Compute { run, .. }
                         if matches!(
                             low.kernel_runs[run.0 as usize].kernel,
-                            TileKernelSpec::Gemm { .. }
+                            MidOperationKind::Gemm { .. }
                         ) =>
                     {
                         Some(&low.kernel_runs[run.0 as usize])
@@ -1575,7 +1562,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                 assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
                 assert!(run.provenance.operation.is_some());
                 assert!(run.provenance.value.is_some());
-                let TileKernelSpec::Gemm {
+                let MidOperationKind::Gemm {
                     mode,
                     inner_block: kernel_inner,
                     output_columns: kernel_columns,
@@ -1711,12 +1698,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
         let product = selected
             .operations
             .iter()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Compute(Compute::Product(_))
-                )
-            })
+            .find(|operation| matches!(operation.kind, MidOperationKind::Product(_)))
             .unwrap();
         let config = config
             .with_input(
@@ -1747,7 +1729,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                     matches!(
                         work,
                         BlockOperation::Compute { run, .. }
-                            if matches!(low.kernel_runs[run.0 as usize].kernel, TileKernelSpec::Gemm {
+                            if matches!(low.kernel_runs[run.0 as usize].kernel, MidOperationKind::Gemm {
                                 weights: crate::GemmWeightLoad::Interleaved,
                                 ..
                             })
@@ -2036,14 +2018,20 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
 
 #[test]
 fn repeat_copy_yield_reaches_the_carried_allocation() {
-    use crate::{Compute, CoordinateMapping, MidInput, MidRegion, MidValue, OperandIndexing};
+    use crate::{CoordinateMapping, MidInput, MidRegion, MidValue, OperandIndexing};
     let id = MidValueId::from_index;
     let tensor_type = TensorType::new([8, 16], Precision::F16, Layout::row_sharded(1));
     let operation = |inputs: &[u32], result, kind| MidOperation {
         source: None,
         inputs: inputs.iter().copied().map(id).collect(),
         results: vec![id(result)],
+        operands: if matches!(kind, MidOperationKind::Gelu) {
+            vec![OperandIndexing::Elementwise { result: 0 }]
+        } else {
+            vec![]
+        },
         kind,
+        output_aliases: Vec::new(),
     };
     let mid = MidProgram {
         tile_count: 1,
@@ -2074,15 +2062,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                     arguments: vec![id(1)],
                     yields: vec![id(3)],
                     operations: vec![
-                        operation(
-                            &[1],
-                            2,
-                            MidOperationKind::Compute(Compute::Kernel {
-                                kernel: TileKernelSpec::Gelu,
-                                operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                                output_aliases: vec![],
-                            }),
-                        ),
+                        operation(&[1], 2, MidOperationKind::Gelu),
                         operation(
                             &[2],
                             3,
@@ -2525,7 +2505,7 @@ fn local_casts_pair_corresponding_linear_fragments() {
         .filter(|run| {
             matches!(
                 run.kernel,
-                TileKernelSpec::Cast {
+                MidOperationKind::Cast {
                     from: Precision::F32,
                     to: Precision::F16
                 }

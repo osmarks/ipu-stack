@@ -1,5 +1,6 @@
 //! Consume shrinking casts in bank-separated chunks over shifted shared storage.
 use super::*;
+use crate::mid::MidOperationKind;
 
 impl TileGraphBuilder {
     pub(super) fn build_shifted_cast(
@@ -7,7 +8,7 @@ impl TileGraphBuilder {
         body: &mut BlockRegion,
         tile: u16,
         provenance: WorkProvenance,
-        kernel: TileKernelSpec,
+        kernel: MidOperationKind,
         input: ShardView,
         output: ShardView,
     ) -> ExpansionResult<()> {

@@ -1,7 +1,8 @@
 //! Coordinate-copy semantics and composition before tile expansion.
 
 use crate::low::CopyPolicy;
-use crate::mid::{Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId};
+use crate::mid::MidOperationKind;
+use crate::mid::{MidOperation, MidProgram, MidValue, MidValueId};
 use crate::tensor::{AxisFactorView, TensorShape};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -170,7 +171,7 @@ pub(crate) fn independent_sum_prefix(
     storage_groups: &[MidValueId],
 ) -> usize {
     independent_prefix(operations, checkpoints, storage_groups, |kind| {
-        matches!(kind, MidOperationKind::Compute(Compute::Sum { .. }))
+        matches!(kind, MidOperationKind::Sum { .. })
     })
 }
 
@@ -464,6 +465,8 @@ mod tests {
                     mapping: CoordinateMapping::default(),
                     reuse_local: true,
                 },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             })
             .collect();
         (operations, values)
@@ -488,8 +491,11 @@ mod tests {
     fn copy_composition_stops_at_numeric_casts() {
         let (mut operations, mut values) = chain();
         values[0].tensor_type.format.precision = Precision::F32;
-        operations[0].kind =
-            MidOperationKind::Compute(Compute::cast(Precision::F32, Precision::F16));
+        operations[0].kind = MidOperationKind::Cast {
+            from: Precision::F32,
+            to: Precision::F16,
+        };
+        operations[0].operands = vec![crate::OperandIndexing::Elementwise { result: 0 }];
         let cast = operations[0].clone();
         compose(&mut operations, &values, &[MidValueId(3)]);
         assert_eq!(operations.len(), 2);

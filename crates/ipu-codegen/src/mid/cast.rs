@@ -1,9 +1,8 @@
 //! Storage donation for shrinking casts with a bank-separated output prefix.
-use crate::kernel::TileKernelSpec;
+
 use crate::kernel::cast::{CAST_PREFIX_BYTES, CastChunks};
-use crate::mid::{
-    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, OperandIndexing,
-};
+use crate::mid::MidOperationKind;
+use crate::mid::{MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::Precision;
 use std::collections::BTreeSet;
 
@@ -35,15 +34,14 @@ fn donate(
             MidOperationKind::Copy {
                 reuse_local: true, ..
             } => bound.extend(op.inputs.iter().copied()),
-            MidOperationKind::Compute(compute) => {
-                let output_aliases = compute.output_aliases();
+            _ => {
+                let output_aliases = op.output_aliases();
                 for &(output, input) in output_aliases {
                     if bound.contains(&op.results[output]) {
                         bound.insert(op.inputs[input]);
                     }
                 }
             }
-            _ => {}
         }
     }
     let producers = super::rewrite::single_use_producers(operations, required);
@@ -85,12 +83,11 @@ fn donate(
         }
         let fresh = match &operations[producer].kind {
             MidOperationKind::Copy { .. } => true,
-            MidOperationKind::Compute(Compute::Sum { .. }) => false,
-            MidOperationKind::Compute(compute) => {
-                let output_aliases = compute.output_aliases();
+            MidOperationKind::Sum { .. } | MidOperationKind::Repeat(_) => false,
+            _ => {
+                let output_aliases = operations[producer].output_aliases();
                 output_aliases.is_empty()
             }
-            _ => false,
         };
         if !fresh {
             continue;
@@ -126,14 +123,12 @@ fn donate(
         if let MidOperationKind::Copy { reuse_local, .. } = &mut operations[producer].kind {
             *reuse_local = false;
         }
-        operations[index].kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Cast {
-                from: Precision::F16,
-                to: target.tensor_type.format.precision,
-            },
-            operands: vec![OperandIndexing::Elementwise { result: 0 }],
-            output_aliases: vec![(0, 0)],
-        });
+        operations[index].kind = MidOperationKind::Cast {
+            from: Precision::F16,
+            to: target.tensor_type.format.precision,
+        };
+        operations[index].operands = vec![OperandIndexing::Elementwise { result: 0 }];
+        operations[index].output_aliases = vec![(0, 0)];
         tracing::debug!(?input, ?output, "donated cast input storage");
         values[output.index() as usize].storage_group =
             values[input.index() as usize].storage_group;
@@ -190,19 +185,19 @@ mod tests {
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
                     },
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 },
                 MidOperation {
                     source: None,
                     inputs: vec![MidValueId(1)],
                     results: vec![MidValueId(2)],
-                    kind: MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Cast {
-                            from: Precision::F16,
-                            to: Precision::F8F143 { scale_exponent: 0 },
-                        },
-                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                        output_aliases: vec![],
-                    }),
+                    kind: MidOperationKind::Cast {
+                        from: Precision::F16,
+                        to: Precision::F8F143 { scale_exponent: 0 },
+                    },
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                    output_aliases: vec![],
                 },
             ],
             ..MidProgram::default()
@@ -331,6 +326,8 @@ mod tests {
                 iterated_inputs: vec![],
                 body,
             }),
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         });
         mid.reuse_cast_inputs();
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
@@ -362,6 +359,8 @@ mod tests {
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         });
         let old = mid.clone();
         donate(&mut mid.operations, &mut mid.values, &[MidValueId(3)], true);
@@ -391,7 +390,7 @@ mod tests {
         let casts = low
             .kernel_runs
             .iter()
-            .filter(|run| matches!(run.kernel, TileKernelSpec::Cast { .. }))
+            .filter(|run| matches!(run.kernel, MidOperationKind::Cast { .. }))
             .collect::<Vec<_>>();
         assert!(casts.len() >= 2);
         for run in casts {

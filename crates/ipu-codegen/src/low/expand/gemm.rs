@@ -2,6 +2,7 @@
 //! contraction/column blocks, batch matrices and bound GEMM calls.
 
 use super::*;
+use crate::mid::MidOperationKind;
 
 impl TileGraphBuilder {
     pub(super) fn build_product(
@@ -137,7 +138,7 @@ impl TileGraphBuilder {
                     &self.full_view(output),
                     &[(output_column, column, column_end)],
                 )?;
-                let kernel = TileKernelSpec::Gemm {
+                let kernel = MidOperationKind::Gemm {
                     multiply: product.multiply,
                     accumulate: product.accumulate,
                     mode: if k == 0 {
@@ -295,7 +296,7 @@ fn narrow_gemm_matrix_view(
 mod tests {
     use super::*;
     use crate::{
-        AccumulationPrecision, Compute, GraphInputKind, MidInput, MidValue, Product, ProductAxes,
+        AccumulationPrecision, GraphInputKind, MidInput, MidValue, Product, ProductAxes,
         TensorAxis, ValueId,
     };
 
@@ -382,7 +383,7 @@ mod tests {
                     source: None,
                     inputs: vec![MidValueId::from_index(0), MidValueId::from_index(1)],
                     results: vec![MidValueId::from_index(2)],
-                    kind: MidOperationKind::Compute(Compute::Product(Product {
+                    kind: MidOperationKind::Product(Product {
                         multiply: Precision::F16,
                         accumulate: AccumulationPrecision::F32,
                         mode: crate::GemmKernelMode::Initialize,
@@ -397,7 +398,9 @@ mod tests {
                         },
                         operands: Default::default(),
                         output_aliases: Vec::new(),
-                    })),
+                    }),
+                    operands: Vec::new(),
+                    output_aliases: Vec::new(),
                 }],
                 ..MidProgram::default()
             };

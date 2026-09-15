@@ -2,8 +2,9 @@
 //! tensor program and axis partitions, not the number of tile IR objects.
 
 use super::*;
-use crate::Compute;
-use crate::{MidOperationKind, MidProgram, TileKernelSpec};
+use crate::mid::MidOperationKind;
+
+use crate::MidProgram;
 
 /// Price complete replacement sequences with the same overflow and missing-cost rules.
 pub(crate) fn operation_cycles<'a>(
@@ -114,31 +115,25 @@ fn analyze_storage<const PER_TILE: bool>(
         parent[a.max(b)] = a.min(b);
     };
     for (operation, _) in &steps {
-        match &operation.kind {
-            MidOperationKind::Compute(compute) => {
-                let output_aliases = compute.output_aliases();
-                for &(output, input) in output_aliases {
-                    alias(operation.results[output], operation.inputs[input]);
-                }
+        for &(output, input) in operation.output_aliases() {
+            alias(operation.results[output], operation.inputs[input]);
+        }
+        if let MidOperationKind::Repeat(repeat) = &operation.kind {
+            for (&argument, &input) in repeat.body.arguments.iter().zip(&operation.inputs) {
+                alias(argument, input);
             }
-            MidOperationKind::Repeat(repeat) => {
-                for (&argument, &input) in repeat.body.arguments.iter().zip(&operation.inputs) {
-                    alias(argument, input);
-                }
-                for (&result, &input) in operation.results.iter().zip(&operation.inputs) {
-                    alias(result, input);
-                }
-                for (&argument, values) in repeat
-                    .body
-                    .arguments
-                    .iter()
-                    .skip(operation.inputs.len())
-                    .zip(&repeat.iterated_inputs)
-                {
-                    alias(argument, *values.first()?);
-                }
+            for (&result, &input) in operation.results.iter().zip(&operation.inputs) {
+                alias(result, input);
             }
-            _ => {}
+            for (&argument, values) in repeat
+                .body
+                .arguments
+                .iter()
+                .skip(operation.inputs.len())
+                .zip(&repeat.iterated_inputs)
+            {
+                alias(argument, *values.first()?);
+            }
         }
     }
     for id in 0..parent.len() {
@@ -148,7 +143,7 @@ fn analyze_storage<const PER_TILE: bool>(
     let mut element = vec![false; roots.len()];
     let mut tail = vec![0; roots.len()];
     for (operation, _) in &steps {
-        if let MidOperationKind::Compute(Compute::Product(product)) = &operation.kind {
+        if let MidOperationKind::Product(product) = &operation.kind {
             element[roots[operation.inputs[0].index() as usize]] = true;
             element[roots[operation.results[0].index() as usize]] = true;
             tail[roots[operation.inputs[0].index() as usize]] = 8 * product.multiply.bytes();
@@ -162,10 +157,11 @@ fn analyze_storage<const PER_TILE: bool>(
     let shifted_inputs = steps
         .iter()
         .filter_map(|(operation, _)| {
-            matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
-            output_aliases, ..
-        }) if output_aliases == &[(0, 0)])
+            matches!(operation, MidOperation {
+kind: MidOperationKind::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
+output_aliases,
+..
+} if output_aliases == &[(0, 0)])
             .then(|| operation.inputs[0])
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -407,19 +403,15 @@ fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
     })
 }
 
-fn operand_tensors(
-    operation: &MidOperation,
-    values: &[MidValue],
-    compute: &Compute,
-) -> Option<Vec<TensorType>> {
+fn operand_tensors(operation: &MidOperation, values: &[MidValue]) -> Option<Vec<TensorType>> {
     operation
         .inputs
         .iter()
-        .take(compute.input_count())
+        .take(operation.input_count())
         .enumerate()
         .map(|(index, &id)| {
             let mut local = local_tensor(&values[id.index() as usize].tensor_type)?;
-            for &(axis, start, end) in compute
+            for &(axis, start, end) in operation
                 .operand_window(index)
                 .into_iter()
                 .flat_map(|window| &window.0)
@@ -446,43 +438,8 @@ pub(crate) fn operation_cost(
     let mut rows = 0;
     let mut price = ProgramCycles::default();
     match &operation.kind {
-        MidOperationKind::Compute(
-            compute @ Compute::Kernel {
-                kernel,
-                output_aliases,
-                ..
-            },
-        ) => {
-            let mut inputs = operand_tensors(operation, values, compute)?;
-            price.total = super::primitive::kernel_cycles(
-                kernel,
-                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
-                super::primitive::Geometry::Tensor(&out),
-            );
-            if matches!(
-                kernel,
-                TileKernelSpec::Cast {
-                    from: Precision::F16,
-                    to: Precision::F8F143 { .. }
-                }
-            ) && output_aliases == &[(0, 0)]
-            {
-                let chunks =
-                    crate::kernel::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
-                price.total = 0;
-                for (start, end) in chunks.ranges {
-                    out.shape.0[chunks.axis] = end - start;
-                    inputs[0].shape.0[chunks.axis] = end - start;
-                    price.total += super::primitive::kernel_cycles(
-                        kernel,
-                        |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
-                        super::primitive::Geometry::Tensor(&out),
-                    );
-                }
-            }
-        }
-        MidOperationKind::Compute(compute @ Compute::Product(product)) => {
-            let mut inputs = operand_tensors(operation, values, compute)?;
+        MidOperationKind::Product(product) => {
+            let mut inputs = operand_tensors(operation, values)?;
             let axes = product.axes;
             let left_axis = axes.left_inner.resolve(inputs[0].shape.0.len()).ok()?;
             let right_axis = axes.right_inner.resolve(inputs[1].shape.0.len()).ok()?;
@@ -502,7 +459,7 @@ pub(crate) fn operation_cost(
             inputs[1].shape.0[right_axis] = inner;
             out.shape.0[column_axis] = columns;
             price.total = super::primitive::kernel_cycles(
-                &TileKernelSpec::Gemm {
+                &MidOperationKind::Gemm {
                     multiply: product.multiply,
                     accumulate: product.accumulate,
                     mode: product.mode,
@@ -515,7 +472,7 @@ pub(crate) fn operation_cost(
             )
             .saturating_mul(calls);
         }
-        MidOperationKind::Compute(Compute::Sum { axis, staging }) => {
+        MidOperationKind::Sum { axis, staging } => {
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);
             let remote = contributors.saturating_sub(1);
             let bytes = maximum_shard_bytes(output);
@@ -595,6 +552,36 @@ pub(crate) fn operation_cost(
             }
         }
         MidOperationKind::Repeat(_) => unreachable!(),
+        kernel => {
+            let output_aliases = &operation.output_aliases;
+            let mut inputs = operand_tensors(operation, values)?;
+            price.total = super::primitive::kernel_cycles(
+                kernel,
+                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
+                super::primitive::Geometry::Tensor(&out),
+            );
+            if matches!(
+                kernel,
+                MidOperationKind::Cast {
+                    from: Precision::F16,
+                    to: Precision::F8F143 { .. }
+                }
+            ) && output_aliases == &[(0, 0)]
+            {
+                let chunks =
+                    crate::kernel::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
+                price.total = 0;
+                for (start, end) in chunks.ranges {
+                    out.shape.0[chunks.axis] = end - start;
+                    inputs[0].shape.0[chunks.axis] = end - start;
+                    price.total += super::primitive::kernel_cycles(
+                        kernel,
+                        |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
+                        super::primitive::Geometry::Tensor(&out),
+                    );
+                }
+            }
+        }
     }
     Some((price, scratch, rows))
 }

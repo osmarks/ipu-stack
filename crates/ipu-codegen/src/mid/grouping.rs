@@ -1,9 +1,9 @@
 //! Group independent reductions and distribute their preparation across tiles.
 //! These whole-program passes choose groups directly within each Repeat region.
 use super::{
-    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, ProgramError,
-    independent_copy_prefix,
+    MidOperation, MidProgram, MidValue, MidValueId, ProgramError, independent_copy_prefix,
 };
+use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, OwnerMap};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,10 +38,8 @@ impl MidProgram {
                     for input in operation.read_values() {
                         uses[groups[input.index() as usize].index() as usize] += 1;
                     }
-                    if matches!(
-                        operation.kind,
-                        MidOperationKind::Compute(Compute::Sum { .. })
-                    ) && operation.results.len() == 1
+                    if matches!(operation.kind, MidOperationKind::Sum { .. })
+                        && operation.results.len() == 1
                     {
                         producers.insert(operation.results[0], operation);
                     }
@@ -118,8 +116,8 @@ fn group_region(
             if selected.len() >= limit
                 || !(matches!(
                     op.kind,
-                    MidOperationKind::Copy { .. } | MidOperationKind::Compute(Compute::Sum { .. })
-                ) || matches!(&op.kind, MidOperationKind::Compute(Compute::Product(product)) if product.output_aliases.is_empty()))
+                    MidOperationKind::Copy { .. } | MidOperationKind::Sum { .. }
+                ) || matches!(&op.kind, MidOperationKind::Product(product) if product.output_aliases.is_empty()))
                 || selected
                     .iter()
                     .any(|&i| conflicts(&operations[i], op, values))
@@ -229,7 +227,7 @@ fn reduction_outputs(
         .iter()
         .enumerate()
         .filter_map(|(i, op)| {
-            (matches!(op.kind, MidOperationKind::Compute(Compute::Sum { .. }))
+            (matches!(op.kind, MidOperationKind::Sum { .. })
                 && op.results.len() == 1
                 && used.contains(&group(op.results[0]))
                 && !forbidden.contains(&group(op.results[0])))
@@ -288,7 +286,7 @@ fn separate_homes<'a>(
 mod tests {
     use super::*;
     use crate::graph::{ComputeGraph, ValueId};
-    use crate::kernel::TileKernelSpec;
+
     use crate::mid::{CoordinateMapping, MidRegion, MidRepeat, ReductionStaging};
     use crate::tensor::{AxisFactorView, Layout, Precision, TensorType};
 
@@ -331,6 +329,8 @@ mod tests {
             inputs: vec![MidValueId::from_index(input)],
             results: vec![MidValueId::from_index(output)],
             kind: primitive,
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
         };
         let copy = |input, output| {
             operation(
@@ -356,18 +356,18 @@ mod tests {
             operation(
                 4,
                 0,
-                MidOperationKind::Compute(Compute::Sum {
+                MidOperationKind::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                }),
+                },
             ),
             operation(
                 5,
                 1,
-                MidOperationKind::Compute(Compute::Sum {
+                MidOperationKind::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                }),
+                },
             ),
             copy(0, 2),
             copy(1, 3),
@@ -451,6 +451,8 @@ mod tests {
                         yields,
                     },
                 }),
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
             });
             body
         };
@@ -476,11 +478,9 @@ mod tests {
         );
 
         assert!(delayed.overlap_reductions(1).is_none());
-        delayed.operations[1].kind = MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Gelu,
-            operands: Vec::new(),
-            output_aliases: vec![(0, 0)],
-        });
+        delayed.operations[1].kind = MidOperationKind::Gelu;
+        delayed.operations[1].operands = Vec::new();
+        delayed.operations[1].output_aliases = vec![(0, 0)];
         assert!(delayed.overlap_reductions(2).is_none());
         delayed.operations[1] = copy(5, 4); // Would overwrite a delayed partial.
         assert!(delayed.overlap_reductions(2).is_none());
