@@ -267,7 +267,6 @@ mod tests {
                         results: vec![MidValueId::from_index(1)],
                         kind: MidOperationKind::Copy {
                             mapping: CoordinateMapping::default(),
-                            reuse_local: false,
                             packing: crate::PackingPolicy::Automatic,
                             policy: default_copy_policy(
                                 &source.format.layout,

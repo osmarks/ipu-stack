@@ -169,15 +169,6 @@ impl KernelRun {
             if view.bind(shards)?.shard.tile != tile {
                 return Err(KernelAbiError::RequirementMismatch.into());
             }
-            if matches!(kernel, MidOperationKind::ReductionSum { .. })
-                && view
-                    .bind(shards)?
-                    .traversal(crate::CopyOrder::Physical)?
-                    .contiguous_span()
-                    .is_none()
-            {
-                return Err(KernelAbiError::RequirementMismatch.into());
-            }
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;
         let shared = metadata.iter().find(|metadata| {

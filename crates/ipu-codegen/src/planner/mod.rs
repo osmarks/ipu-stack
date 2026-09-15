@@ -17,7 +17,7 @@ mod parameter_homes;
 mod reduction;
 pub use catalogue::OperatorCandidate;
 pub use error::{LoweringError, LoweringResult};
-pub use operator::{GemmOrientation, LocalOperandStaging, OperatorFamily};
+pub use operator::{GemmOrientation, OperatorFamily};
 pub use reduction::ReductionStaging;
 #[cfg(test)]
 pub(crate) mod test_support;

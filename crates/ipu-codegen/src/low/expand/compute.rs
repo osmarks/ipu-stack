@@ -2,20 +2,9 @@
 //! construction and iteration are complete before this stage.
 
 use super::*;
+use crate::OperandIndexing;
 use crate::mid::MidOperationKind;
 use crate::tensor::Broadcast;
-use crate::{OperandIndexing, OperandWindow};
-
-/// Writable aliases need complete allocations, rather than borrowed slices.
-pub(super) fn allocation_inputs<'a>(
-    operation: &'a MidOperation,
-) -> impl Iterator<Item = &'a MidValueId> {
-    operation
-        .output_aliases
-        .iter()
-        .map(|&(_, input)| input)
-        .filter_map(|index| operation.inputs.get(index))
-}
 
 impl TileGraphBuilder {
     pub(super) fn build_compute(
@@ -111,11 +100,15 @@ impl TileGraphBuilder {
                             let source = resident
                                 .get(index)
                                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                            if matches!(indexing, OperandIndexing::Fragment(_)) {
-                                self.fragment_window(source, window)
-                            } else {
-                                self.window(source, window)
-                            }
+                            Ok(ShardView {
+                                shard: source.shard,
+                                extents: window
+                                    .select(
+                                        &source.extents,
+                                        matches!(indexing, OperandIndexing::Fragment(_)),
+                                    )
+                                    .ok_or(ExpansionError::InvalidOperatorPlan)?,
+                            })
                         }
                     }
                 })
@@ -124,13 +117,13 @@ impl TileGraphBuilder {
                 .into_iter()
                 .enumerate()
                 .map(|(index, shard)| {
-                    let view = self.full_view(shard);
-                    operation
-                        .output_windows
-                        .get(index)
-                        .map_or(Ok(view.clone()), |window| {
-                            self.fragment_window(&view, window)
-                        })
+                    let mut view = self.full_view(shard);
+                    if let Some(window) = operation.output_windows.get(index) {
+                        view.extents = window
+                            .select(&view.extents, true)
+                            .ok_or(ExpansionError::InvalidOperatorPlan)?;
+                    }
+                    Ok(view)
                 })
                 .collect::<ExpansionResult<Vec<_>>>()?;
             if inputs
@@ -210,38 +203,6 @@ impl TileGraphBuilder {
             }
         }
         Some(view)
-    }
-
-    pub(super) fn window(
-        &self,
-        source: &ShardView,
-        window: &OperandWindow,
-    ) -> ExpansionResult<ShardView> {
-        let ranges = window
-            .0
-            .iter()
-            .map(|&(axis, start, end)| (usize::from(axis), start, end))
-            .collect::<Vec<_>>();
-        self.narrow_view(source, &ranges)
-    }
-
-    fn fragment_window(
-        &self,
-        source: &ShardView,
-        window: &OperandWindow,
-    ) -> ExpansionResult<ShardView> {
-        let mut result = source.clone();
-        for &(axis, start, end) in &window.0 {
-            let e = result
-                .extents
-                .get_mut(axis as usize)
-                .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            let origin = e.start;
-            e.start = origin.saturating_add(start).min(e.physical_end);
-            e.physical_end = origin.saturating_add(end).min(e.physical_end).max(e.start);
-            e.logical_end = e.logical_end.min(e.physical_end).max(e.start);
-        }
-        Ok(result)
     }
 
     /// Preserve per-tile fragment order without rescanning all shards for each

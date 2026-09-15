@@ -296,7 +296,7 @@ pub use planner::ReductionStaging;
 pub use supervisor::*;
 // Compatibility name for planner choices; this is not an executable mid node.
 pub use planner::OperatorFamily as MidOperator;
-pub use planner::{GemmOrientation, LocalOperandStaging, OperatorCandidate};
+pub use planner::{GemmOrientation, OperatorCandidate};
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
 pub(crate) use tensor::*;

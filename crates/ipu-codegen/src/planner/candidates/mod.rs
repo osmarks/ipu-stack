@@ -18,8 +18,8 @@ use crate::planner::catalogue::{
     gemm_accumulation_precision, gemm_plan,
 };
 use crate::planner::operator::{
-    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan,
+    GemmDistribution, GemmOrientation, OperandMaterialization, OperandRequirement,
+    OperatorDispatch, OperatorFamily, OperatorPlan,
 };
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AxisTiling, BlockMajorOrder,
@@ -746,7 +746,6 @@ pub(super) fn gemm_plan_matches(
         && *output_column_block == constraint.output_column_block
         && weight.format.layout.memory_class == constraint.weight_memory_class
         && *reduction_staging == constraint.reduction_staging
-        && weight.local_staging == constraint.local_weight_staging
 }
 
 pub(super) fn independent_parameter_storage(
@@ -1226,14 +1225,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     GemmOrientation::Swapped => TensorAxis::FromEnd(2),
                 },
             );
-            let physical_right_index = orientation.operand_indices().1;
-            let local_staging_options: &[_] = match orientation {
-                GemmOrientation::Normal => &[LocalOperandStaging::Direct],
-                GemmOrientation::Swapped => &[
-                    LocalOperandStaging::Direct,
-                    LocalOperandStaging::MatchRemote,
-                ],
-            };
             let maximum_result_rows = u16::try_from(rows / u32::from(row_partitions))
                 .unwrap_or(u16::MAX)
                 .min(inner_partitions);
@@ -1344,45 +1335,42 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                         || vec![ReductionStaging::Complete, ReductionStaging::Streamed],
                         |constraint| vec![constraint.reduction_staging],
                     );
-                    for &local_staging in local_staging_options {
-                        for &reduction_staging in &staging_options {
-                            let dispatch = OperatorDispatch::BlockedGemm {
-                                inner_block: kernel_inner_block,
-                                output_column_block: kernel_output_columns,
-                                orientation,
-                                distribution: GemmDistribution::ParallelReduction {
-                                    row_partitions,
-                                    column_partitions,
-                                    inner_partitions,
-                                    result_row_partitions,
-                                    result_column_partitions,
-                                    reduction_staging,
-                                },
-                            };
-                            let mut staged = gemm_plan(
-                                operator,
-                                [
-                                    input_layouts[0].clone(),
-                                    input_layouts[1].clone(),
-                                    result_layout.clone(),
-                                ],
-                                dispatch,
-                            );
-                            staged.inputs[physical_right_index].local_staging = local_staging;
-                            if config.gemm_output_packing != GemmOutputPacking::Native
-                                && (grouped_output.is_some()
-                                    || config.gemm_output_packing == GemmOutputPacking::Packed)
-                                && let Some(packed) = packed_gemm_output(&staged, output)
-                                && (config.gemm_output_packing == GemmOutputPacking::Packed
-                                    || output_demands.iter().any(|demand| {
-                                        demand.matches(&packed.output.layout, output)
-                                    }))
-                            {
-                                variants.push(packed);
-                            }
-                            if config.gemm_output_packing != GemmOutputPacking::Packed {
-                                variants.push(staged);
-                            }
+                    for &reduction_staging in &staging_options {
+                        let dispatch = OperatorDispatch::BlockedGemm {
+                            inner_block: kernel_inner_block,
+                            output_column_block: kernel_output_columns,
+                            orientation,
+                            distribution: GemmDistribution::ParallelReduction {
+                                row_partitions,
+                                column_partitions,
+                                inner_partitions,
+                                result_row_partitions,
+                                result_column_partitions,
+                                reduction_staging,
+                            },
+                        };
+                        let staged = gemm_plan(
+                            operator,
+                            [
+                                input_layouts[0].clone(),
+                                input_layouts[1].clone(),
+                                result_layout.clone(),
+                            ],
+                            dispatch,
+                        );
+                        if config.gemm_output_packing != GemmOutputPacking::Native
+                            && (grouped_output.is_some()
+                                || config.gemm_output_packing == GemmOutputPacking::Packed)
+                            && let Some(packed) = packed_gemm_output(&staged, output)
+                            && (config.gemm_output_packing == GemmOutputPacking::Packed
+                                || output_demands
+                                    .iter()
+                                    .any(|demand| demand.matches(&packed.output.layout, output)))
+                        {
+                            variants.push(packed);
+                        }
+                        if config.gemm_output_packing != GemmOutputPacking::Packed {
+                            variants.push(staged);
                         }
                     }
                 }
@@ -1451,7 +1439,7 @@ pub(super) struct OperatorCompatibility {
     // result ownership and cost to the next consumer differ substantially.
     pub(super) inner_partitions: Option<u16>,
     pub(super) result_partitions: Option<(u16, u16)>,
-    pub(super) inputs: Vec<(Precision, ElementOrder, MemoryClass, LocalOperandStaging)>,
+    pub(super) inputs: Vec<(Precision, ElementOrder, MemoryClass)>,
     pub(super) output: (
         Precision,
         ElementOrder,
@@ -1498,7 +1486,6 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
                     input.format.precision,
                     input.format.layout.order,
                     input.format.layout.memory_class,
-                    input.local_staging,
                 )
             })
             .collect(),

@@ -142,15 +142,197 @@ impl CoordinateMapping {
         while offsets.last() == Some(&0) {
             offsets.pop();
         }
-        let result = Self { offsets, view };
-        Some(result)
+        Some(Self { offsets, view })
     }
 }
 
 impl MidProgram {
+    /// Replace materializations with explicit backed operand windows. Every
+    /// retained Copy still allocates and populates its declared destination.
+    pub(crate) fn use_views(&mut self) {
+        use_views(
+            &mut self.operations,
+            &self.values,
+            &self.outputs,
+            self.tile_count,
+        );
+    }
     pub(crate) fn compose_copies(&mut self) {
         compose_region(&mut self.operations, &self.values, &self.outputs);
     }
+}
+
+fn use_views(
+    operations: &mut Vec<MidOperation>,
+    values: &[MidValue],
+    required: &[MidValueId],
+    tiles: u16,
+) {
+    use crate::{OperandIndexing, OperandWindow};
+    for op in &mut *operations {
+        if let MidOperationKind::Repeat(repeat) = &mut op.kind {
+            use_views(
+                &mut repeat.body.operations,
+                values,
+                &repeat.body.yields,
+                tiles,
+            );
+        }
+    }
+    let mut removed = BTreeSet::new();
+    for index in 0..operations.len() {
+        let MidOperationKind::Copy {
+            mapping,
+            policy: CopyPolicy::Automatic | CopyPolicy::DirectRetile,
+            packing: crate::PackingPolicy::Automatic,
+        } = &operations[index].kind
+        else {
+            continue;
+        };
+        let (input, output) = (operations[index].inputs[0], operations[index].results[0]);
+        if mapping.view.is_some() || required.contains(&output) {
+            continue;
+        }
+        let source = &values[input.index() as usize];
+        let destination = &values[output.index() as usize];
+        // Until alias lifetimes are proven, only borrow immutable storage.
+        // Check both ends: ownership groups need not include every alias edge.
+        if operations.iter().any(|op| {
+            op.output_aliases.iter().any(|&(o, i)| {
+                [op.results[o], op.inputs[i]]
+                    .iter()
+                    .any(|v| values[v.index() as usize].storage_group == source.storage_group)
+            }) || matches!(op.kind, MidOperationKind::Repeat(_))
+                && op
+                    .read_values()
+                    .any(|v| values[v.index() as usize].storage_group == source.storage_group)
+        }) {
+            continue;
+        }
+        let (from, to) = (&source.tensor_type, &destination.tensor_type);
+        if from.shape.0.len() != to.shape.0.len()
+            || from.format.precision != to.format.precision
+            || from.format.layout.order != to.format.layout.order
+            || from.format.layout.memory_class != to.format.layout.memory_class
+        {
+            continue;
+        }
+        let (Ok(sources), Ok(targets)) = (
+            from.format.layout.shard_extents(&from.shape),
+            to.format.layout.shard_extents(&to.shape),
+        ) else {
+            continue;
+        };
+        let mut pairs = Vec::new();
+        for (owner, target) in &targets {
+            let tile = destination.owners.tile(*owner, tiles);
+            let mut resident = sources
+                .iter()
+                .filter(|(owner, _)| source.owners.tile(*owner, tiles) == tile);
+            let Some((_, backing)) = resident.next() else {
+                break;
+            };
+            if resident.next().is_some() {
+                break;
+            }
+            pairs.push((backing, target));
+        }
+        if pairs.is_empty() || pairs.len() != targets.len() {
+            continue;
+        }
+        let window = (0..from.shape.0.len())
+            .map(|axis| {
+                let offset = mapping.offsets.get(axis).copied().unwrap_or(0);
+                let start = pairs[0].1[axis]
+                    .start
+                    .checked_add(offset)?
+                    .checked_sub(pairs[0].0[axis].start)?;
+                let width = pairs
+                    .iter()
+                    .map(|(_, target)| target[axis].physical_end - target[axis].start)
+                    .max()?;
+                Some((axis as u16, start, start.checked_add(width)?))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(window) = window else {
+            continue;
+        };
+        if !pairs.iter().all(|(backing, target)| {
+            let Some(view) = OperandWindow(window.clone()).select(backing, true) else {
+                return false;
+            };
+            for axis in 0..view.len() {
+                let offset = mapping.offsets.get(axis).copied().unwrap_or(0);
+                if view[axis].start != target[axis].start.saturating_add(offset)
+                    || view[axis].physical_end != target[axis].physical_end.saturating_add(offset)
+                    || view[axis].logical_end != target[axis].logical_end.saturating_add(offset)
+                {
+                    return false;
+                }
+            }
+            crate::storage::byte_traversal(
+                crate::storage::TensorStorage {
+                    format: &from.format,
+                    extents: backing,
+                },
+                &view,
+                true,
+            )
+            .ok()
+            .and_then(|t| t.contiguous_span())
+            .is_some_and(|s| s.offset.is_multiple_of(8))
+        }) {
+            continue;
+        }
+        let mut edits = Vec::new();
+        let mut safe = true;
+        for (consumer, op) in operations.iter().enumerate().skip(index + 1) {
+            if op.read_values().any(|&v| v == output) && !op.inputs.contains(&output) {
+                safe = false;
+            }
+            for (operand, _) in op
+                .inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| **value == output)
+            {
+                if !safe || op.output_aliases.iter().any(|&(_, i)| i == operand) {
+                    safe = false;
+                    break;
+                }
+                let mut selected = OperandWindow(window.clone());
+                match op.operands.get(operand) {
+                    Some(OperandIndexing::Local(w)) if w.0.is_empty() => {}
+                    Some(OperandIndexing::Fragment(w)) => {
+                        for &(axis, start, end) in &w.0 {
+                            let range = &mut selected.0[axis as usize];
+                            let origin = range.1;
+                            range.1 = origin.saturating_add(start).min(range.2);
+                            range.2 = origin.saturating_add(end).min(range.2);
+                        }
+                    }
+                    _ => {
+                        safe = false;
+                        break;
+                    }
+                }
+                safe &= selected.0.iter().all(|&(_, start, end)| start < end);
+                edits.push((consumer, operand, selected));
+            }
+            if !safe {
+                break;
+            }
+        }
+        if !safe || edits.is_empty() {
+            continue;
+        }
+        for (consumer, operand, window) in edits {
+            operations[consumer].inputs[operand] = input;
+            operations[consumer].operands[operand] = OperandIndexing::Fragment(window);
+        }
+        removed.insert(index);
+    }
+    super::rewrite::apply_edits(operations, &removed, BTreeMap::new());
 }
 
 /// Batch adjacent independent copies. Their local preparations precede one
@@ -160,17 +342,6 @@ pub(crate) fn independent_copy_prefix(
     checkpoints: bool,
     storage_groups: &[MidValueId],
 ) -> usize {
-    independent_prefix(operations, checkpoints, storage_groups, |kind| {
-        matches!(kind, MidOperationKind::Copy { .. })
-    })
-}
-
-fn independent_prefix(
-    operations: &[MidOperation],
-    checkpoints: bool,
-    storage_groups: &[MidValueId],
-    eligible: impl Fn(&MidOperationKind) -> bool,
-) -> usize {
     let group = |id: &MidValueId| storage_groups[id.index() as usize];
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
@@ -179,7 +350,7 @@ fn independent_prefix(
         .iter()
         .take_while(|operation| {
             if (checkpoints && operation.source != source)
-                || !eligible(&operation.kind)
+                || !matches!(operation.kind, MidOperationKind::Copy { .. })
                 || operation
                     .inputs
                     .iter()
@@ -200,14 +371,13 @@ fn independent_prefix(
 
 // Forced packing belongs to the present source/destination pair. Composition
 // preserves that boundary until it can prove the requested realization survives.
-fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool, CopyPolicy)> {
+fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, CopyPolicy)> {
     match &operation.kind {
         MidOperationKind::Copy {
             mapping,
-            reuse_local,
             policy,
             packing: crate::PackingPolicy::Automatic,
-        } if *policy != CopyPolicy::LocalKernel => Some((mapping.clone(), *reuse_local, *policy)),
+        } if *policy != CopyPolicy::LocalKernel => Some((mapping.clone(), *policy)),
         _ => None,
     }
 }
@@ -241,7 +411,7 @@ pub(super) fn compose(
     let mut producers = BTreeMap::<MidValueId, usize>::new();
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
-        let Some((mut next, mut reuse_local, mut policy)) = mapping(&operations[index]) else {
+        let Some((mut next, mut policy)) = mapping(&operations[index]) else {
             // In-place compute and loop-carried storage can overwrite an
             // earlier source. Do not move a materialization across them.
             producers.clear();
@@ -259,8 +429,7 @@ pub(super) fn compose(
             let Some(&producer) = producers.get(&input) else {
                 break;
             };
-            let (previous, previous_reuse, previous_policy) =
-                mapping(&operations[producer]).unwrap();
+            let (previous, previous_policy) = mapping(&operations[producer]).unwrap();
             let source = operations[producer].inputs[0];
             let intermediate = &values[input.index() as usize].tensor_type;
             let destination = &values[output.index() as usize].tensor_type;
@@ -313,7 +482,6 @@ pub(super) fn compose(
             }
             policy = merged_policy;
             next = composed;
-            reuse_local &= previous_reuse;
             input = source;
             removed.insert(producer);
         }
@@ -323,7 +491,6 @@ pub(super) fn compose(
                 policy,
                 packing: crate::PackingPolicy::Automatic,
                 mapping: next,
-                reuse_local,
             };
         }
         producers.insert(output, index);
@@ -453,7 +620,6 @@ mod tests {
                     policy: crate::CopyPolicy::Automatic,
                     packing: crate::PackingPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
-                    reuse_local: true,
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),

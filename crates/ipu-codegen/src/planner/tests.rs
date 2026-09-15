@@ -21,8 +21,8 @@ use crate::planner::catalogue::{
 };
 use crate::planner::error::LoweringError;
 use crate::planner::operator::{
-    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
+    GemmDistribution, GemmOrientation, OperandMaterialization, OperandRequirement,
+    OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
 };
 use crate::planner::{bind, build, candidates, test_support::lower};
 use crate::tensor::{
@@ -72,7 +72,6 @@ fn whole_program_reduction_grouping_replays_and_lowers() {
             output_column_block: 32,
             weight_memory_class: MemoryClass::Ipu21Interleaved,
             reduction_staging: ReductionStaging::Complete,
-            local_weight_staging: LocalOperandStaging::Direct,
         });
     }
     let fragments = FragmentCache::default();
@@ -1287,7 +1286,6 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
                 output_column_block: if k == 4 { 48 } else { 160 },
                 weight_memory_class: MemoryClass::Ipu21Interleaved,
                 reduction_staging: ReductionStaging::Complete,
-                local_weight_staging: LocalOperandStaging::Direct,
             });
         let mut selected = candidates::plans(
             &graph.operations()[0],
@@ -1390,7 +1388,6 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
                 output_column_block: 48,
                 weight_memory_class: memory,
                 reduction_staging: ReductionStaging::Complete,
-                local_weight_staging: LocalOperandStaging::Direct,
             };
             assert!(
                 retained.iter().any(|plan| gemm_plan_matches(

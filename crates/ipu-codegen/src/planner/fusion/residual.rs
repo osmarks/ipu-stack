@@ -170,7 +170,6 @@ pub(super) fn run(
                 results: vec![id],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
@@ -467,7 +466,6 @@ mod tests {
                 results: vec![value.id],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },

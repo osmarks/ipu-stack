@@ -4,9 +4,9 @@ use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionProducts, AttentionStrategy, AxisFactorView, BlockMajorOrder,
     CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
-    LocalOperandStaging, MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision,
-    ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
-    build_diagnostic_package, build_package,
+    MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision, ReductionStaging,
+    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
+    build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -136,7 +136,7 @@ struct Arguments {
     /// Use compact exchange rows with endpoint-balanced waves of this many words.
     #[arg(long)]
     exchange_stream_words: Option<std::num::NonZeroU32>,
-    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.
+    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION.
     #[arg(
         long,
         value_parser = parse_gemm_plan_constraint,
@@ -375,10 +375,9 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
         memory,
         orientation,
         reduction,
-        local,
     ] = fields.as_slice()
     else {
-        return Err("expected OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL".into());
+        return Err("expected OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION".into());
     };
     let grid = grid
         .split('x')
@@ -437,11 +436,6 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
                     .map_err(|_| "batch size must be a nonzero u16")?,
             ),
             _ => return Err("reduction must be complete, streamed, or batch-N".into()),
-        },
-        local_weight_staging: match *local {
-            "direct" => LocalOperandStaging::Direct,
-            "match-remote" => LocalOperandStaging::MatchRemote,
-            _ => return Err("local staging must be direct or match-remote".into()),
         },
     })
 }

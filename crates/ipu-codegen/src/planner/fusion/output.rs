@@ -184,7 +184,6 @@ fn fuse_fp8_outputs_at(
                 inputs: vec![value.id],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
@@ -271,7 +270,6 @@ fn fuse_fp8_outputs_at(
                     results: vec![value.id],
                     kind: MidOperationKind::Copy {
                         mapping: CoordinateMapping::default(),
-                        reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },

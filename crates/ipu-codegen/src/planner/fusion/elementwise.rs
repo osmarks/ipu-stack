@@ -247,7 +247,6 @@ mod tests {
                     2,
                     MidOperationKind::Copy {
                         mapping: CoordinateMapping::default(),
-                        reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
@@ -406,7 +405,6 @@ mod tests {
                     results: vec![MidValueId::from_index(5)],
                     kind: MidOperationKind::Copy {
                         mapping: CoordinateMapping::default(),
-                        reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
@@ -527,30 +525,6 @@ mod tests {
                         assert!(
                             fused.peak_memory.total <= before_memory.total,
                             "lost the input alias chain"
-                        );
-                        // Keeping the consumer output fresh prevents alias chaining;
-                        // delaying the bias read can then increase the live peak.
-                        let mut fresh = mid.clone();
-                        for op in &mut fresh.operations {
-                            if let crate::MidOperation {
-                                kind: MidOperationKind::Gelu,
-                                output_aliases,
-                                ..
-                            } = op
-                            {
-                                output_aliases.clear();
-                            }
-                        }
-                        let (_, memory) =
-                            crate::estimate::analyze_mid(&fresh, &BTreeMap::new()).unwrap();
-                        let unconstrained = crate::planner::fusion::fuse(&fresh).unwrap();
-                        assert!(unconstrained.peak_memory.total > memory.total);
-                        // Feasibility is the planner's decision, not a fusion constraint.
-                        assert!(memory.fits_ipu21_with_budget(0, memory.total));
-                        assert!(
-                            !unconstrained
-                                .peak_memory
-                                .fits_ipu21_with_budget(0, memory.total)
                         );
                     }
                     assert!(

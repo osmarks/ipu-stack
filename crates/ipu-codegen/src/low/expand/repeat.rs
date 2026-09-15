@@ -1,7 +1,6 @@
 //! Structured repeat bodies and carried/iterated block bindings.
 
 use super::*;
-use crate::mid::MidOperationKind;
 
 impl TileGraphBuilder {
     pub(super) fn build_repeat(
@@ -147,20 +146,9 @@ fn repeat_yield_can_alias(
         if index >= definition && operation.read_values().any(|input| aliases.contains(input)) {
             return false;
         }
-        match &operation.kind {
-            MidOperationKind::Copy {
-                reuse_local: true, ..
-            } if operation.inputs.iter().any(|input| aliases.contains(input)) => {
-                // Internal copies may become local views during expansion.
-                aliases.extend(operation.results.iter().copied());
-            }
-            _ => {
-                let output_aliases = operation.output_aliases.as_slice();
-                for &(output, input) in output_aliases {
-                    if aliases.contains(&operation.inputs[input]) {
-                        aliases.insert(operation.results[output]);
-                    }
-                }
+        for &(output, input) in &operation.output_aliases {
+            if aliases.contains(&operation.inputs[input]) {
+                aliases.insert(operation.results[output]);
             }
         }
     }
@@ -189,8 +177,8 @@ mod tests {
             output_windows: Vec::new(),
         };
         let gelu = || MidOperationKind::Gelu;
-        for reuse_local in [false, true] {
-            let operations = vec![
+        for view in [false, true] {
+            let mut operations = vec![
                 op(
                     0,
                     2,
@@ -198,15 +186,17 @@ mod tests {
                         policy: crate::CopyPolicy::Automatic,
                         packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
-                        reuse_local,
                     },
                 ),
                 op(1, 3, gelu()),
-                op(2, 4, gelu()),
+                op(if view { 0 } else { 2 }, 4, gelu()),
             ];
+            if view {
+                operations.remove(0);
+            }
             assert_eq!(
                 repeat_yield_can_alias(id(3), id(0), &operations),
-                !reuse_local,
+                !view,
                 "the later reader needs the previous carried value unless its copy was materialized"
             );
         }

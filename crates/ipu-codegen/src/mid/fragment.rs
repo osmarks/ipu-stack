@@ -331,7 +331,6 @@ mod tests {
                 results: vec![id(index + 1)],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                     policy: CopyPolicy::Automatic,
                     packing: PackingPolicy::Automatic,
                 },

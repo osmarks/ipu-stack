@@ -149,7 +149,6 @@ fn append_owner_copy(
             policy: crate::CopyPolicy::Automatic,
             packing: crate::PackingPolicy::Automatic,
             mapping: CoordinateMapping::default(),
-            reuse_local: true,
         },
         operands: Vec::new(),
         output_aliases: Vec::new(),

@@ -382,7 +382,6 @@ pub(super) fn ensure_format(
             } else {
                 MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                     policy,
                     packing: crate::PackingPolicy::Automatic,
                 }

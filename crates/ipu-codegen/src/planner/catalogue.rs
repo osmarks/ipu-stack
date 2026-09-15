@@ -6,8 +6,8 @@ use crate::tensor::MemoryClass;
 use crate::tensor::Precision;
 
 use crate::planner::operator::{
-    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
+    GemmDistribution, GemmOrientation, OperandMaterialization, OperandRequirement,
+    OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
 };
 use crate::tensor::{
     AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, GridOrder, Layout, TensorFormat, TensorShape,
@@ -260,19 +260,13 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                     {
                         continue;
                     }
-                    let mut candidate = amp_grid_gemm_operator_candidate(
+                    let candidate = amp_grid_gemm_operator_candidate(
                         precision,
                         64,
                         output_columns,
                         grid_shape,
                         weights,
                     );
-                    if precision == Precision::F16
-                        && weights.memory_class == MemoryClass::Ipu21Standard
-                    {
-                        grid.push(candidate.clone());
-                        candidate.plan.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
-                    }
                     grid.push(candidate);
                 }
             }

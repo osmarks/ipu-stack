@@ -30,17 +30,9 @@ fn donate(
         if !op.results.iter().any(|v| bound.contains(v)) {
             continue;
         }
-        match &op.kind {
-            MidOperationKind::Copy {
-                reuse_local: true, ..
-            } => bound.extend(op.inputs.iter().copied()),
-            _ => {
-                let output_aliases = op.output_aliases.as_slice();
-                for &(output, input) in output_aliases {
-                    if bound.contains(&op.results[output]) {
-                        bound.insert(op.inputs[input]);
-                    }
-                }
+        for &(output, input) in &op.output_aliases {
+            if bound.contains(&op.results[output]) {
+                bound.insert(op.inputs[input]);
             }
         }
     }
@@ -118,11 +110,6 @@ fn donate(
         {
             continue;
         }
-        // A coordinate copy may otherwise alias an external parameter or an
-        // earlier activation in low. Donation requires its own materialization.
-        if let MidOperationKind::Copy { reuse_local, .. } = &mut operations[producer].kind {
-            *reuse_local = false;
-        }
         operations[index].kind = MidOperationKind::Cast {
             from: Precision::F16,
             to: target.tensor_type.format.precision,
@@ -183,7 +170,6 @@ mod tests {
                         policy: crate::CopyPolicy::Automatic,
                         packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
-                        reuse_local: true,
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
@@ -347,7 +333,7 @@ mod tests {
         let old = mid.clone();
         donate(&mut mid.operations, &mut mid.values, &mid.outputs, true);
         assert_eq!(mid, old);
-        // An alias of a yield has the same restriction.
+        // An explicit copy separates yielded storage from the cast's donor.
         let mut alias = mid.values[2].clone();
         alias.id = MidValueId(3);
         alias.storage_group = alias.id;
@@ -360,15 +346,13 @@ mod tests {
                 policy: crate::CopyPolicy::Automatic,
                 packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
-                reuse_local: true,
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         });
-        let old = mid.clone();
         donate(&mut mid.operations, &mut mid.values, &[MidValueId(3)], true);
-        assert_eq!(mid, old);
+        assert_eq!(mid.operations[1].output_aliases, vec![(0, 0)]);
     }
 
     #[test]
@@ -382,7 +366,6 @@ mod tests {
         mid.values[0].tensor_type.format.layout.order = ElementOrder::RowMajor;
         mid.operations[0].kind = MidOperationKind::Copy {
             mapping: CoordinateMapping::default(),
-            reuse_local: false,
             policy: CopyPolicy::LocalKernel,
             packing: crate::PackingPolicy::Automatic,
         };

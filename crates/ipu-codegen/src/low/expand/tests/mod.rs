@@ -270,8 +270,9 @@ fn factor_mappings_keep_the_bound_source_selection() {
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
     let source = builder.shards[0].id;
-    let source_view = builder
-        .narrow_view(&builder.full_view(source), &[(1, 0, 2)])
+    let mut source_view = builder.full_view(source);
+    source_view.extents = crate::OperandWindow(vec![(1, 0, 2)])
+        .select(&source_view.extents, false)
         .unwrap();
     let source_shape = crate::TensorShape(vec![1, 2, 32]);
     let view = crate::AxisFactorView::new(2, 0, 2);
@@ -603,26 +604,6 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(2),
             "case {case}"
         );
-        let parameter_shards = low
-            .value_views(
-                low.inputs
-                    .iter()
-                    .find(|input| input.kind == crate::GraphInputKind::Parameter)
-                    .unwrap()
-                    .value,
-            )
-            .iter()
-            .map(|view| view.shard)
-            .collect::<BTreeSet<_>>();
-        let direct_parameter_runs = low
-            .kernel_runs
-            .iter()
-            .filter(|run| {
-                matches!(run.kernel, MidOperationKind::Gemm { .. })
-                    && parameter_shards.contains(&run.inputs[1].shard)
-            })
-            .count();
-        assert!(direct_parameter_runs > 0, "case {case}");
         if (result_row_partitions, result_column_partitions) != (1, 1) {
             let root = |id| crate::low::storage::storage_root(&low.shards, id);
             let output_shards = low
@@ -1735,11 +1716,6 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let inner_blocks = u32::from(row_partitions) * random.u32(1..=2);
         let inner = inner_blocks * 64;
         let columns = u32::from(column_partitions) * 64;
-        let local_staging = if random.bool() {
-            crate::planner::operator::LocalOperandStaging::Direct
-        } else {
-            crate::planner::operator::LocalOperandStaging::MatchRemote
-        };
         let mut graph = ComputeGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
         let right = graph.parameter("right", [inner, columns]).unwrap();
@@ -1788,8 +1764,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                 },
                 [
                     crate::planner::operator::OperandRequirement::new(left_format),
-                    crate::planner::operator::OperandRequirement::new(right_format)
-                        .with_local_staging(local_staging),
+                    crate::planner::operator::OperandRequirement::new(right_format),
                 ],
                 output_format,
             )]
@@ -2055,7 +2030,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                                 policy: crate::CopyPolicy::Automatic,
                                 packing: crate::PackingPolicy::Automatic,
                                 mapping: CoordinateMapping::default(),
-                                reuse_local: true,
                             },
                         ),
                     ],
@@ -2542,8 +2516,9 @@ fn complete_panel_grid_stays_one_logical_exchange() {
             })
             .unwrap();
     }
-    let source = state
-        .narrow_view(&state.full_view(BlockValueId(0)), &[(1, 0, 64)])
+    let mut source = state.full_view(BlockValueId(0));
+    source.extents = crate::OperandWindow(vec![(1, 0, 64)])
+        .select(&source.extents, false)
         .unwrap();
     let destination = state.full_view(BlockValueId(1));
     let (mappings, order) = state
@@ -2645,11 +2620,13 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
     }
     let source = state.full_view(BlockValueId(0));
     let target = state.full_view(BlockValueId(1));
-    let clipped_source = state
-        .narrow_view(&state.full_view(BlockValueId(0)), &[(1, 0, 12)])
+    let mut clipped_source = state.full_view(BlockValueId(0));
+    clipped_source.extents = crate::OperandWindow(vec![(1, 0, 12)])
+        .select(&clipped_source.extents, false)
         .unwrap();
-    let clipped_target = state
-        .narrow_view(&state.full_view(BlockValueId(2)), &[(1, 0, 12)])
+    let mut clipped_target = state.full_view(BlockValueId(2));
+    clipped_target.extents = crate::OperandWindow(vec![(1, 0, 12)])
+        .select(&clipped_target.extents, false)
         .unwrap();
     let parts = super::mapping::split_mapping_at_panel_boundaries(
         &state.shards[0],

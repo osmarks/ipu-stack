@@ -58,6 +58,7 @@ pub(crate) fn baseline(
     if let Some(mapping) = &config.tile_mapping {
         program.remap_tiles(mapping)?;
     }
+    program.use_views();
     program
         .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;
@@ -410,7 +411,6 @@ impl<C: CostModel> Builder<'_, C> {
                         policy: crate::CopyPolicy::Automatic,
                         packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
-                        reuse_local: false,
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),

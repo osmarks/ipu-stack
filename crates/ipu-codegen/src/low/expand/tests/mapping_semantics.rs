@@ -334,7 +334,6 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                             _ => crate::CopyPolicy::StageLogicalThenTransform,
                         },
                         mapping: mapping.clone(),
-                        reuse_local: true,
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),

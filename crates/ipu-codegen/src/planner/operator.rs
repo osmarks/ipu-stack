@@ -191,21 +191,9 @@ impl OperatorDispatch {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperandRequirement {
     pub format: TensorFormat,
-    /// How a locally resident operand should be consumed when other tiles use
-    /// an operator-local staging buffer for the same operand.
-    pub local_staging: LocalOperandStaging,
     /// Whether a dispatch may populate and consume bounded operand slices
     /// instead of materializing the complete required format first.
     pub materialization: OperandMaterialization,
-}
-
-#[derive(
-    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub enum LocalOperandStaging {
-    #[default]
-    Direct,
-    MatchRemote,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -219,14 +207,8 @@ impl OperandRequirement {
     pub fn new(format: TensorFormat) -> Self {
         Self {
             format,
-            local_staging: LocalOperandStaging::Direct,
             materialization: OperandMaterialization::Complete,
         }
-    }
-
-    pub fn with_local_staging(mut self, staging: LocalOperandStaging) -> Self {
-        self.local_staging = staging;
-        self
     }
 
     pub fn with_materialization(mut self, materialization: OperandMaterialization) -> Self {

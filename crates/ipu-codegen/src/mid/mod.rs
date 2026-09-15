@@ -61,10 +61,10 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    /// Populate a distributed value through an explicit coordinate mapping.
+    /// Materialize a distributed value in its declared layout. Non-owning
+    /// selections are operand windows on the original value, never Copy results.
     Copy {
         mapping: CoordinateMapping,
-        reuse_local: bool,
         policy: crate::CopyPolicy,
         packing: crate::PackingPolicy,
     },

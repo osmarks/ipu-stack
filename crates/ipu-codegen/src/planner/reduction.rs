@@ -100,12 +100,7 @@ impl FragmentBuilder {
             (input_window, output_window)
         })
         .collect::<Vec<_>>();
-        let seed = self.materialize(
-            input,
-            receive.clone(),
-            vec![],
-            self.can_borrow_dense(input, &receive),
-        );
+        let seed = self.copy(input, receive.clone(), vec![]);
         if partials == 1 {
             return Some(self.kernel(
                 vec![seed],
@@ -122,7 +117,7 @@ impl FragmentBuilder {
             receive.shape.0[axis] = count;
             let mut offsets = vec![0; source.shape.0.len()];
             offsets[axis] = start;
-            let remote = self.materialize(input, receive.clone(), offsets, false);
+            let remote = self.copy(input, receive.clone(), offsets);
             let previous = result.unwrap_or(seed);
             let final_stage = start + count == partials;
             let destination = if final_stage { output } else { &accumulator };

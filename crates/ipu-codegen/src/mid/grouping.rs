@@ -110,10 +110,13 @@ fn group_region(
             start += 1;
             continue;
         }
-        let mut selected = vec![start];
-        for next in start + 1..operations.len() {
+        let group = |i: usize| values[operations[i].results[0].index() as usize].storage_group;
+        let mut selected = Vec::new();
+        let mut representatives = Vec::new();
+        let mut next = start;
+        while next < operations.len() {
             let op = &operations[next];
-            if selected.len() >= limit
+            if representatives.len() >= limit
                 || !(matches!(
                     op.kind,
                     MidOperationKind::Copy { .. } | MidOperationKind::ReductionSum { .. }
@@ -125,20 +128,74 @@ fn group_region(
                 break;
             }
             if is_eligible(op) {
-                selected.push(next);
-                if separate_homes(selected.iter().map(|&i| &operations[i]), values, tiles).is_none()
+                let home = group(next);
+                let end = (next..operations.len())
+                    .take_while(|&i| is_eligible(&operations[i]) && group(i) == home)
+                    .last()
+                    .unwrap()
+                    + 1;
+                // A unit consists of every writer to this storage, not just
+                // the last panel. Interleaved units are left in place.
+                if operations
+                    .iter()
+                    .enumerate()
+                    .any(|(i, op)| is_eligible(op) && group(i) == home && !(next..end).contains(&i))
                 {
-                    selected.pop();
                     break;
                 }
+                representatives.push(next);
+                if separate_homes(
+                    representatives.iter().map(|&i| &operations[i]),
+                    values,
+                    tiles,
+                )
+                .is_none()
+                    && representatives.len() > 1
+                {
+                    representatives.pop();
+                    break;
+                }
+                selected.extend(next..end);
+                next = end;
+            } else {
+                next += 1;
             }
         }
-        if selected.len() < 2 {
+        if representatives.len() < 2 {
             start += 1;
             continue;
         }
-        let homes =
-            separate_homes(selected.iter().map(|&i| &operations[i]), values, tiles).unwrap();
+        let mut homes = separate_homes(
+            representatives.iter().map(|&i| &operations[i]),
+            values,
+            tiles,
+        )
+        .unwrap();
+        // Retarget preparation at its existing Copy destination. Do not add a
+        // second redistribution after preparing on the old owners.
+        let selected_set = selected.iter().copied().collect::<BTreeSet<_>>();
+        for op in operations
+            .iter()
+            .filter(|op| matches!(op.kind, MidOperationKind::Copy { .. }))
+        {
+            let output = op.results[0];
+            if required.contains(&output) {
+                continue;
+            }
+            let users = operations
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| op.read_values().any(|&input| input == output))
+                .collect::<Vec<_>>();
+            if let Some(&(first, _)) = users.first()
+                && users
+                    .iter()
+                    .all(|(i, _)| selected_set.contains(i) && group(*i) == group(first))
+                && let Some(home) = homes.get(&group(first)).cloned()
+            {
+                homes.insert(output, home);
+            }
+        }
         apply_homes(values, &homes, tiles)?;
         let insertion = selected.last().copied().unwrap() + 1 - selected.len();
         let mut sums = selected
@@ -215,10 +272,32 @@ fn reduction_outputs(
     let group = |id: MidValueId| values[id.index() as usize].storage_group;
     let mut forbidden = required.iter().copied().map(group).collect::<BTreeSet<_>>();
     let mut used = BTreeSet::new();
+    let reductions = operations
+        .iter()
+        .filter(|op| matches!(op.kind, MidOperationKind::ReductionSum { .. }))
+        .flat_map(|op| op.results.iter().copied())
+        .collect::<BTreeSet<_>>();
     for op in operations {
         for input in op.read_values() {
+            if matches!(op.kind, MidOperationKind::ReductionSum { .. })
+                && reductions.contains(input)
+                && op
+                    .results
+                    .iter()
+                    .all(|&output| group(output) != group(*input))
+            {
+                // A streamed chain needs stage-by-stage grouping. Do not move
+                // only its final stage and leave earlier accumulation behind.
+                forbidden.extend(op.results.iter().copied().map(group));
+            }
             used.insert(group(*input));
-            if !matches!(op.kind, MidOperationKind::Copy { .. }) {
+            if !matches!(op.kind, MidOperationKind::Copy { .. })
+                && !(matches!(op.kind, MidOperationKind::ReductionSum { .. })
+                    && op
+                        .results
+                        .iter()
+                        .any(|&output| group(output) == group(*input)))
+            {
                 forbidden.insert(group(*input));
             }
         }
@@ -349,7 +428,6 @@ mod tests {
                             reversed: false,
                         }),
                     },
-                    reuse_local: false,
                 },
             )
         };

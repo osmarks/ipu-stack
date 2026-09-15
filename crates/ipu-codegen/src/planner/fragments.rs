@@ -73,7 +73,6 @@ pub(crate) fn build_fragment(
                     policy: crate::CopyPolicy::Automatic,
                     packing: crate::PackingPolicy::Automatic,
                     mapping,
-                    reuse_local: false,
                 },
             )[0]
         }
@@ -199,17 +198,6 @@ impl FragmentBuilder {
         output: TensorType,
         offsets: Vec<u32>,
     ) -> MidValueId {
-        self.materialize(input, output, offsets, true)
-    }
-
-    pub(super) fn materialize(
-        &mut self,
-
-        input: MidValueId,
-        output: TensorType,
-        offsets: Vec<u32>,
-        reuse_local: bool,
-    ) -> MidValueId {
         let source = self.tensor(input);
         if offsets.iter().all(|&offset| offset == 0)
             && (source == &output
@@ -217,7 +205,6 @@ impl FragmentBuilder {
                     && source.format.layout.order == output.format.layout.order
                     && source.format.layout.memory_class == output.format.layout.memory_class
                     && same_distribution(source, &output)))
-            && (reuse_local || self.can_borrow_dense(input, &output))
         {
             return input;
         }
@@ -231,63 +218,8 @@ impl FragmentBuilder {
                     offsets,
                     view: None,
                 },
-                reuse_local,
             },
         )[0]
-    }
-
-    /// Prove a copy may borrow a contiguous, aligned region rather than pack it.
-    /// A previous borrowing copy can retain its source's strides, so its declared
-    /// layout is insufficient evidence; unknown backing geometry requires packing.
-    pub(super) fn can_borrow_dense(&self, input: MidValueId, output: &TensorType) -> bool {
-        if self.program.operations.iter().any(|op| {
-            op.results.contains(&input)
-                && matches!(
-                    op.kind,
-                    MidOperationKind::Copy {
-                        reuse_local: true,
-                        ..
-                    }
-                )
-        }) {
-            return false;
-        }
-        let source = self.tensor(input);
-        if source == output {
-            return true;
-        }
-        if source.format.precision != output.format.precision
-            || source.format.layout.order != output.format.layout.order
-        {
-            return false;
-        }
-        let (Ok(sources), Ok(targets)) = (
-            source.format.layout.shard_extents(&source.shape),
-            output.format.layout.shard_extents(&output.shape),
-        ) else {
-            return false;
-        };
-        targets.iter().all(|(_, target)| {
-            sources.iter().any(|(_, backing)| {
-                backing.len() == target.len()
-                    && backing.iter().zip(target).all(|(a, b)| {
-                        a.start <= b.start
-                            && a.physical_end >= b.physical_end
-                            && a.logical_end >= b.logical_end
-                    })
-                    && crate::storage::byte_traversal(
-                        crate::storage::TensorStorage {
-                            format: &source.format,
-                            extents: backing,
-                        },
-                        target,
-                        true,
-                    )
-                    .ok()
-                    .and_then(|t| t.contiguous_span())
-                    .is_some_and(|s| s.offset.is_multiple_of(8))
-            })
-        })
     }
 
     pub(super) fn kernel(
@@ -330,6 +262,10 @@ impl FragmentBuilder {
             .into_iter()
             .map(|ty| self.value(ty))
             .collect::<Vec<_>>();
+        for &(output, input) in &output_aliases {
+            self.program.values[results[output].index() as usize].storage_group =
+                self.program.values[inputs[input].index() as usize].storage_group;
+        }
         self.program.operations.push(MidOperation {
             source: None,
             inputs,

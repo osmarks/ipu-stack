@@ -61,27 +61,6 @@ impl TileGraphBuilder {
             .collect()
     }
 
-    pub(super) fn narrow_view(
-        &self,
-        source: &ShardView,
-        ranges: &[(usize, u32, u32)],
-    ) -> ExpansionResult<ShardView> {
-        let mut view = source.clone();
-        for &(axis, start, end) in ranges {
-            let extent = view
-                .extents
-                .get_mut(axis)
-                .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            if start < extent.start || end > extent.physical_end || start >= end {
-                return Err(ExpansionError::InvalidOperatorPlan);
-            }
-            extent.start = start;
-            extent.physical_end = end;
-            extent.logical_end = end.min(extent.logical_end).max(start);
-        }
-        Ok(view)
-    }
-
     pub(super) fn alias_shard(&mut self, shard: BlockValueId, target: BlockValueId) {
         self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
     }

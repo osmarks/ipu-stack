@@ -3,7 +3,7 @@ use crate::graph::{OperationId, ValueId};
 use crate::planner::OperatorCandidate;
 use crate::planner::ReductionStaging;
 use crate::planner::catalogue::{default_operator_candidates, operator_candidates_for_tile_count};
-use crate::planner::operator::{GemmOrientation, LocalOperandStaging};
+use crate::planner::operator::GemmOrientation;
 use crate::tensor::{MemoryClass, Precision, TensorFormat};
 use ipu_target::ipu21::memory::{
     IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES, IPU21_PLANNED_DATA_BYTES,
@@ -25,7 +25,6 @@ pub struct GemmPlanConstraint {
     pub output_column_block: u32,
     pub weight_memory_class: MemoryClass,
     pub reduction_staging: ReductionStaging,
-    pub local_weight_staging: LocalOperandStaging,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

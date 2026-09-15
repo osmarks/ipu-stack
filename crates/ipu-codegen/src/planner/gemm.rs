@@ -5,8 +5,7 @@ use crate::kernel::{AccumulationPrecision, GemmKernelMode};
 use crate::mid::MidOperationKind;
 use crate::mid::{MidValueId, OperandIndexing, OperandWindow};
 use crate::planner::operator::{
-    GemmDistribution, GemmOrientation, LocalOperandStaging, OperatorFamily, OperatorPlan,
-    ProductGrid,
+    GemmDistribution, GemmOrientation, OperatorFamily, OperatorPlan, ProductGrid,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, MemoryClass, Padding, Precision,
@@ -267,13 +266,7 @@ impl FragmentBuilder {
                 if multiply == Precision::F16 {
                     right_staging.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
                 }
-                let weights = self.materialize(
-                    right,
-                    right_staging,
-                    vec![],
-                    plan.inputs[right.index() as usize].local_staging
-                        == LocalOperandStaging::Direct,
-                );
+                let weights = self.copy(right, right_staging, vec![]);
                 let mut partials = partial;
                 partials.shape.0.insert(0, u32::from(inner_partitions));
                 let rank = partials.shape.0.len();

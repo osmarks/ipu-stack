@@ -218,7 +218,6 @@ fn reorder_region(
             policy: crate::CopyPolicy::Automatic,
             packing: crate::PackingPolicy::Automatic,
             mapping: CoordinateMapping::default(),
-            reuse_local: false,
         };
         before.entry(index).or_default().push(copy);
         removed.extend(chain);
@@ -267,7 +266,6 @@ mod tests {
         let kinds = [
             MidOperationKind::Copy {
                 mapping: CoordinateMapping::default(),
-                reuse_local: false,
                 policy: CopyPolicy::Automatic,
                 packing: crate::PackingPolicy::Automatic,
             },
@@ -386,7 +384,6 @@ mod tests {
                     policy: crate::CopyPolicy::Automatic,
                     packing: crate::PackingPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
-                    reuse_local: false,
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),

@@ -25,7 +25,6 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<()> {
         let MidOperationKind::Copy {
             ref mapping,
-            reuse_local,
             policy,
             packing,
         } = operation.kind
@@ -42,10 +41,6 @@ impl TileGraphBuilder {
             .tensor_type
             .shape
             .clone();
-        // Whole-buffer bindings require canonical storage with its own strides.
-        let reuse_local = reuse_local
-            && packing == PackingPolicy::Automatic
-            && !self.required_storage.contains(output);
         let output_order = self.shards[outputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
@@ -115,13 +110,7 @@ impl TileGraphBuilder {
                 (mappings, CopyOrder::Semantic)
             }
         } else {
-            let mappings = self.offset_copy_mappings(
-                operation,
-                &inputs,
-                &outputs,
-                &mapping.offsets,
-                reuse_local,
-            )?;
+            let mappings = self.offset_copy_mappings(&inputs, &outputs, &mapping.offsets)?;
             (
                 mappings,
                 match policy {
@@ -267,15 +256,13 @@ impl TileGraphBuilder {
 
     fn offset_copy_mappings(
         &mut self,
-        operation: &MidOperation,
         inputs: &[ShardView],
         outputs: &[BlockValueId],
         offsets: &[u32],
-        reuse_local: bool,
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let mut regions = CopyRegions::new(&self.shards, inputs);
         let mut mappings = Vec::new();
-        for (result_index, &output) in outputs.iter().enumerate() {
+        for &output in outputs {
             let destination = &self.shards[output.index() as usize];
             let tile = destination.tile;
             let mut source_region = destination.extents.clone();
@@ -294,46 +281,6 @@ impl TileGraphBuilder {
                     )
                 })
                 .collect::<Vec<_>>();
-            if reuse_local
-                && offsets.iter().all(|&offset| offset == 0)
-                && let [(extents, source)] = intersections.as_slice()
-                && *extents == self.shards[output.index() as usize].extents
-                && self.shards[inputs[*source].shard.index() as usize].tile == tile
-                && self.shards[inputs[*source].shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .precision
-                    == self.shards[output.index() as usize]
-                        .tensor_type
-                        .format
-                        .precision
-                && self.shards[inputs[*source].shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .layout
-                    .order
-                    == self.shards[output.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .order
-            {
-                let mut view = inputs[*source].clone();
-                view.extents = extents.clone();
-                if !self.exported_values.contains(&operation.results[0]) {
-                    self.bindings[operation.results[0].index() as usize][result_index] = view;
-                    self.shards[output.index() as usize].definition =
-                        ShardDefinition::Unmaterialized;
-                    continue;
-                }
-                // Host bindings export the canonical shard's complete storage,
-                // not a ShardView. Preserve its shape and address with an alias
-                // only when the reused allocation has exactly these bounds.
-                if view.extents == self.shards[view.shard.index() as usize].extents {
-                    self.alias_shard(output, view.shard);
-                    continue;
-                }
-            }
             for (source_extents, source) in intersections {
                 let mut destination_extents = source_extents.clone();
                 offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;

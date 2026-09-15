@@ -132,8 +132,6 @@ struct TileGraphBuilder {
     shards: Vec<BlockValue>,
     bindings: Vec<Vec<ShardView>>,
     logical_values: Vec<crate::MidValue>,
-    exported_values: BTreeSet<MidValueId>,
-    required_storage: BTreeSet<MidValueId>,
     phases: Vec<ExchangePhase>,
     kernel_runs: Vec<KernelRun>,
     local_copies: Vec<crate::kernel::CopyRun>,
@@ -154,8 +152,6 @@ impl TileGraphBuilder {
             shards: Vec::new(),
             bindings: vec![Vec::new(); graph.values.len()],
             logical_values: graph.values.clone(),
-            exported_values: graph.outputs.iter().copied().collect(),
-            required_storage: BTreeSet::new(),
             phases: Vec::new(),
             kernel_runs: Vec::new(),
             local_copies: Vec::new(),
@@ -167,14 +163,9 @@ impl TileGraphBuilder {
             .map(|input| input.value)
             .chain(graph.outputs.iter().copied())
             .collect::<BTreeSet<_>>();
-        fn uses(
-            operations: &[MidOperation],
-            used: &mut BTreeSet<MidValueId>,
-            bindings: &mut BTreeSet<MidValueId>,
-        ) {
+        fn uses(operations: &[MidOperation], used: &mut BTreeSet<MidValueId>) {
             for operation in operations {
                 used.extend(operation.read_values().chain(&operation.results).copied());
-                bindings.extend(compute::allocation_inputs(operation).copied());
                 if let MidOperationKind::Repeat(repeat) = &operation.kind {
                     used.extend(
                         repeat
@@ -184,19 +175,11 @@ impl TileGraphBuilder {
                             .chain(&repeat.body.yields)
                             .copied(),
                     );
-                    bindings.extend(
-                        operation
-                            .read_values()
-                            .chain(&operation.results)
-                            .chain(&repeat.body.arguments)
-                            .chain(&repeat.body.yields)
-                            .copied(),
-                    );
-                    uses(&repeat.body.operations, used, bindings);
+                    uses(&repeat.body.operations, used);
                 }
             }
         }
-        uses(&graph.operations, &mut used, &mut state.required_storage);
+        uses(&graph.operations, &mut used);
         for value in &graph.values {
             if !used.contains(&value.id) {
                 continue;
