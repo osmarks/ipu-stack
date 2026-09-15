@@ -254,6 +254,7 @@ mod tests {
         })
         .collect();
         let operation = |input, result, kind| MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId(input)],
             results: vec![MidValueId(result)],
@@ -458,6 +459,7 @@ mod tests {
                     vec![MidValueId(0)]
                 };
                 let producer = MidOperation {
+                    site: None,
                     source: None,
                     results: vec![MidValueId(3)],
                     kind: MidOperationKind::Compute(Compute::Kernel {
@@ -489,6 +491,7 @@ mod tests {
                     ));
                 values.push(identity);
                 let copy = MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId(3)],
                     results: vec![MidValueId(5)],
@@ -502,6 +505,7 @@ mod tests {
                     estimated_exchange_cycles: 0,
                 };
                 let cast = MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId(5)],
                     results: vec![MidValueId(4)],

@@ -44,6 +44,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
             })
             .to_vec(),
         operations: vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![id(0)],
             results: vec![id(6)],
@@ -60,6 +61,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                     estimated_cycles: 0,
                     peak_memory: Default::default(),
                     operations: vec![MidOperation {
+                        site: None,
                         source: None,
                         inputs: vec![id(4)],
                         results: vec![id(5)],

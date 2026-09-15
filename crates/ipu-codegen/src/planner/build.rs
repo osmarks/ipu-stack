@@ -6,8 +6,8 @@ use crate::graph::{
     ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,
 };
 use crate::mid::{
-    CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion, MidRepeat,
-    MidValueId,
+    CoordinateMapping, LocalSite, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion,
+    MidRepeat, MidValueId,
 };
 use crate::planner::bind::{ValueBuilder, emit_selected, ensure_format, lookup};
 use crate::planner::cache::FragmentCache;
@@ -35,17 +35,14 @@ pub(crate) fn build_candidate(
 ) -> LoweringResult<Candidate> {
     let mut selected = select(graph, config, costs, fragments, recipe)?;
     let mut program = selected.program;
-    selected.cast_sites = program.reorder_casts(
-        &selected.recipe.cast_before_copies,
-        &selected.recipe.early_casts,
-    );
+    selected.cast_sites = program.reorder_casts(&BTreeSet::new());
+    selected
+        .recipe
+        .resolve_cast_choices(&program, &selected.cast_sites)?;
+    if !selected.recipe.cast_before_copies.is_empty() {
+        program.reorder_casts(&selected.recipe.cast_before_copies);
+    }
     program.compose_copies();
-    selected.recipe.cast_before_copies.extend(
-        selected.cast_sites.iter().copied().filter(|(source, _)| {
-            source.is_some_and(|id| selected.recipe.early_casts.contains(&id))
-        }),
-    );
-    selected.recipe.early_casts.clear();
     selected.program = if config.diagnostic_checkpoints {
         program
     } else {
@@ -361,8 +358,11 @@ impl<C: CostModel> Builder<'_, C> {
                             let implementation = self.fragments.get(plan, &inputs, &output)?;
                             let mut state = ValueBuilder::default();
                             let mut conversions = Vec::new();
-                            for ((source, requirement), &automatic) in
-                                types.iter().zip(&plan.requirements.inputs).zip(&automatic)
+                            for (index, ((source, requirement), &automatic)) in types
+                                .iter()
+                                .zip(&plan.requirements.inputs)
+                                .zip(&automatic)
+                                .enumerate()
                             {
                                 let id = state.value(operation.results[0], source.clone());
                                 if automatic {
@@ -376,6 +376,7 @@ impl<C: CostModel> Builder<'_, C> {
                                     // represented by the family fragment's memory peak.
                                     OperandMaterialization::Complete,
                                     operation.id,
+                                    LocalSite::from("input").at(index as u32),
                                     self.costs,
                                     &mut state,
                                     &mut conversions,
@@ -449,6 +450,7 @@ impl<C: CostModel> Builder<'_, C> {
                                 },
                                 OperandMaterialization::Complete,
                                 operation.id,
+                                "boundary",
                                 self.costs,
                                 &mut state,
                                 &mut sequence,
@@ -472,8 +474,8 @@ impl<C: CostModel> Builder<'_, C> {
                         );
                         let mut fragment = fragment;
                         if early_cast {
-                            fragment
-                                .reorder_casts(&BTreeSet::new(), &BTreeSet::from([operation.id]));
+                            let sites = fragment.reorder_casts(&BTreeSet::new());
+                            fragment.reorder_casts(&sites);
                         }
                         fragment.compose_copies();
                         let (cycles, memory) = crate::estimate::analyze_with_budget(
@@ -554,6 +556,7 @@ impl<C: CostModel> Builder<'_, C> {
                     target,
                     OperandMaterialization::Complete,
                     operation.id,
+                    "boundary",
                     self.costs,
                     &mut self.state,
                     &mut operations,
@@ -586,6 +589,7 @@ impl<C: CostModel> Builder<'_, C> {
                 let result = self.state.value(source.origin, source.tensor_type);
                 self.state.values[result.index() as usize].owners = source.owners.clone();
                 operations.push(MidOperation {
+                    site: None,
                     source: Some(operation.id),
                     inputs: vec![*input],
                     results: vec![result],
@@ -654,6 +658,7 @@ impl<C: CostModel> Builder<'_, C> {
                 target,
                 OperandMaterialization::Complete,
                 operation.id,
+                LocalSite::from("repeat.invariant").at(index as u32),
                 self.costs,
                 &mut self.state,
                 operations,
@@ -669,12 +674,16 @@ impl<C: CostModel> Builder<'_, C> {
                 .clone();
             let converted = sequence
                 .iter()
-                .map(|&id| {
+                .enumerate()
+                .map(|(element, &id)| {
                     ensure_format(
                         id,
                         target.clone(),
                         OperandMaterialization::Complete,
                         operation.id,
+                        LocalSite::from("repeat.sequence")
+                            .at(index as u32)
+                            .at(element as u32),
                         self.costs,
                         &mut self.state,
                         operations,
@@ -691,6 +700,7 @@ impl<C: CostModel> Builder<'_, C> {
                 self.state.get(inputs[index]).tensor_type.format.clone(),
                 OperandMaterialization::Complete,
                 operation.id,
+                LocalSite::from("repeat.yield").at(index as u32),
                 self.costs,
                 &mut self.state,
                 &mut body,
@@ -730,6 +740,7 @@ impl<C: CostModel> Builder<'_, C> {
             })
             .collect();
         operations.push(MidOperation {
+            site: None,
             source: Some(operation.id),
             inputs,
             results,

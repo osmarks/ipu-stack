@@ -193,6 +193,7 @@ fn known_fusion_cost(
         })
         .collect::<Vec<_>>();
     let op = MidOperation {
+        site: None,
         source: None,
         results: vec![MidValueId::from_index(outputs[0] as u32)],
         kind: MidOperationKind::Compute(Compute::Kernel {

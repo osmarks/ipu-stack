@@ -16,6 +16,8 @@ mod ownership;
 pub(crate) use ownership::bind_compute_owners;
 mod packing;
 mod residual;
+mod site;
+pub use site::{LocalSite, WorkSite};
 pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
@@ -75,6 +77,9 @@ pub enum MidOperationKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidOperation {
     pub source: Option<OperationId>,
+    /// Stable role within the constructing family, retained through rewrites
+    /// that still implement that work. Anonymous hand-built mid is also valid.
+    pub site: Option<LocalSite>,
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
@@ -83,6 +88,13 @@ pub struct MidOperation {
 }
 
 impl MidOperation {
+    pub(crate) fn work_site(&self) -> Option<WorkSite> {
+        Some(WorkSite {
+            source: self.source?,
+            local: self.site.clone()?,
+        })
+    }
+
     /// Values read in the enclosing region, including a repeat's parameter sequences.
     pub(crate) fn read_values(&self) -> impl Iterator<Item = &MidValueId> {
         let sequences = match &self.kind {

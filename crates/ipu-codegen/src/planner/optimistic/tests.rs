@@ -227,6 +227,7 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
         }],
         outputs: vec![MidValueId::from_index(1)],
         operations: vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId::from_index(0)],
             results: vec![MidValueId::from_index(1)],

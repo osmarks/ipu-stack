@@ -308,6 +308,10 @@ pub(crate) fn bind_compute_owners(
                         let id = value.id;
                         values.push(value);
                         rewritten.push(MidOperation {
+                            site: operation
+                                .site
+                                .as_ref()
+                                .map(|site| site.child("owner.copy").at(index as u32)),
                             source: operation.source,
                             inputs: vec![*input],
                             results: vec![id],
@@ -370,6 +374,7 @@ mod tests {
                 .collect(),
             outputs: vec![id(2)],
             operations: vec![MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![id(0), id(1)],
                 results: vec![id(2)],
@@ -421,6 +426,7 @@ mod tests {
             });
         }
         let operation = |input, output, primitive| MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId::from_index(input)],
             results: vec![MidValueId::from_index(output)],
@@ -510,6 +516,7 @@ mod tests {
             let operations = std::mem::take(&mut body.operations);
             body.outputs.clear();
             body.operations.push(MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![],
                 results: vec![],

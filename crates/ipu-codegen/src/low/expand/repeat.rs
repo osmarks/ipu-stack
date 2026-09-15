@@ -170,6 +170,7 @@ mod tests {
     fn carried_storage_remains_live_through_reused_copy_inputs() {
         let id = MidValueId::from_index;
         let op = |input, output, kind| MidOperation {
+            site: None,
             source: None,
             inputs: vec![id(input)],
             results: vec![id(output)],

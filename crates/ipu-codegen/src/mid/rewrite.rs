@@ -54,7 +54,7 @@ pub(super) fn is_single_use(
 }
 
 /// Recognize an unfused, whole-value FP16-to-FP8 local conversion.
-pub(super) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidValueId, MidValueId)> {
+pub(crate) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidValueId, MidValueId)> {
     let local = match &op.kind {
         MidOperationKind::Compute(Compute::Kernel {
             kernel:

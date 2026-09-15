@@ -1,7 +1,7 @@
 //! Check executable bindings at construction and rewrite boundaries. Physical
 //! address/access legality is checked later, against concrete kernel calls.
 
-use super::{MidOperation, MidOperationKind, MidProgram, MidValueId};
+use super::{MidOperation, MidOperationKind, MidProgram, MidValueId, WorkSite};
 use crate::{Compute, OperandIndexing, TileKernelSpec};
 use std::collections::BTreeSet;
 
@@ -44,6 +44,7 @@ impl MidProgram {
             &self.operations,
             &self.outputs,
             &mut defined,
+            &mut BTreeSet::new(),
         )
     }
 
@@ -53,6 +54,7 @@ impl MidProgram {
         operations: &[MidOperation],
         yields: &[MidValueId],
         defined: &mut BTreeSet<MidValueId>,
+        sites: &mut BTreeSet<WorkSite>,
     ) -> ProgramResult<()> {
         let invalid = |message| ProgramError::Invalid(message);
         let mut available = BTreeSet::new();
@@ -67,6 +69,11 @@ impl MidProgram {
             available.insert(argument);
         }
         for operation in operations {
+            if let Some(site) = operation.work_site()
+                && !sites.insert(site.clone())
+            {
+                return Err(invalid(format!("ambiguous work site {site:?}")));
+            }
             for &input in operation.read_values() {
                 if !available.contains(&input) {
                     return Err(invalid(format!(
@@ -212,6 +219,7 @@ impl MidProgram {
                         &repeat.body.operations,
                         &repeat.body.yields,
                         defined,
+                        sites,
                     )?;
                     repeat.count != 0
                         && repeat.carried_inputs + repeat.invariant_inputs == arity.0
@@ -271,6 +279,35 @@ mod tests {
         graph.set_outputs([y]).unwrap();
         let config = PipelineConfig::new(4).with_automatic_input(x, Precision::F16);
         crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap()
+    }
+
+    #[test]
+    fn replayable_sites_cannot_name_two_operations() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [4, 16]).unwrap();
+        let first = graph.gelu(input).unwrap();
+        let second = graph.gelu(first).unwrap();
+        graph.set_outputs([second]).unwrap();
+        let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        let mut program =
+            crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        program.validate().unwrap();
+        let site = program
+            .operations
+            .iter()
+            .find_map(MidOperation::work_site)
+            .unwrap();
+        let other = program
+            .operations
+            .iter_mut()
+            .find(|op| op.work_site().is_some_and(|candidate| candidate != site))
+            .unwrap();
+        other.source = Some(site.source);
+        other.site = Some(site.local);
+        assert!(
+            matches!(program.validate(), Err(ProgramError::Invalid(message))
+            if message.contains("ambiguous work site"))
+        );
     }
 
     #[test]

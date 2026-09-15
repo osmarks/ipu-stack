@@ -43,10 +43,10 @@ pub(crate) fn proposals(
         candidates.push(recipe);
     }
 
-    for &site in &incumbent.cast_sites {
+    for site in &incumbent.cast_sites {
         let mut recipe = incumbent.recipe.clone();
-        if !recipe.cast_before_copies.insert(site) {
-            recipe.cast_before_copies.remove(&site);
+        if !recipe.cast_before_copies.insert(site.clone()) {
+            recipe.cast_before_copies.remove(site);
         }
         candidates.push(recipe);
     }

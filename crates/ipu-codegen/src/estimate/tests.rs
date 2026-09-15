@@ -321,6 +321,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             })
             .collect(),
         operations: vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![id(0)],
             results: vec![id(2)],
@@ -408,6 +409,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
     };
     let id = MidValueId::from_index;
     let copy = |input, output| MidOperation {
+        site: None,
         source: None,
         inputs: vec![id(input)],
         results: vec![id(output)],
@@ -443,6 +445,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
     };
     for count in [1, 3] {
         program.operations = vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![id(0), id(1)],
             results: program.outputs.clone(),
@@ -502,6 +505,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
     .collect::<Vec<_>>();
     let cost = |offsets| {
         let op = MidOperation {
+            site: None,
             source: None,
             inputs: vec![values[0].id],
             results: vec![values[1].id],

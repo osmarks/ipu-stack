@@ -265,6 +265,7 @@ mod tests {
                         })
                         .collect(),
                     operations: vec![MidOperation {
+                        site: None,
                         source: None,
                         inputs: vec![MidValueId::from_index(0)],
                         results: vec![MidValueId::from_index(1)],

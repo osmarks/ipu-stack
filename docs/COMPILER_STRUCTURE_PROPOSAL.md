@@ -95,6 +95,12 @@ sites with the words. Repeat relocation, row sharing and schedule replay consume
 the retained sites; their address/group reconstruction walks are removed.
 The independent decoders live in exchange diagnostics and check emitted metadata
 in the randomized encoding tests. This does not change scheduling policy.
+Family constructors now label executable work with stable local roles and block
+coordinates. Cast-order requests use these sites and source-operation provenance;
+version-one checkpoint ordinals are resolved only at the loading/construction
+boundary. Missing requests and ambiguous names are rejected. This supplies the
+identities for scoped preparation choices; the ownership, packing, donation and
+grouping policies below have not yet all moved to that scope.
 The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

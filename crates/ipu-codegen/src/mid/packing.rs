@@ -123,6 +123,7 @@ fn distribute_region(
                     });
                 }
                 let pack = MidOperation {
+                    site: operation.site.as_ref().map(|site| site.child("pack")),
                     inputs: vec![logical],
                     results: vec![packed],
                     source: operation.source,
@@ -138,6 +139,7 @@ fn distribute_region(
                     estimated_exchange_cycles: 0,
                 };
                 let transfer = MidOperation {
+                    site: operation.site.as_ref().map(|site| site.child("distribute")),
                     inputs: vec![packed],
                     results: vec![*output],
                     source: operation.source,
@@ -229,6 +231,7 @@ mod tests {
                 }],
                 outputs: vec![MidValueId(1)],
                 operations: vec![MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId(0)],
                     results: vec![MidValueId(1)],

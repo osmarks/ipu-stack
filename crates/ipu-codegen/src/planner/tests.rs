@@ -302,6 +302,7 @@ fn fp8_conversion_precedes_operand_replication() {
         target.clone(),
         OperandMaterialization::Complete,
         graph.operations()[0].id,
+        "input",
         &crate::estimate::Ipu21CostModel,
         &mut state,
         &mut operations,
@@ -311,9 +312,9 @@ fn fp8_conversion_precedes_operand_replication() {
         operations,
         ..MidProgram::default()
     };
-    let sites = mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+    let sites = mid.reorder_casts(&BTreeSet::new());
     assert_eq!(sites.len(), 1);
-    mid.reorder_casts(&sites, &BTreeSet::new());
+    mid.reorder_casts(&sites);
     assert_eq!(mid.operations.len(), 2);
     let cast = &mid.operations[0];
     assert!(matches!(
@@ -2112,12 +2113,13 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         };
         let mut operations = Vec::new();
         let mut results = Vec::new();
-        for _ in 0..2 {
+        for index in 0..2 {
             results.push(bind::ensure_format(
                 input,
                 target.clone(),
                 OperandMaterialization::Complete,
                 graph.operations()[0].id,
+                crate::mid::LocalSite::from("input").at(index),
                 &crate::estimate::Ipu21CostModel,
                 &mut state,
                 &mut operations,
@@ -2136,9 +2138,9 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
             outputs: results.clone(),
             ..MidProgram::default()
         };
-        let sites = mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+        let sites = mid.reorder_casts(&BTreeSet::new());
         assert_eq!(sites.len(), 2);
-        mid.reorder_casts(&sites, &BTreeSet::new());
+        mid.reorder_casts(&sites);
         assert_eq!(
             mid.operations.len(),
             3,
@@ -2353,6 +2355,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         formats[2].clone(),
         OperandMaterialization::DispatchSlices,
         graph.operations()[0].id,
+        "input",
         &Ipu21CostModel,
         &mut state,
         &mut operations,
@@ -2520,7 +2523,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
         }
         for site in &late.cast_sites {
             let mut recipe = late.recipe.clone();
-            recipe.cast_before_copies.insert(*site);
+            recipe.cast_before_copies.insert(site.clone());
             let serialized = serde_json::to_vec(&recipe).unwrap();
             let recipe: Recipe = serde_json::from_slice(&serialized).unwrap();
             let early = build::build_candidate(
@@ -2546,5 +2549,73 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             .unwrap();
             assert_eq!(replay.program, early.program);
         }
+
+        // V quantization is emitted before QK construction. Its addition must
+        // not redirect the saved Q/K requests to different numeric operations.
+        let casts = |candidate: &crate::planner::Candidate, config: &PipelineConfig| {
+            let raw = build::select(
+                &graph,
+                config,
+                &Ipu21CostModel,
+                &FragmentCache::default(),
+                &candidate.recipe,
+            )
+            .unwrap();
+            raw.program
+                .operations
+                .iter()
+                .filter(|operation| {
+                    crate::mid::rewrite::fp8_cast(operation, &raw.program.values).is_some()
+                })
+                .map(|operation| operation.work_site().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let old_order = casts(&late, &config);
+        config.attention_fp8_scales[1] = Some(-4);
+        let with_v = build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &FragmentCache::default(),
+            &Recipe::default(),
+        )
+        .unwrap();
+        let new_order = casts(&with_v, &config);
+        assert!(late.cast_sites.is_subset(&with_v.cast_sites));
+        for site in &late.cast_sites {
+            let old = old_order
+                .iter()
+                .position(|candidate| candidate == site)
+                .unwrap();
+            let new = new_order
+                .iter()
+                .position(|candidate| candidate == site)
+                .unwrap();
+            assert!(
+                new > old,
+                "the fixture must actually change the old cast ordinals"
+            );
+        }
+        let mut recipe = with_v.recipe.clone();
+        recipe.cast_before_copies = late.cast_sites;
+        let early = build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &FragmentCache::default(),
+            &recipe,
+        )
+        .unwrap();
+        assert_eq!(early.recipe.cast_before_copies, recipe.cast_before_copies);
+        let tiles = crate::expand_tiles(&early.program).unwrap();
+        crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
+
+        let mut unavailable = recipe.cast_before_copies.first().unwrap().clone();
+        unavailable.local = crate::mid::LocalSite::from("nonexistent operand");
+        recipe.cast_before_copies.insert(unavailable.clone());
+        assert!(matches!(
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &FragmentCache::default(), &recipe),
+            Err(LoweringError::UnavailableCastChoice(site)) if site == unavailable
+        ));
     }
 }

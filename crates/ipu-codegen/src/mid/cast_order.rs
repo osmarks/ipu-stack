@@ -1,10 +1,9 @@
-//! Searchable cast motion on expanded mid graphs, including compound operators.
+//! Cast motion on executable mid, selected by stable construction sites.
 
-use crate::graph::OperationId;
 use crate::kernel::TileKernelSpec;
 use crate::mid::{
     Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing,
+    OperandIndexing, WorkSite,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -93,24 +92,14 @@ pub(crate) fn cast_layout(input: &TensorType) -> Option<Layout> {
     valid.then_some(layout)
 }
 
-/// Ordinal among an operator's FP16 -> FP8 casts before any rewrites. Unlike
-/// value IDs, this does not depend on allocations made for preceding operators.
-pub(crate) type CastSite = (Option<OperationId>, u32);
-
 impl MidProgram {
-    pub(crate) fn reorder_casts(
-        &mut self,
-        selected: &BTreeSet<CastSite>,
-        legacy: &BTreeSet<OperationId>,
-    ) -> BTreeSet<CastSite> {
+    pub(crate) fn reorder_casts(&mut self, selected: &BTreeSet<WorkSite>) -> BTreeSet<WorkSite> {
         let mut available = BTreeSet::new();
         reorder_region(
             &mut self.operations,
             &mut self.values,
             &self.outputs,
             selected,
-            legacy,
-            &mut BTreeMap::new(),
             &mut available,
         );
         available
@@ -121,10 +110,8 @@ fn reorder_region(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
-    selected: &BTreeSet<CastSite>,
-    legacy: &BTreeSet<OperationId>,
-    ordinals: &mut BTreeMap<Option<OperationId>, u32>,
-    available: &mut BTreeSet<CastSite>,
+    selected: &BTreeSet<WorkSite>,
+    available: &mut BTreeSet<WorkSite>,
 ) {
     let producers = super::rewrite::single_use_producers(operations, required);
     let mut shared = Vec::<(MidValueId, MidValueId, usize)>::new();
@@ -137,8 +124,6 @@ fn reorder_region(
                 values,
                 &repeat.body.yields,
                 selected,
-                legacy,
-                ordinals,
                 available,
             );
             continue;
@@ -147,9 +132,9 @@ fn reorder_region(
         let Some((mut input, output)) = super::rewrite::fp8_cast(cast, values) else {
             continue;
         };
-        let ordinal = ordinals.entry(cast.source).or_default();
-        let site = (cast.source, *ordinal);
-        *ordinal += 1;
+        let Some(site) = cast.work_site() else {
+            continue;
+        };
         let mut chain = Vec::new();
         let mut best = None;
         while let Some(&previous) = producers.get(&input) {
@@ -211,8 +196,8 @@ fn reorder_region(
             continue;
         };
         tracing::debug!(?site, ?input, ?format, "available mid cast motion");
-        available.insert(site);
-        if !selected.contains(&site) && !cast.source.is_some_and(|id| legacy.contains(&id)) {
+        available.insert(site.clone());
+        if !selected.contains(&site) {
             continue;
         }
         let at = *chain.last().unwrap();
@@ -235,6 +220,7 @@ fn reorder_region(
             value.tensor_type.format = format;
             values.push(value);
             let early = MidOperation {
+                site: cast.site.clone(),
                 source: cast.source,
                 inputs: vec![input],
                 results: vec![id],
@@ -254,6 +240,7 @@ fn reorder_region(
             id
         });
         let mut copy = cast.clone();
+        copy.site = cast.site.as_ref().map(|site| site.child("distribute"));
         copy.inputs = vec![id];
         copy.kind = MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
@@ -292,6 +279,10 @@ mod tests {
     use super::*;
 
     fn fixture() -> MidProgram {
+        let mut graph = crate::ComputeGraph::new();
+        let input = graph.host_input("x", [16, 64]).unwrap();
+        graph.gelu(input).unwrap();
+        let source = graph.operations()[0].id;
         let mut layout = Layout::amp_left(1, 64);
         let input = TensorType::new([8, 64], Precision::F16, layout.clone());
         layout.tiling = TensorTiling::replicated(4);
@@ -335,7 +326,8 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, kind)| MidOperation {
-                    source: None,
+                    site: Some(crate::mid::LocalSite::from(["copy", "cast"][i])),
+                    source: Some(source),
                     inputs: vec![MidValueId(i as u32)],
                     results: vec![MidValueId(i as u32 + 1)],
                     kind,
@@ -353,10 +345,7 @@ mod tests {
         let mut mid = fixture();
         let intermediate = mid.operations[0].results[0];
         mid.outputs.push(intermediate);
-        assert!(
-            mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new())
-                .is_empty()
-        );
+        assert!(mid.reorder_casts(&BTreeSet::new()).is_empty());
         mid.outputs.pop();
         let source = mid.operations[0].inputs[0];
         let mut alias = mid.values[source.index() as usize].clone();
@@ -364,6 +353,7 @@ mod tests {
         mid.operations.insert(
             1,
             MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![source],
                 results: vec![alias.id],
@@ -377,10 +367,7 @@ mod tests {
             },
         );
         mid.values.push(alias);
-        assert!(
-            mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new())
-                .is_empty()
-        );
+        assert!(mid.reorder_casts(&BTreeSet::new()).is_empty());
     }
 
     #[test]
@@ -388,6 +375,7 @@ mod tests {
         let mut mid = fixture();
         let yields = mid.outputs.clone();
         mid.operations = vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId(0)],
             results: yields.clone(),
@@ -407,9 +395,9 @@ mod tests {
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         }];
-        let sites = mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+        let sites = mid.reorder_casts(&BTreeSet::new());
         assert_eq!(sites.len(), 1);
-        mid.reorder_casts(&sites, &BTreeSet::new());
+        mid.reorder_casts(&sites);
         let MidOperationKind::Repeat(repeat) = &mid.operations[0].kind else {
             panic!()
         };
@@ -429,6 +417,7 @@ mod tests {
         mid.operations.insert(
             0,
             MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![original.id],
                 results: vec![source],
@@ -444,9 +433,9 @@ mod tests {
         );
         mid.values.push(original);
         let mut rewritten = mid;
-        let sites = rewritten.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+        let sites = rewritten.reorder_casts(&BTreeSet::new());
         assert_eq!(sites.len(), 1);
-        rewritten.reorder_casts(&sites, &BTreeSet::new());
+        rewritten.reorder_casts(&sites);
         rewritten.compose_copies();
         let cast = rewritten
             .operations

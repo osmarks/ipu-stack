@@ -33,6 +33,7 @@ fn copied_columns(columns: u32) -> MidProgram {
         }],
         outputs: vec![MidValueId::from_index(1)],
         operations: vec![MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId::from_index(0)],
             results: vec![MidValueId::from_index(1)],
@@ -170,6 +171,7 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
         value.storage_group = value.id;
         value.tensor_type.format.layout = Layout::row_major(TensorTiling::sharded(axis, 2));
         mid.operations.push(MidOperation {
+            site: None,
             source: None,
             inputs: vec![mid.values[1].id],
             results: vec![value.id],
@@ -265,6 +267,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
     result.storage_group = result.id;
     mid.outputs = vec![result.id];
     mid.operations.push(MidOperation {
+        site: None,
         source: None,
         inputs: vec![mid.values[0].id, mid.values[1].id],
         results: vec![result.id],
@@ -333,6 +336,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 })
                 .collect(),
             operations: vec![MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![MidValueId::from_index(0), MidValueId::from_index(1)],
                 results: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
@@ -417,6 +421,7 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
         }
         mid.outputs = vec![mid.values[0].id, result.id];
         mid.operations.push(MidOperation {
+            site: None,
             source: None,
             inputs: vec![mid.values[1].id],
             results: vec![result.id],

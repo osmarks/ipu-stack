@@ -2,7 +2,9 @@
 
 use super::fragments::{FragmentBuilder, project_grid};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
-use crate::mid::{Compute, MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes};
+use crate::mid::{
+    Compute, LocalSite, MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes,
+};
 use crate::planner::operator::ProductGrid;
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder,
@@ -58,7 +60,12 @@ impl FragmentBuilder {
         let query_buffer = if query_key_grid.is_some() {
             MidValueId::from_index(0)
         } else {
-            self.copy(MidValueId::from_index(0), query_type, vec![])
+            self.copy(
+                "query.prepare",
+                MidValueId::from_index(0),
+                query_type,
+                vec![],
+            )
         };
         let mut scores_type = output.clone();
         scores_type.format.precision = Precision::F16;
@@ -126,14 +133,26 @@ impl FragmentBuilder {
             .ok()?,
             column_block: AMP_COLUMN_MICRO as u16,
         });
-        let key_panels =
-            self.prepare_attention_operand(MidValueId::from_index(1), &packed_key, key_block)?;
-        let value_panels =
-            self.prepare_attention_operand(MidValueId::from_index(2), &packed_value, key_block)?;
+        let key_panels = self.prepare_attention_operand(
+            "key.prepare",
+            MidValueId::from_index(1),
+            &packed_key,
+            key_block,
+        )?;
+        let value_panels = self.prepare_attention_operand(
+            "value.prepare",
+            MidValueId::from_index(2),
+            &packed_value,
+            key_block,
+        )?;
         // Quantize each unreplicated native panel once, before PV ownership
         // replicates it across query partitions.
         let value_panels = if let Some(scale_exponent) = fp8_scales[1] {
-            self.cast(value_panels, Precision::F8F143 { scale_exponent })
+            self.cast(
+                "value.cast",
+                value_panels,
+                Precision::F8F143 { scale_exponent },
+            )
         } else {
             value_panels
         };
@@ -155,12 +174,23 @@ impl FragmentBuilder {
             let k = if query_key_grid.is_some() {
                 key_panels
             } else {
-                self.copy(key_panels, key_block_type, vec![0, start, 0])
+                self.copy(
+                    LocalSite::from("key.block").at(start),
+                    key_panels,
+                    key_block_type,
+                    vec![0, start, 0],
+                )
             };
             // Flash broadcasts K/V together. Full materialization keeps their
             // large resident matrices in disjoint lifetimes.
-            let v = (!materialized)
-                .then(|| self.copy(value_panels, value_block_type.clone(), vec![0, start, 0]));
+            let v = (!materialized).then(|| {
+                self.copy(
+                    LocalSite::from("value.block").at(start),
+                    value_panels,
+                    value_block_type.clone(),
+                    vec![0, start, 0],
+                )
+            });
             let scores = if let Some(grid) = query_key_grid {
                 // Softmax consumes a padded row but only its valid key prefix.
                 // Retain that logical bound so copies may transfer the shared
@@ -174,6 +204,7 @@ impl FragmentBuilder {
                     }
                 }
                 self.distributed_product(
+                    LocalSite::from("qk").at(start),
                     query_buffer,
                     k,
                     &rows,
@@ -186,6 +217,7 @@ impl FragmentBuilder {
                 )?
             } else {
                 self.compute(
+                    LocalSite::from("qk/product").at(start),
                     vec![query_buffer, k],
                     scores_type.clone(),
                     Compute::Product(product(
@@ -200,6 +232,7 @@ impl FragmentBuilder {
                 )
             };
             weights = Some(self.kernel(
+                LocalSite::from("softmax").at(start),
                 vec![scores],
                 weights_type.clone(),
                 TileKernelSpec::AttentionSoftmax {
@@ -214,7 +247,14 @@ impl FragmentBuilder {
             let v = if probability_value_grid.is_some() {
                 value_panels
             } else {
-                v.unwrap_or_else(|| self.copy(value_panels, value_block_type, vec![0, start, 0]))
+                v.unwrap_or_else(|| {
+                    self.copy(
+                        LocalSite::from("value.block").at(start),
+                        value_panels,
+                        value_block_type,
+                        vec![0, start, 0],
+                    )
+                })
             };
             let product = if let Some(grid) = probability_value_grid {
                 // The softmax buffer also carries FP32 maximum/denominator
@@ -224,8 +264,14 @@ impl FragmentBuilder {
                 // the corresponding V coefficients are zero.
                 let mut probabilities = self.tensor(weights_id).clone();
                 probabilities.shape.0[2] = key_block;
-                let probabilities = self.copy(weights_id, probabilities, vec![]);
+                let probabilities = self.copy(
+                    LocalSite::from("probabilities").at(start),
+                    weights_id,
+                    probabilities,
+                    vec![],
+                );
                 self.distributed_product(
+                    LocalSite::from("pv").at(start),
                     probabilities,
                     v,
                     &product_type,
@@ -238,6 +284,7 @@ impl FragmentBuilder {
                 )?
             } else {
                 self.compute(
+                    LocalSite::from("pv/product").at(start),
                     vec![weights_id, v],
                     product_type.clone(),
                     Compute::Product(Product {
@@ -268,6 +315,7 @@ impl FragmentBuilder {
             }
             let indexing = vec![OperandIndexing::local(); inputs.len()];
             result = Some(self.kernel(
+                LocalSite::from("merge").at(start),
                 inputs,
                 if direct_f16 {
                     final_output.clone()
@@ -285,14 +333,15 @@ impl FragmentBuilder {
                 indexing,
             ));
         }
-        let result = self.cast(result?, final_output.format.precision);
-        Some(self.copy(result, final_output.clone(), vec![]))
+        let result = self.cast("output.cast", result?, final_output.format.precision);
+        Some(self.copy("output", result, final_output.clone(), vec![]))
     }
 
     /// Pack once on a small distributed owner grid, then broadcast native
     /// panels. Both materializations are ordinary mid values and copies.
     fn prepare_attention_operand(
         &mut self,
+        site: &str,
         input: MidValueId,
         resident: &TensorType,
         key_block: u32,
@@ -347,7 +396,7 @@ impl FragmentBuilder {
                 _ => unreachable!(),
             }
         }
-        Some(self.copy(input, packed, vec![]))
+        Some(self.copy(site, input, packed, vec![]))
     }
 }
 
@@ -429,7 +478,7 @@ mod tests {
         resident.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
         let mut b = FragmentBuilder::new(&[key]);
         let prepared = b
-            .prepare_attention_operand(MidValueId::from_index(0), &resident, 64)
+            .prepare_attention_operand("prepare", MidValueId::from_index(0), &resident, 64)
             .unwrap();
         assert_eq!(b.tensor(prepared).format.layout.tiling.tile_count, 192);
     }

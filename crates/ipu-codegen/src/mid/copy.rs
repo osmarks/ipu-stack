@@ -457,6 +457,7 @@ mod tests {
             .collect();
         let operations = (1..4)
             .map(|index| MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![MidValueId(index - 1)],
                 results: vec![MidValueId(index)],

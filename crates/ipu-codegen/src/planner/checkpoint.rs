@@ -37,24 +37,31 @@ impl State {
         let context = format!("{graph:?}\n{normalized:?}\n{mapping:?}");
         let Some(path) = &config.load_search_state else {
             return Ok(Self {
-                version: 1,
+                version: 2,
                 context,
                 mapping: mapping.map(<[u16]>::to_vec),
                 ..Self::default()
             });
         };
-        let mut state: Self = serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+                invalid(format!("invalid search state {}: {error}", path.display()))
+            })?;
+        if saved["version"] == 1 {
+            migrate_cast_site_schema(&mut saved)?;
+        }
+        let mut state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
-        if state.version == 1
+        if state.version == 2
             && state.context != context
             && matches_legacy_context(graph, &state.context, &context)
         {
             state.context = context.clone();
             tracing::info!("migrated checkpoint context without redundant bookkeeping");
         }
-        if state.version != 1 || state.context != context {
-            let detail = if state.version != 1 {
+        if state.version != 2 || state.context != context {
+            let detail = if state.version != 2 {
                 format!("unsupported schema version {}", state.version)
             } else {
                 context_difference(&state.context, &context)
@@ -64,13 +71,14 @@ impl State {
             )));
         }
         if !state.recipe.early_casts.is_empty()
-            || state
-                .visited
-                .iter()
-                .any(|recipe| !recipe.early_casts.is_empty())
+            || !state.recipe.legacy_cast_sites.is_empty()
+            || state.visited.iter().any(|recipe| {
+                !recipe.early_casts.is_empty() || !recipe.legacy_cast_sites.is_empty()
+            })
         {
-            // Old visits describe outer-input cast ordering, not choices on
-            // the expanded graph. Preserve the incumbent and search budget.
+            // Ordinal and source-wide visits cannot be compared to named
+            // choices without rebuilding each plan. Keep the incumbent and
+            // search budget; discard only these obsolete visit identities.
             state.visited.clear();
             tracing::info!("migrating legacy cast choices; cleared obsolete search visits");
         }
@@ -112,6 +120,30 @@ impl State {
         tracing::info!(path = %path.display(), attempts = self.attempts, bytes = bytes.len(), "saved mid-plan search state");
         Ok(())
     }
+}
+
+/// Version one identified casts by their emission order within an operator.
+/// Carry those requests only until family construction can resolve their names.
+/// A new checkpoint serializes named choices, never these compatibility fields.
+fn migrate_cast_site_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> {
+    fn recipe(value: &mut serde_json::Value) -> PackageBuildResult<()> {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("checkpoint recipe is not an object"))?;
+        if let Some(casts) = object.remove("cast_before_copies") {
+            object.insert("legacy_cast_sites".into(), casts);
+        }
+        Ok(())
+    }
+    recipe(&mut saved["recipe"])?;
+    if let Some(visited) = saved["visited"].as_array_mut() {
+        for value in visited {
+            recipe(value)?;
+        }
+    }
+    saved["version"] = 2.into();
+    tracing::info!("migrating ordinal cast choices to family-local sites");
+    Ok(())
 }
 
 /// Version-one contexts recorded implementation details alongside the graph.
@@ -175,6 +207,93 @@ fn context_difference(saved: &str, current: &str) -> String {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
+
+    #[test]
+    fn ordinal_cast_checkpoint_replays_and_saves_named_choices() {
+        use crate::planner::{build_candidate, cache::FragmentCache};
+
+        let mut graph = ComputeGraph::new();
+        let q = graph.host_input("q", [4, 17, 72]).unwrap();
+        let k = graph.host_input("k", [4, 73, 72]).unwrap();
+        let v = graph.host_input("v", [4, 73, 72]).unwrap();
+        let result = graph.flash_attention(q, k, v).unwrap();
+        graph.set_outputs([result]).unwrap();
+        let mut config = PipelineConfig::new(64)
+            .with_attention_products(crate::compile::AttentionProducts::Independent)
+            .with_automatic_input(q, crate::Precision::F16)
+            .with_automatic_input(k, crate::Precision::F16)
+            .with_automatic_input(v, crate::Precision::F16);
+        config.attention_fp8_scales = [Some(-4), None];
+        let fragments = FragmentCache::default();
+        let late = build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &Recipe::default(),
+        )
+        .unwrap();
+        let site = late.cast_sites.iter().next_back().unwrap().clone();
+        let raw = crate::planner::build::select(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &late.recipe,
+        )
+        .unwrap();
+        let ordinal = raw
+            .program
+            .operations
+            .iter()
+            .filter(|operation| operation.source == Some(site.source))
+            .filter(|operation| {
+                crate::mid::rewrite::fp8_cast(operation, &raw.program.values).is_some()
+            })
+            .position(|operation| operation.work_site().as_ref() == Some(&site))
+            .unwrap();
+        let mut named = late.recipe;
+        named.cast_before_copies.insert(site);
+        let expected =
+            build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &named).unwrap();
+        let mut state = State::load(&graph, &config, None).unwrap();
+        state.recipe = named;
+        state.attempts = 29;
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["version"] = 1.into();
+        saved["recipe"]["cast_before_copies"] = serde_json::json!([[
+            state.recipe.cast_before_copies.first().unwrap().source,
+            ordinal
+        ]]);
+        saved["visited"] = serde_json::json!([saved["recipe"].clone()]);
+        let path = std::env::temp_dir().join(format!("ipu-cast-sites-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        config.load_search_state = Some(path.clone());
+        config.save_search_state = Some(path.clone());
+        let mut resumed = State::load(&graph, &config, None).unwrap();
+        assert_eq!(resumed.attempts, 29);
+        assert!(resumed.visited.is_empty());
+        let actual = build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &resumed.recipe,
+        )
+        .unwrap();
+        assert_eq!(actual.program, expected.program);
+        assert!(actual.recipe == expected.recipe);
+        resumed.save(&config, &actual, &config).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["version"], 2);
+        assert!(saved["recipe"].get("legacy_cast_sites").is_none());
+        assert!(saved["recipe"].get("early_casts").is_none());
+        let replay = State::load(&graph, &config, None).unwrap();
+        assert_eq!(replay.attempts, 29);
+        assert!(replay.recipe == actual.recipe);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn legacy_graph_registry_preserves_graph_and_configuration_checks() {

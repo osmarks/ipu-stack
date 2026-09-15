@@ -377,6 +377,7 @@ mod tests {
                     .collect(),
                 outputs: vec![MidValueId::from_index(2)],
                 operations: vec![MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId::from_index(0), MidValueId::from_index(1)],
                     results: vec![MidValueId::from_index(2)],

@@ -160,6 +160,7 @@ pub(crate) fn append_fragment(
     let mut bound = fragment.operations.clone();
     remap_operations(&mut bound, &ids, source)?;
     bound.extend(returned.into_iter().map(|(input, result)| MidOperation {
+        site: None,
         source,
         inputs: vec![input],
         results: vec![result],
@@ -244,6 +245,7 @@ mod tests {
             values[i].storage_group = id(1);
         }
         let add = MidOperation {
+            site: None,
             source: None,
             inputs: vec![id(4), id(5)],
             results: vec![id(6)],
@@ -261,6 +263,7 @@ mod tests {
             inputs: (0..3).map(input).collect(),
             outputs: vec![id(3)],
             operations: vec![MidOperation {
+                site: None,
                 source: None,
                 inputs: vec![id(0)],
                 results: vec![id(3)],

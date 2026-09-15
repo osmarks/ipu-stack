@@ -1,0 +1,40 @@
+//! Provenance for replayable choices on family-created work. Roles are named by
+//! the constructor; coordinates identify algorithmic blocks, never arena IDs or
+//! the number of previously emitted operations.
+use crate::graph::OperationId;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LocalSite {
+    pub role: String,
+    pub coordinates: Vec<u32>,
+}
+
+impl From<&str> for LocalSite {
+    fn from(role: &str) -> Self {
+        Self {
+            role: role.into(),
+            coordinates: Vec::new(),
+        }
+    }
+}
+
+impl LocalSite {
+    pub(crate) fn at(mut self, coordinate: u32) -> Self {
+        self.coordinates.push(coordinate);
+        self
+    }
+
+    pub(crate) fn child(&self, role: &str) -> Self {
+        Self {
+            role: format!("{}/{role}", self.role),
+            coordinates: self.coordinates.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorkSite {
+    pub source: OperationId,
+    pub local: LocalSite,
+}

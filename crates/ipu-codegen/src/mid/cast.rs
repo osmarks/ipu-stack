@@ -182,6 +182,7 @@ mod tests {
             outputs: vec![MidValueId(2)],
             operations: vec![
                 MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId(0)],
                     results: vec![MidValueId(1)],
@@ -195,6 +196,7 @@ mod tests {
                     estimated_exchange_cycles: 0,
                 },
                 MidOperation {
+                    site: None,
                     source: None,
                     inputs: vec![MidValueId(1)],
                     results: vec![MidValueId(2)],
@@ -325,6 +327,7 @@ mod tests {
         };
         mid.outputs.clear();
         mid.operations.push(MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId(0)],
             results: vec![],
@@ -359,6 +362,7 @@ mod tests {
         alias.storage_group = alias.id;
         mid.values.push(alias);
         mid.operations.push(MidOperation {
+            site: None,
             source: None,
             inputs: vec![MidValueId(2)],
             results: vec![MidValueId(3)],

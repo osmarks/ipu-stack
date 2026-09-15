@@ -115,6 +115,17 @@ another representation. Persistent parameter-home selection belongs to
 `mid/ownership.rs`. Cross-module imports name their owners instead of inheriting
 planner/tensor/configuration names through the mid module.
 
+Constructors label their work using [mid/site.rs](../crates/ipu-codegen/src/mid/site.rs):
+a role within the family, algorithmic block coordinates, and the containing
+source operation. Binding retains the role when substituting actual values;
+rewrites retain it for the same work and name generated copies as children.
+Names never depend on arena IDs or the number of earlier emitted operations.
+Cast-order requests in Recipe refer to these sites. Checkpoint loading preserves
+old ordinal requests only until construction can resolve them; new checkpoints
+store names. Missing cast choices are errors, and mid validation rejects names
+that ambiguously refer to more than one operation. The other preparation policies
+are still global and remain a refactor requirement.
+
 The optional mapping search in
 [compile/placement.rs](../crates/ipu-codegen/src/compile/placement.rs) proposes
 one permutation over the entire active tile set. `map_tiles` changes every
