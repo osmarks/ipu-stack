@@ -83,8 +83,8 @@ as callable operands. Recipe now selects input homes, operator working domains
 and individual result homes. The old whole-device mapping neighborhood is an
 ordinary joint Recipe proposal, ranked with its fabric-load estimate; the
 separate mapping optimizer and low remapping pass are removed. Checkpoint
-version four migrates previous mappings into those choices. Family storage,
-grouping scope and cache boundaries below still require work.
+version four migrates previous mappings into those choices. Family storage
+and cache boundaries below still require work.
 Architectural SRAM, supervisor encodings, register IDs and physical routing now
 belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
 the target topology through explicit functions. Package validation and the driver
@@ -110,7 +110,13 @@ panel rows and an explicit workspace per named copy, preserving the destination'
 layout and home. Construction rejects unavailable choices; layout proposals can
 explicitly remove affected choices. Version-five checkpoints migrate the previous
 global row hint once, and physical relabeling includes packing workspaces.
-Grouping policies below have not yet moved to that scope.
+Grouping now names independent reductions. Its rewrite only changes order;
+disjoint reduction/preparation homes use the ordinary ownership choices and
+check physical overlap across different domains. Explicit result homes name the
+actual assignment, preserving alias-relative rotations without an implicit
+constructor offset. Version-six checkpoints resolve the old bases and global
+grouping requests once. Unrelated groups and result homes remain fixed when
+search explicitly removes choices affected by a layout change.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

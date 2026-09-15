@@ -13,6 +13,9 @@ pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     #[serde(default)]
     pub owners: crate::mid::OwnerChoices,
+    /// Checkpoint-only result bases, resolved against constructor rotations.
+    #[serde(default, skip_serializing, with = "crate::mid::site_map")]
+    pub legacy_result_bases: BTreeMap<crate::mid::ResultSite, crate::tensor::OwnerMap>,
     pub open_boundaries: BTreeSet<ValueId>,
     /// Initial capacity-baseline or legacy checkpoint requests; converted to
     /// individual cast sites after expansion and never saved in this form.
@@ -28,13 +31,96 @@ pub(crate) struct Recipe {
     /// Checkpoint-only global preference, resolved once against eligible copies.
     #[serde(default, skip_serializing)]
     pub legacy_packing_rows: Option<std::num::NonZeroU16>,
-    pub parallel_reductions: usize,
-    pub disjoint_copy_sources: bool,
+    #[serde(default)]
+    pub reduction_groups: Vec<crate::mid::ReductionGroup>,
+    #[serde(default, skip_serializing)]
+    pub legacy_parallel_reductions: usize,
+    #[serde(default, skip_serializing)]
+    pub legacy_disjoint_copy_sources: bool,
     #[serde(default)]
     pub cast_storage: Option<CastStoragePolicy>,
 }
 
 impl Recipe {
+    pub(crate) fn has_legacy_choices(&self) -> bool {
+        !self.early_casts.is_empty()
+            || !self.legacy_cast_sites.is_empty()
+            || self.legacy_packing_rows.is_some()
+            || !self.legacy_result_bases.is_empty()
+            || self.legacy_parallel_reductions != 0
+            || self.legacy_disjoint_copy_sources
+    }
+
+    /// Compatibility requests are resolved once against executable work. New
+    /// recipes name each group and use the ordinary result-home policy.
+    pub(crate) fn resolve_legacy_grouping(
+        &mut self,
+        program: &mut MidProgram,
+        checkpoints: bool,
+    ) -> Result<(), crate::mid::ProgramError> {
+        let limit = std::mem::take(&mut self.legacy_parallel_reductions);
+        let separate = std::mem::take(&mut self.legacy_disjoint_copy_sources);
+        if limit < 2 && !separate {
+            return Ok(());
+        }
+        if !self.reduction_groups.is_empty() {
+            return Err(crate::mid::ProgramError::Invalid(
+                "recipe mixes global and named reduction grouping".into(),
+            ));
+        }
+        if limit > 1 && !checkpoints {
+            let proposal = program.propose_reduction_groups(limit);
+            program.apply_ownership(&crate::mid::OwnerChoices {
+                results: proposal.homes.clone(),
+                ..Default::default()
+            })?;
+            self.owners.results.extend(proposal.homes);
+            self.reduction_groups = proposal.reductions;
+        }
+        program.group_reductions(&self.reduction_groups)?;
+        if separate {
+            let homes = program.propose_preparation_homes(checkpoints);
+            program.apply_ownership(&crate::mid::OwnerChoices {
+                results: homes.clone(),
+                ..Default::default()
+            })?;
+            self.owners.results.extend(homes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resolve_result_homes(
+        &mut self,
+        program: &MidProgram,
+    ) -> Result<(), crate::mid::ProgramError> {
+        if self.legacy_result_bases.is_empty() {
+            return Ok(());
+        }
+        let values = program.named_results().collect::<BTreeMap<_, _>>();
+        for (site, base) in std::mem::take(&mut self.legacy_result_bases) {
+            base.validate(1, program.tile_count)?;
+            let value = values.get(&site).ok_or_else(|| {
+                crate::mid::ProgramError::Invalid(format!(
+                    "legacy result home is unavailable at {site:?}"
+                ))
+            })?;
+            let home = base
+                .shifted(
+                    i32::from(program.values[value.index() as usize].owners.rotation()),
+                    program.tile_count,
+                )
+                .ok_or_else(|| {
+                    crate::mid::ProgramError::Invalid("invalid legacy result owner domain".into())
+                })?;
+            if self.owners.results.insert(site, home).is_some() {
+                return Err(crate::mid::ProgramError::Invalid(
+                    "recipe mixes legacy and explicit result homes".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn remapped(
         &self,
         graph: &crate::ComputeGraph,
@@ -138,8 +224,10 @@ impl Recipe {
             casts: Vec<crate::mid::WorkSite>,
             early_casts: Vec<OperationId>,
             packing: BTreeSet<crate::mid::WorkSite>,
-            parallel_reductions: (usize, usize),
-            disjoint_copy_sources: (bool, bool),
+            reductions: (
+                &'a [crate::mid::ReductionGroup],
+                &'a [crate::mid::ReductionGroup],
+            ),
             cast_storage: (&'a Option<CastStoragePolicy>, &'a Option<CastStoragePolicy>),
             owners: (&'a crate::mid::OwnerChoices, &'a crate::mid::OwnerChoices),
         }
@@ -173,8 +261,7 @@ impl Recipe {
                 .filter(|site| self.packing.get(*site) != before.packing.get(*site))
                 .cloned()
                 .collect(),
-            parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
-            disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
+            reductions: (&before.reduction_groups, &self.reduction_groups),
             cast_storage: (&before.cast_storage, &self.cast_storage),
             owners: (&before.owners, &self.owners),
         }
@@ -188,4 +275,5 @@ pub(crate) struct Candidate {
     pub cast_sites: BTreeSet<crate::mid::WorkSite>,
     pub cast_storage_sites: BTreeSet<crate::mid::WorkSite>,
     pub packing_choices: BTreeMap<crate::mid::WorkSite, Vec<crate::mid::PanelPacking>>,
+    pub grouping_choices: Vec<crate::mid::GroupProposal>,
 }

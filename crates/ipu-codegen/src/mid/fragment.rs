@@ -348,16 +348,16 @@ mod tests {
         add.source = Some(source);
         add.site = Some("add".into());
         let site = add.result_site(0).unwrap();
+        let home = program.values[add.results[0].index() as usize]
+            .owners
+            .clone();
         let mut choices = crate::mid::OwnerChoices::default();
-        choices.results.insert(
-            site.clone(),
-            crate::tensor::OwnerMap::embedded(vec![0, 1, 2, 3]),
-        );
+        choices.results.insert(site.clone(), home);
         let original = program.clone();
         program.apply_ownership(&choices).unwrap();
         assert_eq!(
             program, original,
-            "an explicit identity map preserves the input's home"
+            "an explicit current assignment preserves the input's home"
         );
         choices
             .results

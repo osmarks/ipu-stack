@@ -14,6 +14,8 @@ mod fragment;
 mod output_fusion;
 mod ownership;
 pub(crate) use ownership::OwnerChoices;
+mod grouping;
+pub(crate) use grouping::{GroupProposal, ReductionGroup};
 mod packing;
 pub(crate) use packing::PanelPacking;
 mod residual;
@@ -156,6 +158,18 @@ pub struct MidProgram {
 }
 
 impl MidProgram {
+    pub(crate) fn named_results(&self) -> impl Iterator<Item = (ResultSite, MidValueId)> {
+        self.walk_operations().flat_map(|operation| {
+            operation
+                .results
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| {
+                    operation.result_site(index).map(|site| (site, value))
+                })
+        })
+    }
+
     /// Visit nested work once, without unrolling Repeat or changing its scope.
     pub(crate) fn walk_operations(&self) -> impl Iterator<Item = &MidOperation> {
         let mut regions = vec![self.operations.iter()];

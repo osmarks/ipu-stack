@@ -36,10 +36,12 @@ pub(crate) fn proposals(
     // change with donation only for the affected families and direct consumers.
     let mut propose = |recipe: Recipe, sources: &BTreeSet<crate::OperationId>| {
         let mut variants = vec![recipe];
-        // Layout/cast changes can remove a packing site or change its capacity.
-        // Propose dropping the affected choices explicitly; rebuilding never
+        // Layout/cast changes can remove named work or change its capacity.
+        // Propose dropping affected packing, grouping and result homes explicitly; rebuilding never
         // silently ignores an unavailable request.
-        if !variants[0].packing.is_empty()
+        if (!variants[0].packing.is_empty()
+            || !variants[0].reduction_groups.is_empty()
+            || !variants[0].owners.results.is_empty())
             && (variants[0].plans != incumbent.recipe.plans
                 || variants[0].open_boundaries != incumbent.recipe.open_boundaries
                 || variants[0].cast_before_copies != incumbent.recipe.cast_before_copies)
@@ -48,7 +50,17 @@ pub(crate) fn proposals(
             cleared
                 .packing
                 .retain(|site, _| !sources.contains(&site.source));
-            if cleared.packing.len() != variants[0].packing.len() {
+            cleared.reduction_groups.retain(|group| {
+                !group
+                    .members
+                    .iter()
+                    .any(|site| sources.contains(&site.source))
+            });
+            cleared
+                .owners
+                .results
+                .retain(|site, _| !sources.contains(&site.work.source));
+            if cleared != variants[0] {
                 variants.push(cleared);
             }
         }
@@ -98,17 +110,12 @@ pub(crate) fn proposals(
             propose(recipe, &cast_sources);
         }
     }
-    for limit in 2..=config.max_parallel_reductions {
-        if incumbent.recipe.parallel_reductions != limit {
-            let mut recipe = incumbent.recipe.clone();
-            recipe.parallel_reductions = limit;
-            propose(recipe, &cast_sources);
-        }
-    }
-    if !incumbent.recipe.disjoint_copy_sources {
+    for choice in &incumbent.grouping_choices {
         let mut recipe = incumbent.recipe.clone();
-        recipe.disjoint_copy_sources = true;
-        propose(recipe, &cast_sources);
+        recipe.reduction_groups = choice.reductions.clone();
+        recipe.owners.results.extend(choice.homes.clone());
+        let sources = choice.homes.keys().map(|site| site.work.source).collect();
+        propose(recipe, &sources);
     }
 
     for site in &incumbent.cast_sites {

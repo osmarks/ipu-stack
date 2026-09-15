@@ -6,7 +6,7 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
@@ -60,6 +60,9 @@ impl State {
         if saved["version"] == 4 {
             migrate_packing_schema(&mut saved)?;
         }
+        if saved["version"] == 5 {
+            migrate_grouping_schema(&mut saved)?;
+        }
         let mut state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
@@ -80,14 +83,7 @@ impl State {
                 "search state does not match this graph/configuration: {detail}"
             )));
         }
-        if !state.recipe.early_casts.is_empty()
-            || !state.recipe.legacy_cast_sites.is_empty()
-            || state.recipe.legacy_packing_rows.is_some()
-            || state.visited.iter().any(|recipe| {
-                !recipe.early_casts.is_empty()
-                    || !recipe.legacy_cast_sites.is_empty()
-                    || recipe.legacy_packing_rows.is_some()
-            })
+        if state.recipe.has_legacy_choices() || state.visited.iter().any(Recipe::has_legacy_choices)
         {
             // Ordinal and global visits cannot be compared to named
             // choices without rebuilding each plan. Keep the incumbent and
@@ -245,8 +241,48 @@ fn migrate_packing_schema(saved: &mut serde_json::Value) -> PackageBuildResult<(
             migrate(recipe)?;
         }
     }
-    saved["version"] = VERSION.into();
+    saved["version"] = 5.into();
     tracing::info!("migrating global packing rows to named copy choices");
+    Ok(())
+}
+
+fn migrate_grouping_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> {
+    let migrate = |recipe: &mut serde_json::Value| -> PackageBuildResult<()> {
+        let object = recipe
+            .as_object_mut()
+            .ok_or_else(|| invalid("checkpoint recipe is not an object"))?;
+        for (old, new) in [
+            ("parallel_reductions", "legacy_parallel_reductions"),
+            ("disjoint_copy_sources", "legacy_disjoint_copy_sources"),
+        ] {
+            if let Some(value) = object.remove(old)
+                && object.insert(new.into(), value).is_some()
+            {
+                return Err(invalid("checkpoint has multiple global grouping requests"));
+            }
+        }
+        if let Some(owners) = object
+            .get_mut("owners")
+            .and_then(serde_json::Value::as_object_mut)
+            && let Some(results) = owners.remove("results")
+            && object
+                .insert("legacy_result_bases".into(), results)
+                .is_some()
+        {
+            return Err(invalid(
+                "checkpoint has multiple legacy result-home requests",
+            ));
+        }
+        Ok(())
+    };
+    migrate(&mut saved["recipe"])?;
+    if let Some(visited) = saved["visited"].as_array_mut() {
+        for recipe in visited {
+            migrate(recipe)?;
+        }
+    }
+    saved["version"] = VERSION.into();
+    tracing::info!("migrating global grouping and result bases to named groups and actual homes");
     Ok(())
 }
 
@@ -311,6 +347,41 @@ fn context_difference(saved: &str, current: &str) -> String {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
+
+    #[test]
+    fn grouping_checkpoint_migration_preserves_pending_requests() {
+        let mut graph = crate::ComputeGraph::new();
+        let x = graph.host_input("x", [4, 16]).unwrap();
+        graph.gelu(x).unwrap();
+        let site = crate::mid::ResultSite {
+            work: crate::mid::WorkSite {
+                source: graph.operations()[0].id,
+                local: "gelu".into(),
+            },
+            result: 0,
+        };
+        let mut old_recipe = Recipe::default();
+        old_recipe
+            .owners
+            .results
+            .insert(site.clone(), crate::tensor::OwnerMap::rotated(3));
+        let mut recipe = serde_json::to_value(&old_recipe).unwrap();
+        recipe["parallel_reductions"] = 2.into();
+        recipe["disjoint_copy_sources"] = true.into();
+        let mut saved = serde_json::json!({"version":5, "recipe":recipe, "visited":[recipe]});
+        migrate_grouping_schema(&mut saved).unwrap();
+        for value in [&saved["recipe"], &saved["visited"][0]] {
+            let migrated: Recipe = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(migrated.legacy_parallel_reductions, 2);
+            assert!(migrated.legacy_disjoint_copy_sources);
+            assert_eq!(
+                migrated.legacy_result_bases[&site],
+                old_recipe.owners.results[&site]
+            );
+            assert!(migrated.owners.results.is_empty());
+        }
+        assert_eq!(saved["version"], VERSION);
+    }
 
     #[test]
     fn legacy_packing_becomes_scoped_and_layout_search_can_replace_it() {

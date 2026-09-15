@@ -99,6 +99,115 @@ fn recipe_moves_one_consumer_without_moving_its_shared_input() {
 }
 
 #[test]
+fn named_reduction_groups_replay_through_normal_ownership_and_lowering() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [16, 128]).unwrap();
+    let wa = graph.parameter("wa", [128, 64]).unwrap();
+    let wb = graph.parameter("wb", [128, 64]).unwrap();
+    let a = graph.gemm(x, wa).unwrap();
+    let b = graph.gemm(x, wb).unwrap();
+    let view = AxisFactorView {
+        split_axis: 1,
+        merge_axis: 0,
+        factor: 2,
+        reversed: false,
+    };
+    let av = graph.view(a, view).unwrap();
+    let bv = graph.view(b, view).unwrap();
+    let y = graph.add(av, bv).unwrap();
+    graph.set_outputs([y]).unwrap();
+    let mut config = PipelineConfig::new(32)
+        .with_automatic_input(x, Precision::F16)
+        .with_automatic_input(wa, Precision::F16)
+        .with_automatic_input(wb, Precision::F16);
+    for source_operation in 0..2 {
+        config = config.with_gemm_plan_constraint(GemmPlanConstraint {
+            source_operation,
+            orientation: GemmOrientation::Normal,
+            row_partitions: 2,
+            column_partitions: 2,
+            inner_partitions: 2,
+            result_row_partitions: 1,
+            result_column_partitions: 1,
+            output_column_block: 32,
+            weight_memory_class: MemoryClass::Ipu21Interleaved,
+            reduction_staging: ReductionStaging::Complete,
+            local_weight_staging: LocalOperandStaging::Direct,
+        });
+    }
+    let fragments = FragmentCache::default();
+    let initial = Recipe {
+        open_boundaries: BTreeSet::from([a, b, av, bv]),
+        ..Default::default()
+    };
+    let baseline =
+        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &initial).unwrap();
+    let choice = baseline
+        .grouping_choices
+        .iter()
+        .find(|choice| !choice.reductions.is_empty())
+        .unwrap_or_else(|| panic!("no reduction groups: {:#?}", baseline.program.operations));
+    let mut recipe = baseline.recipe.clone();
+    recipe.reduction_groups = choice.reductions.clone();
+    recipe.owners.results.extend(choice.homes.clone());
+    let grouped =
+        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &recipe).unwrap();
+    let expanded = crate::low::expand::expand_tiles(&grouped.program, false).unwrap();
+    crate::place(&crate::low::lower_to_tiles(&expanded, false)).unwrap();
+    let replay: Recipe =
+        serde_json::from_slice(&serde_json::to_vec(&grouped.recipe).unwrap()).unwrap();
+    let rebuilt =
+        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &replay).unwrap();
+    assert_eq!(rebuilt.program, grouped.program);
+    let mut legacy = baseline.recipe.clone();
+    legacy.legacy_parallel_reductions = 2;
+    let migrated =
+        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &legacy).unwrap();
+    assert_eq!(migrated.program, grouped.program);
+    assert!(migrated.recipe == grouped.recipe);
+    // An explicit home denotes the actual output assignment even when a
+    // constructor has already rotated that storage group.
+    let mut rotated = baseline.program.clone();
+    let (site, requested) = choice.homes.first_key_value().unwrap();
+    let value = rotated
+        .named_results()
+        .find(|(name, _)| name == site)
+        .unwrap()
+        .1;
+    let storage = rotated.values[value.index() as usize].storage_group;
+    for alias in rotated
+        .values
+        .iter_mut()
+        .filter(|v| v.storage_group == storage)
+    {
+        alias.owners = alias.owners.shifted(5, rotated.tile_count).unwrap();
+    }
+    let mut legacy_home = Recipe::default();
+    legacy_home
+        .legacy_result_bases
+        .insert(site.clone(), requested.clone());
+    legacy_home.resolve_result_homes(&rotated).unwrap();
+    assert_eq!(
+        legacy_home.owners.results[site],
+        requested.shifted(5, rotated.tile_count).unwrap()
+    );
+    rotated
+        .apply_ownership(&crate::mid::OwnerChoices {
+            results: choice.homes.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rotated.values[value.index() as usize].owners, *requested);
+    crate::low::expand::expand_tiles(&rotated, false).unwrap();
+    let mut stale = recipe;
+    stale.reduction_groups[0].members[0]
+        .local
+        .role
+        .push_str(".missing");
+    assert!(build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &stale).is_err());
+}
+
+#[test]
 fn recipe_can_place_gemm_partials_and_reduction_on_different_tiles() {
     use crate::tensor::OwnerMap;
 

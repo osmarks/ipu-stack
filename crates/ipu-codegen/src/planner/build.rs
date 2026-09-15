@@ -60,12 +60,10 @@ pub(crate) fn build_candidate(
             .program
             .packing_choices(&super::proposals::PACKING_ROWS, &selected.recipe.packing);
         selected.program.apply_packing(&selected.recipe.packing)?;
-        if recipe.parallel_reductions > 1 {
-            let program = selected.program;
-            selected.program = program
-                .with_overlapped_reductions(recipe.parallel_reductions)
-                .unwrap_or(program);
-        }
+        selected.grouping_choices = (2..=config.max_parallel_reductions)
+            .map(|limit| selected.program.propose_reduction_groups(limit))
+            .filter(|proposal| !proposal.reductions.is_empty())
+            .collect();
     } else {
         if !selected.recipe.packing.is_empty() {
             return Err(crate::mid::ProgramError::Invalid(
@@ -76,11 +74,26 @@ pub(crate) fn build_candidate(
         // The old global hint was disabled by diagnostic checkpoints too.
         selected.recipe.legacy_packing_rows = None;
     }
-    if recipe.disjoint_copy_sources {
-        let program = selected.program;
-        selected.program = program
-            .with_disjoint_copy_sources(config.diagnostic_checkpoints)
-            .unwrap_or(program);
+    selected
+        .recipe
+        .resolve_legacy_grouping(&mut selected.program, config.diagnostic_checkpoints)?;
+    if config.diagnostic_checkpoints && !selected.recipe.reduction_groups.is_empty() {
+        return Err(crate::mid::ProgramError::Invalid(
+            "reduction grouping cannot apply with diagnostic checkpoints".into(),
+        )
+        .into());
+    }
+    selected
+        .program
+        .group_reductions(&selected.recipe.reduction_groups)?;
+    let homes = selected
+        .program
+        .propose_preparation_homes(config.diagnostic_checkpoints);
+    if !homes.is_empty() {
+        selected.grouping_choices.push(crate::mid::GroupProposal {
+            reductions: selected.recipe.reduction_groups.clone(),
+            homes,
+        });
     }
     let storage = selected.recipe.cast_storage.as_ref().unwrap();
     if config.diagnostic_checkpoints {
@@ -233,12 +246,14 @@ pub(crate) fn select(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
+    builder.recipe.resolve_result_homes(&program)?;
     program.apply_ownership(&builder.recipe.owners)?;
     program.validate()?;
     Ok(Candidate {
         cast_sites: BTreeSet::new(),
         cast_storage_sites: BTreeSet::new(),
         packing_choices: BTreeMap::new(),
+        grouping_choices: Vec::new(),
         program,
         recipe: builder.recipe,
         alternatives: builder.alternatives,

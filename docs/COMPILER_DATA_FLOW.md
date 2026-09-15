@@ -144,8 +144,17 @@ existing four row sizes. An unavailable requested site or workspace is an error.
 Layout/cast proposals may explicitly remove affected packing choices, while
 unrelated choices remain fixed. Version-five checkpoints resolve the old global
 row hint once; new checkpoints retain only named choices. Joint tile-mapping
-proposals also remap packing workspaces. Reduction/preparation grouping remains
-global and is still a refactor requirement.
+proposals also remap packing workspaces.
+
+[Grouping](../crates/ipu-codegen/src/mid/grouping.rs) proposes named independent
+reductions and disjoint result homes. The homes enter the ordinary ownership
+policy; the grouping rewrite only delays the named reductions to form a contiguous
+group. It checks read/write hazards and region boundaries before changing order.
+Preparation proposals use the same result-home policy without an ordering rewrite.
+Both proposals check actual tiles when domains differ. The existing bounded joint
+neighborhood remains; recipes can retain unrelated groups independently.
+Version-six checkpoints resolve old global grouping requests once. Layout changes
+can explicitly remove affected groups and homes, as with packing choices.
 
 Mid values carry an
 [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto
@@ -155,9 +164,11 @@ Expansion and memory accounting resolve owners through this same map. Mid
 [ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts explicit
 copies when a local compute operand or allocation alias needs another result's
 owners; distributed Sum retains its own contributor traffic. Repeat and fragment
-binding preserve the maps. Recipe's `OwnerChoices` gives inputs and individual
-results a base home, and operators a working domain for new storage. Family-local
-embeddings and relative rotations are interpreted within that domain. Input
+binding preserve the maps. Recipe's `OwnerChoices` gives inputs a base home,
+individual results an actual home, and operators a working domain for new storage.
+An explicit result request does not inherit an extra constructor rotation; aliases
+retain their relative rotations within that result's storage group. Family-local
+embeddings and relative rotations are interpreted within operator domains. Input
 homes and explicit result choices take precedence; conflicting choices for a
 shared storage group fail. A moved Repeat body copies its yield back to the
 carried state's home. The graph builder applies these choices after selecting
