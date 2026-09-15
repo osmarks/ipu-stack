@@ -39,6 +39,24 @@ pub fn build_tile_program_package(
         ));
     }
 
+    let (mut data, aperture) = split_aperture_data(data)?;
+    let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
+    let objects = vec![fs::read(runtime_artifact.object)?];
+    let kernels = KernelBuildPlan::default();
+    let mut retained_runtime = vec![
+        COMPLETE_SYMBOL,
+        HOST_RUN_SYMBOL,
+        REPEAT_CALL_SYMBOL,
+        WORKER_BARRIER_SYMBOL,
+    ];
+    for program in programs {
+        collect_compute_symbols(&mut retained_runtime, &program.steps);
+    }
+    if !aperture.is_empty() {
+        retained_runtime.push(crate::kernel::abi::COPY_U32_SYMBOL);
+    }
+    retained_runtime.sort_unstable();
+    retained_runtime.dedup();
     let mut programs = programs.to_vec();
     programs.extend(
         (programs.len() as u16..execution_tiles).map(|tile| TileProgram {
@@ -46,30 +64,7 @@ pub fn build_tile_program_package(
             steps: Vec::new(),
         }),
     );
-    let (mut data, aperture) = split_aperture_data(data)?;
-    let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
-    let objects = vec![fs::read(runtime_artifact.object)?];
-    let kernels = KernelBuildPlan::default();
-    let mut retained_runtime = vec![
-        COMPLETE_SYMBOL.into(),
-        HOST_RUN_SYMBOL.into(),
-        REPEAT_CALL_SYMBOL.into(),
-        WORKER_BARRIER_SYMBOL.into(),
-    ];
-    for program in &programs {
-        collect_compute_symbols(&mut retained_runtime, &program.steps);
-    }
-    if !aperture.is_empty() {
-        retained_runtime.push(crate::kernel::abi::COPY_U32_SYMBOL.into());
-    }
-    retained_runtime.sort_unstable();
-    retained_runtime.dedup();
-    let layout = link_runtime(
-        &objects,
-        runtime_symbols(0, 0, 0)?,
-        &kernels,
-        &retained_runtime,
-    )?;
+    let layout = link_runtime(&objects, 0, 0, 0, &kernels, &retained_runtime)?;
     let mut memory = TileMemoryMap::new();
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     // Explicit tile programs bring fixed data addresses; protect linked code
@@ -356,11 +351,11 @@ fn collect_exchange_rows(
     Ok(())
 }
 
-fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep]) {
+fn collect_compute_symbols<'a>(symbols: &mut Vec<&'a str>, steps: &'a [crate::TileStep]) {
     for step in steps {
         let profile = match step {
             crate::TileStep::Compute(compute) => {
-                symbols.push(compute.symbol.clone());
+                symbols.push(&compute.symbol);
                 &compute.profile
             }
             crate::TileStep::Repeat(repeat) => {
@@ -371,7 +366,7 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
             crate::TileStep::Checkpoint(checkpoint) => &checkpoint.profile,
         };
         if profile.before.is_some() || profile.after.is_some() {
-            symbols.push(SAMPLE_CYCLE_SYMBOL.into());
+            symbols.push(SAMPLE_CYCLE_SYMBOL);
         }
     }
 }

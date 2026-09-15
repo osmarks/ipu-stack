@@ -42,7 +42,7 @@ use ipu_package::{
 };
 use ipu_target::ipu21::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::num::TryFromIntError;
 
@@ -608,7 +608,7 @@ pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
 struct TileBuildContext<'a> {
     objects: &'a [Vec<u8>],
     kernel_plan: &'a KernelBuildPlan,
-    retained_runtime: &'a [String],
+    retained_runtime: &'a [&'a str],
     code_address: u32,
     host_staging_address: u32,
 }
@@ -622,11 +622,9 @@ fn build_tile(
 ) -> PackageBuildResult<TileImage> {
     let linked = link_runtime(
         context.objects,
-        runtime_symbols(
-            logical_tile,
-            context.code_address,
-            context.host_staging_address,
-        )?,
+        logical_tile,
+        context.code_address,
+        context.host_staging_address,
         context.kernel_plan,
         context.retained_runtime,
     )?;
@@ -682,12 +680,19 @@ fn build_tile(
 
 fn link_runtime(
     objects: &[Vec<u8>],
-    externals: HashMap<String, u32>,
+    physical_tile: u32,
+    program_address: u32,
+    host_staging_address: u32,
     kernel_plan: &KernelBuildPlan,
-    retained_runtime: &[String],
+    retained_runtime: &[&str],
 ) -> PackageBuildResult<LinkedImage> {
-    let mut retained_symbols = retained_runtime.to_vec();
-    retained_symbols.extend(kernel_plan.retained_symbols().map(str::to_owned));
+    let sync_context = physical_tile
+        .checked_mul(8)
+        .ok_or_else(|| invalid("tile index overflow"))?;
+    let prng_seed = physical_tile
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(8))
+        .ok_or_else(|| invalid("PRNG seed overflow"))?;
     Ok(link(
         objects,
         &LinkOptions {
@@ -702,59 +707,48 @@ fn link_runtime(
                     ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 ),
             ],
-            entry_symbol: RUNTIME_ENTRY_SYMBOL.into(),
-            retained_symbols,
-            externals,
+            entry_symbol: RUNTIME_ENTRY_SYMBOL,
+            retained_symbols: &retained_runtime
+                .iter()
+                .copied()
+                .chain(kernel_plan.retained_symbols())
+                .collect::<Vec<_>>(),
+            externals: &[
+                (WORKER_SYNC_CONTEXT_SYMBOL, sync_context),
+                (
+                    WORKER_STACK_BASE_SYMBOL,
+                    COMPLETION_ADDRESS + WORKER_STACK_HEADROOM,
+                ),
+                (PRNG_SEED_SYMBOL, prng_seed),
+                (PROGRAM_ADDRESS_SYMBOL, program_address),
+                (COMPLETION_ADDRESS_SYMBOL, COMPLETION_ADDRESS),
+                (
+                    ipu_target::ipu21::runtime_layout::HOST_STAGING_SYMBOL,
+                    host_staging_address,
+                ),
+            ],
         },
     )?)
 }
 
-fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Vec<String> {
-    let mut symbols = vec![COMPLETE_SYMBOL.into()];
+fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Vec<&'static str> {
+    let mut symbols = vec![COMPLETE_SYMBOL];
     if !program.exchange_phases.is_empty() {
-        symbols.push(WORKER_BARRIER_SYMBOL.into());
-        symbols.push(ipu_target::ipu21::runtime_layout::PATCH_ROW_SYMBOL.into());
+        symbols.push(WORKER_BARRIER_SYMBOL);
+        symbols.push(ipu_target::ipu21::runtime_layout::PATCH_ROW_SYMBOL);
         if !program.repeat_runs.is_empty() {
-            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_TABLES_SYMBOL.into());
-            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
+            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_TABLES_SYMBOL);
+            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_ARITHMETIC_SYMBOL);
         }
     }
     if config.profiling {
-        symbols.push(SAMPLE_CYCLE_SYMBOL.into());
+        symbols.push(SAMPLE_CYCLE_SYMBOL);
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
-        symbols.push(ipu_target::ipu21::runtime_layout::HOST_RUN_SYMBOL.into());
-        symbols.push(ipu_target::ipu21::runtime_layout::REPEAT_CALL_SYMBOL.into());
+        symbols.push(ipu_target::ipu21::runtime_layout::HOST_RUN_SYMBOL);
+        symbols.push(ipu_target::ipu21::runtime_layout::REPEAT_CALL_SYMBOL);
     }
     symbols
-}
-
-fn runtime_symbols(
-    physical_tile: u32,
-    program_address: u32,
-    host_staging_address: u32,
-) -> PackageBuildResult<HashMap<String, u32>> {
-    let sync_context = physical_tile
-        .checked_mul(8)
-        .ok_or_else(|| invalid("tile index overflow"))?;
-    let prng_seed = physical_tile
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(8))
-        .ok_or_else(|| invalid("PRNG seed overflow"))?;
-    Ok(HashMap::from([
-        (WORKER_SYNC_CONTEXT_SYMBOL.into(), sync_context),
-        (
-            WORKER_STACK_BASE_SYMBOL.into(),
-            COMPLETION_ADDRESS + WORKER_STACK_HEADROOM,
-        ),
-        (PRNG_SEED_SYMBOL.into(), prng_seed),
-        (PROGRAM_ADDRESS_SYMBOL.into(), program_address),
-        (COMPLETION_ADDRESS_SYMBOL.into(), COMPLETION_ADDRESS),
-        (
-            ipu_target::ipu21::runtime_layout::HOST_STAGING_SYMBOL.into(),
-            host_staging_address,
-        ),
-    ]))
 }
 
 // Calls use explicit addresses. Use any free executable hole, including those

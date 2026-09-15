@@ -318,16 +318,16 @@ pub fn inspect_object(bytes: &[u8]) -> Result<ObjectSummary, ElfError> {
 }
 
 #[derive(Clone, Debug)]
-pub struct LinkOptions {
+pub struct LinkOptions<'a> {
     /// Architectural base used by image-relative relocations. For IPU21 this
     /// is `TMEM_REGION0_BASE_ADDR` (0x4c000), regardless of section placement.
     pub image_base: u32,
     /// Optional executable intervals used for non-contiguous section placement.
     pub regions: Vec<(u32, u32)>,
-    pub entry_symbol: String,
+    pub entry_symbol: &'a str,
     /// Symbols reached through runtime dispatch tables rather than ELF relocations.
-    pub retained_symbols: Vec<String>,
-    pub externals: HashMap<String, u32>,
+    pub retained_symbols: &'a [&'a str],
+    pub externals: &'a [(&'a str, u32)],
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +354,7 @@ struct PlacedSection {
     size: usize,
 }
 
-pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, ElfError> {
+pub fn link(objects: &[Vec<u8>], options: &LinkOptions<'_>) -> Result<LinkedImage, ElfError> {
     debug!(
         objects = objects.len(),
         relocation_base = format_args!("0x{:x}", options.image_base),
@@ -366,8 +366,8 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
         .iter()
         .map(|bytes| object::File::parse(bytes.as_slice()))
         .collect::<Result<Vec<_>, _>>()?;
-    let roots = std::iter::once(options.entry_symbol.as_str())
-        .chain(options.retained_symbols.iter().map(String::as_str));
+    let roots =
+        std::iter::once(options.entry_symbol).chain(options.retained_symbols.iter().copied());
     let kept = reachable_sections(&parsed, roots)?;
     debug!(sections = kept.len(), "retained reachable sections");
     let mut placements = Vec::new();
@@ -500,8 +500,8 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
             }
         }
     }
-    for (name, value) in &options.externals {
-        symbols.insert(name.clone(), *value);
+    for &(name, value) in options.externals {
+        symbols.insert(name.to_owned(), value);
     }
     debug!(?symbols, "resolved linked symbols");
 
@@ -564,7 +564,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
         }
     }
     let entry = *symbols
-        .get(&options.entry_symbol)
+        .get(options.entry_symbol)
         .ok_or_else(|| ElfError::Link(format!("missing entry symbol {}", options.entry_symbol)))?;
     let mut segments = Vec::<LinkedSegment>::new();
     for placement in &placements {

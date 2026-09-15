@@ -269,9 +269,12 @@ fn main() -> Result<()> {
                         base,
                         ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
                     )],
-                    entry_symbol: entry,
-                    retained_symbols: Vec::new(),
-                    externals: symbol.into_iter().collect(),
+                    entry_symbol: &entry,
+                    retained_symbols: &[],
+                    externals: &symbol
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), *value))
+                        .collect::<Vec<_>>(),
                 },
             )?;
             fs::write(&output, &image.bytes)?;

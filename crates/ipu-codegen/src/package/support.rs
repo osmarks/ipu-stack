@@ -6,7 +6,7 @@ use super::{
     PackageBuildError, PackageBuildResult, RUNTIME_EXECUTABLE_START, active_topology,
     allocate_package_code, check_exchange_budget, invalid, link_runtime, linked_end,
     protect_executable_elements, reserve_exchange_setup, reserve_fixed_runtime_memory,
-    reserve_linked_image, runtime_retained_symbols, runtime_symbols,
+    reserve_linked_image, runtime_retained_symbols,
 };
 use crate::host;
 use crate::kernel::KernelBuildPlan;
@@ -30,7 +30,7 @@ pub(crate) struct PackageSupport {
     pub(crate) exchange_code_base: u32,
     pub(super) objects: Vec<Vec<u8>>,
     pub(super) kernel_plan: KernelBuildPlan,
-    pub(super) retained_runtime: Vec<String>,
+    pub(super) retained_runtime: Vec<&'static str>,
     pub(super) layout: LinkedImage,
     pub(super) physical_to_logical: Vec<u16>,
     pub(super) code_address: u32,
@@ -53,12 +53,7 @@ pub(crate) fn size_support(
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = tracing::info_span!("link_runtime").in_scope(|| -> PackageBuildResult<_> {
-        link_runtime(
-            &objects,
-            runtime_symbols(0, 0, 0)?,
-            &kernel_plan,
-            &retained_runtime,
-        )
+        link_runtime(&objects, 0, 0, 0, &kernel_plan, &retained_runtime)
     })?;
     let linked_end = linked_end(&layout)?;
     let mut memory = TileMemoryMap::new();
