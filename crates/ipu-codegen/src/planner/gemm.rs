@@ -39,12 +39,8 @@ impl FragmentBuilder {
         let right_source_type = self.tensor(right).clone();
         let mut left_type = left_source_type.clone();
         let mut right_type = right_source_type.clone();
-        left_type.format = plan.requirements.inputs[left.index() as usize]
-            .format
-            .clone();
-        right_type.format = plan.requirements.inputs[right.index() as usize]
-            .format
-            .clone();
+        left_type.format = plan.inputs[left.index() as usize].format.clone();
+        right_type.format = plan.inputs[right.index() as usize].format.clone();
         let (left_row, left_inner) = orientation.matrix_axes(left_type.shape.0.len());
         let (right_inner, right_column) = orientation.matrix_axes(right_type.shape.0.len());
         let (output_row, output_column) = orientation.matrix_axes(output.shape.0.len());
@@ -113,7 +109,7 @@ impl FragmentBuilder {
                     right,
                     right_staging,
                     vec![],
-                    plan.requirements.inputs[right.index() as usize].local_staging
+                    plan.inputs[right.index() as usize].local_staging
                         == LocalOperandStaging::Direct,
                 );
                 let mut partials = partial;

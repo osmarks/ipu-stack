@@ -19,7 +19,7 @@ use super::*;
 use crate::estimate::Ipu21CostModel;
 use crate::planner::OperatorCandidate;
 use crate::planner::operator::{
-    GemmDistribution, OperandRequirement, OperatorDispatch, OperatorFamily, OutputAliasing,
+    GemmDistribution, OperandRequirement, OperatorDispatch, OperatorFamily,
 };
 use crate::planner::test_support::lower;
 use crate::{
@@ -561,7 +561,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                 OperandRequirement::new(left_format.clone()),
                 OperandRequirement::new(right_format.clone()),
             ],
-            OperandRequirement::new(output_format),
+            output_format,
         )
         .with_dispatch(OperatorDispatch::BlockedGemm {
             inner_block: 64,
@@ -732,7 +732,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
                 OperandRequirement::new(left_format),
                 OperandRequirement::new(right_format),
             ],
-            OperandRequirement::new(output_format),
+            output_format,
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -776,7 +776,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             OperatorFamily::Gelu,
             [OperandRequirement::new(tensor_format.clone())],
-            OperandRequirement::new(tensor_format),
+            tensor_format,
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -911,7 +911,7 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
             // GeLU preserves element order. Requesting its output format on
             // the operand makes the required local conversion explicit.
             [OperandRequirement::new(output_format.clone())],
-            OperandRequirement::new(output_format),
+            output_format,
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -980,7 +980,7 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             OperatorFamily::Gelu,
             [OperandRequirement::new(target_format.clone())],
-            OperandRequirement::new(target_format),
+            target_format,
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -1679,20 +1679,15 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                     distribution: GemmDistribution::OutputStationary,
                     ..
                 }
-            ) && candidate
-                .plan
-                .requirements
-                .inputs
-                .get(1)
-                .is_some_and(|requirement| {
-                    requirement.format.layout.order
-                        == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                            row_block: 64,
-                            column_block: crate::tensor::AMP_COLUMN_MICRO as u16,
-                        })
-                        && requirement.format.layout.tiling.tile_count == tiles
-                        && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-                })
+            ) && candidate.plan.inputs.get(1).is_some_and(|requirement| {
+                requirement.format.layout.order
+                    == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                        row_block: 64,
+                        column_block: crate::tensor::AMP_COLUMN_MICRO as u16,
+                    })
+                    && requirement.format.layout.tiling.tile_count == tiles
+                    && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+            })
         });
         let selected = crate::planner::build::select(
             &graph,
@@ -1704,8 +1699,8 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
         .unwrap();
         let plan = selected.recipe.plans.values().next().unwrap();
         let config = config
-            .with_input(left, plan.requirements.inputs[0].format.clone())
-            .with_input(right, plan.requirements.inputs[1].format.clone());
+            .with_input(left, plan.inputs[0].format.clone())
+            .with_input(right, plan.inputs[1].format.clone());
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
@@ -1797,7 +1792,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                     crate::planner::operator::OperandRequirement::new(right_format)
                         .with_local_staging(local_staging),
                 ],
-                crate::planner::operator::OperandRequirement::new(output_format),
+                output_format,
             )]
             .into_iter()
             .map(OperatorCandidate::Concrete)
@@ -1910,9 +1905,9 @@ fn repeat_binds_every_linear_fragment_including_rotated_owners() {
     let mut candidate = ConcreteOperatorCandidate::new(
         OperatorFamily::Add,
         vec![OperandRequirement::new(format.clone()); 2],
-        OperandRequirement::new(format.clone()),
+        format.clone(),
     );
-    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    candidate.plan.reuse_inputs = Some(vec![0]);
     let mut config = PipelineConfig::new(2);
     for input in [carried, invariant].into_iter().chain(parameters) {
         config.inputs.insert(input, format.clone());
@@ -2160,9 +2155,9 @@ fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
     let mut candidate = ConcreteOperatorCandidate::new(
         OperatorFamily::Gelu,
         [OperandRequirement::new(tensor_format.clone())],
-        OperandRequirement::new(tensor_format.clone()),
+        tensor_format.clone(),
     );
-    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    candidate.plan.reuse_inputs = Some(vec![0]);
     let mut config = PipelineConfig::new(1)
         .with_input(a, tensor_format.clone())
         .with_input(b, tensor_format);
@@ -2433,9 +2428,9 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let mut candidate = ConcreteOperatorCandidate::new(
         OperatorFamily::Gelu,
         [OperandRequirement::new(format.clone())],
-        OperandRequirement::new(format.clone()),
+        format.clone(),
     );
-    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    candidate.plan.reuse_inputs = Some(vec![0]);
     let mut config = PipelineConfig::new(4).with_input(input, format);
     config.operator_candidates = vec![candidate]
         .into_iter()
@@ -2466,7 +2461,7 @@ fn local_casts_pair_corresponding_linear_fragments() {
     let candidate = ConcreteOperatorCandidate::new(
         OperatorFamily::Gelu,
         [OperandRequirement::new(target.clone())],
-        OperandRequirement::new(target.clone()),
+        target.clone(),
     );
     let mut config = PipelineConfig::new(2).with_input(
         input,

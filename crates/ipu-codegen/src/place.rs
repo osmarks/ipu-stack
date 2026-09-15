@@ -1825,7 +1825,7 @@ mod tests {
                 [crate::planner::operator::OperandRequirement::new(
                     format.clone(),
                 )],
-                crate::planner::operator::OperandRequirement::new(format),
+                format,
             )]
             .into_iter()
             .map(crate::planner::OperatorCandidate::Concrete)
@@ -1982,7 +1982,7 @@ mod tests {
             // the cost model prefers another precision or inserts conversions.
             config.operator_candidates.retain(|candidate| {
                 candidate.concrete().is_some_and(|candidate| {
-                    let format = &candidate.plan.requirements.output.format;
+                    let format = &candidate.plan.output;
                     format.precision == Precision::F16
                         && format.layout.order == crate::ElementOrder::RowMajor
                 })

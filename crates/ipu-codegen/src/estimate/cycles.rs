@@ -343,9 +343,8 @@ impl CostModel for Ipu21CostModel {
 mod tests {
     use super::*;
     use crate::estimate::ExchangeEndpointLoad;
-    use crate::planner::operator::{OperandRequirement, OutputAliasing, StorageRequirements};
-    use crate::planner::operator::{OperatorDispatch, OperatorFamily};
-    use crate::{TensorFormat, TileKernelSpec};
+    use crate::planner::operator::OperandRequirement;
+    use crate::planner::operator::OperatorFamily;
 
     const CASES: usize = 32;
 
@@ -413,20 +412,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    fn pointwise_dispatch() -> OperatorDispatch {
-        OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Gelu,
-        }
-    }
-
-    fn pointwise_requirements(format: TensorFormat) -> StorageRequirements {
-        StorageRequirements {
-            inputs: vec![OperandRequirement::new(format.clone())],
-            output: OperandRequirement::new(format),
-            output_aliasing: OutputAliasing::Fresh,
         }
     }
 
@@ -501,26 +486,29 @@ mod tests {
             let unsharded =
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
             for operator in [OperatorFamily::Gelu, OperatorFamily::Add] {
-                let sharded_cycles = crate::planner::fragments::build_fragment(
-                    &OperatorPlan {
+                let cycles = |tensor: &TensorType| {
+                    let arity = if operator == OperatorFamily::Add {
+                        2
+                    } else {
+                        1
+                    };
+                    let plan = crate::planner::catalogue::ConcreteOperatorCandidate::new(
                         operator,
-                        dispatch: pointwise_dispatch(),
-                        requirements: pointwise_requirements(sharded.format.clone()),
-                    },
-                    std::slice::from_ref(&sharded),
-                    &sharded,
-                )
-                .map_or(u64::MAX, |program| program.estimated_cycles);
-                let unsharded_cycles = crate::planner::fragments::build_fragment(
-                    &OperatorPlan {
-                        operator,
-                        dispatch: pointwise_dispatch(),
-                        requirements: pointwise_requirements(unsharded.format.clone()),
-                    },
-                    std::slice::from_ref(&unsharded),
-                    &unsharded,
-                )
-                .map_or(u64::MAX, |program| program.estimated_cycles);
+                        vec![OperandRequirement::new(tensor.format.clone()); arity],
+                        tensor.format.clone(),
+                    )
+                    .plan;
+                    let program = crate::planner::fragments::build_fragment(
+                        &plan,
+                        &vec![tensor.clone(); arity],
+                        tensor,
+                    )
+                    .expect("supported pointwise work");
+                    program.validate().unwrap();
+                    program.estimated_cycles
+                };
+                let sharded_cycles = cycles(&sharded);
+                let unsharded_cycles = cycles(&unsharded);
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
         }

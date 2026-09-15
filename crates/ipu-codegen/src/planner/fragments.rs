@@ -7,7 +7,7 @@ use crate::mid::{
     Compute, CoordinateMapping, LocalSite, MidInput, MidOperation, MidOperationKind, MidProgram,
     MidValue, MidValueId, OperandIndexing,
 };
-use crate::planner::operator::{OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing};
+use crate::planner::operator::{OperatorDispatch, OperatorFamily, OperatorPlan};
 use crate::tensor::{
     Precision, TensorTiling, TensorType, broadcast_operand_tiling, project_tiling,
     same_distribution,
@@ -22,7 +22,8 @@ pub(crate) fn build_fragment(
     let mut b = FragmentBuilder::new(inputs);
     let result = match &plan.dispatch {
         OperatorDispatch::LayerNorm { parts } => b.layernorm(output, *parts)?,
-        OperatorDispatch::Pointwise { kernel, .. } => {
+        OperatorDispatch::LocalKernel => {
+            let kernel = plan.operator.local_kernel()?;
             // The fused attention callable consumes already-selected local
             // Q/K/V panels. Its row domains differ from the result's domain.
             let indexing = if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
@@ -43,26 +44,18 @@ pub(crate) fn build_fragment(
                     vec![],
                 ));
             }
-            let reuse = match &plan.requirements.output_aliasing {
-                OutputAliasing::MayAliasInputs(indices) => indices.iter().find_map(|&index| {
+            let reuse = plan.reuse_inputs.as_ref().and_then(|indices| {
+                indices.iter().find_map(|&index| {
                     let input = *operands.get(usize::from(index))?;
                     (b.tensor(input) == output).then_some(input)
-                }),
-                OutputAliasing::Fresh => None,
-            };
+                })
+            });
             let mut kernel_output = output.clone();
             if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                 kernel_output.format.precision = Precision::F32;
             }
             let indexing = vec![indexing; operands.len()];
-            let result = b.kernel(
-                "compute",
-                operands,
-                kernel_output,
-                kernel.clone(),
-                reuse,
-                indexing,
-            );
+            let result = b.kernel("compute", operands, kernel_output, kernel, reuse, indexing);
             b.cast("output.cast", result, output.format.precision)
         }
         OperatorDispatch::View => {

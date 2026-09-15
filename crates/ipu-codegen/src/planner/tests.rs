@@ -27,8 +27,7 @@ use crate::planner::catalogue::{
 use crate::planner::error::LoweringError;
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
-    StorageRequirements, default_dispatch,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
 };
 use crate::planner::recipe::Recipe;
 use crate::planner::{bind, build, candidates, test_support::lower};
@@ -373,9 +372,7 @@ fn layernorm_distributes_batch_rows_without_splitting_features() {
                     .concrete()
                     .unwrap()
                     .plan
-                    .requirements
                     .output
-                    .format
                     .layout
                     .tiling
                     .tile_count
@@ -419,9 +416,7 @@ fn add_grid_uses_rows_before_splitting_columns() {
                     .concrete()
                     .unwrap()
                     .plan
-                    .requirements
                     .output
-                    .format
                     .layout
                     .tiling
                     .tile_count
@@ -834,18 +829,15 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             accumulate: AccumulationPrecision::F32,
         };
         let dispatch = default_dispatch(operator);
-        let requirements = StorageRequirements {
+        let plan = OperatorPlan {
+            operator,
+            dispatch,
             inputs: vec![
                 OperandRequirement::new(left.format.clone()),
                 OperandRequirement::new(standard.format.clone()),
             ],
-            output: OperandRequirement::new(output.format.clone()),
-            output_aliasing: OutputAliasing::Fresh,
-        };
-        let plan = OperatorPlan {
-            operator,
-            dispatch,
-            requirements,
+            output: output.format.clone(),
+            reuse_inputs: None,
         };
         let standard_cost =
             crate::planner::fragments::build_fragment(&plan, &[left.clone(), standard], &output)
@@ -884,19 +876,19 @@ fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids
             TensorType::new(
                 [u32::from(row_partitions), inner],
                 Precision::F16,
-                candidate.plan.requirements.inputs[0].format.layout.clone(),
+                candidate.plan.inputs[0].format.layout.clone(),
             ),
             TensorType::new(
                 [inner, columns],
                 Precision::F16,
-                candidate.plan.requirements.inputs[1].format.layout.clone(),
+                candidate.plan.inputs[1].format.layout.clone(),
             ),
         ];
         let variants =
             independent_parameter_storage(&candidate.plan, &inputs, 1, &PipelineConfig::new(tiles));
         assert!(!variants.is_empty(), "case {case}");
         for variant in variants {
-            let tiling = &variant.requirements.inputs[1].format.layout.tiling;
+            let tiling = &variant.inputs[1].format.layout.tiling;
             assert_eq!(tiling.replicas, 1, "case {case}");
             assert!(tiling.tile_count <= tiles, "case {case}");
             assert_eq!(
@@ -910,7 +902,7 @@ fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids
                 "case {case}"
             );
             assert!(
-                variant.requirements.inputs[1]
+                variant.inputs[1]
                     .format
                     .layout
                     .padded_shape(&inputs[1].shape)
@@ -1098,7 +1090,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
                 OperandRequirement::new(left_format.clone()),
                 OperandRequirement::new(right_format.clone()),
             ],
-            OperandRequirement::new(output_format.clone()),
+            output_format.clone(),
         );
         let mut left_shape = batches.clone();
         left_shape.extend([rows, inner]);
@@ -1145,21 +1137,18 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         assert_eq!(selected_multiply, multiply, "random case {case}");
         assert_eq!(selected_accumulate, accumulate, "random case {case}");
         let left = &value(&lowered, operator.inputs[0]).tensor_type.format;
-        assert_eq!(
-            left.precision,
-            candidate.plan.requirements.inputs[0].format.precision
-        );
+        assert_eq!(left.precision, candidate.plan.inputs[0].format.precision);
         assert_eq!(
             left.layout.order,
-            candidate.plan.requirements.inputs[0].format.layout.order
+            candidate.plan.inputs[0].format.layout.order
         );
         let selected_right = &value(&lowered, operator.inputs[1]).tensor_type.format;
         assert_eq!(
-            selected_right.precision, candidate.plan.requirements.inputs[1].format.precision,
+            selected_right.precision, candidate.plan.inputs[1].format.precision,
             "random case {case}"
         );
         assert_eq!(
-            selected_right.layout.order, candidate.plan.requirements.inputs[1].format.layout.order,
+            selected_right.layout.order, candidate.plan.inputs[1].format.layout.order,
             "random case {case}"
         );
         let output = value(&lowered, lowered.outputs[0]);
@@ -1169,7 +1158,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             "random case {case}"
         );
         assert_eq!(
-            &output.tensor_type.format, &candidate.plan.requirements.output.format,
+            &output.tensor_type.format, &candidate.plan.output,
             "random case {case}"
         );
         assert_conversions_are_explicit(&lowered, &lowered.operations);
@@ -1303,18 +1292,18 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             ConcreteOperatorCandidate::new(
                 OperatorFamily::Gelu,
                 [OperandRequirement::new(gelu_input.clone())],
-                OperandRequirement::new(gelu_output.clone()),
+                gelu_output.clone(),
             )
-            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+            .with_reusable_inputs([0]),
             ConcreteOperatorCandidate::new(
                 OperatorFamily::Add,
                 [
                     OperandRequirement::new(add_left.clone()),
                     OperandRequirement::new(add_right.clone()),
                 ],
-                OperandRequirement::new(add_output.clone()),
+                add_output.clone(),
             )
-            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+            .with_reusable_inputs([0]),
             ConcreteOperatorCandidate::new(
                 OperatorFamily::FlashAttention {
                     options: AttentionOptions::default(),
@@ -1325,7 +1314,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
                     OperandRequirement::new(attention_key.clone()),
                     OperandRequirement::new(attention_value_format.clone()),
                 ],
-                OperandRequirement::new(attention_output.clone()),
+                attention_output.clone(),
             ),
         ]
         .into_iter()
@@ -1987,7 +1976,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
                 retained.iter().any(|plan| gemm_plan_matches(
                     &expected,
                     &plan.dispatch,
-                    &plan.requirements.inputs
+                    &plan.inputs
                 )),
                 "operation {operation}: lost {memory:?} historical geometry"
             );
@@ -2112,10 +2101,10 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
         inner_grain: 1,
     };
     assert!(
-        candidates.iter().any(|plan| requested.matches(
-            &plan.requirements.output.format.layout,
-            graph.value_shape(projection).unwrap()
-        )),
+        candidates
+            .iter()
+            .any(|plan| requested
+                .matches(&plan.output.layout, graph.value_shape(projection).unwrap())),
         "missing V-compatible output among {} candidates",
         candidates.len()
     );
@@ -2324,7 +2313,7 @@ fn attention_can_share_key_panels_when_streams_exceed_panel_owner_budget() {
     );
     assert!(!plans.is_empty());
     for plan in plans {
-        let layout = &plan.requirements.inputs[1].format.layout;
+        let layout = &plan.inputs[1].format.layout;
         assert!(layout.tiling.tile_count <= 1472);
         assert!(layout.resolve(&TensorShape(vec![128, 729, 72])).is_ok());
     }
@@ -2555,7 +2544,7 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
             OperandRequirement::new(input_format),
             OperandRequirement::new(weight_format),
         ],
-        OperandRequirement::new(output_format),
+        output_format,
     ))];
     config.standard_memory_reservation_bytes = 0;
     config.tile_memory_budget_bytes = 80000;
@@ -2883,7 +2872,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
 #[test]
 fn layout_search_can_replace_scoped_packing() {
     use crate::planner::catalogue::pointwise_operator_candidate;
-    use crate::planner::operator::OutputAliasing;
+
     use crate::tensor::{BlockMajorOrder, ElementOrder, Layout, Precision, TensorFormat};
 
     let mut graph = ComputeGraph::new();
@@ -2910,7 +2899,7 @@ fn layout_search_can_replace_scoped_packing() {
             [format.clone()],
             format,
         )
-        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+        .with_reusable_inputs([0])
         .plan
     };
     let config = PipelineConfig::new(64)

@@ -7,8 +7,7 @@ use crate::tensor::Precision;
 
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
-    StorageRequirements, default_dispatch,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
 };
 use crate::tensor::{
     AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, GridOrder, Layout, TensorFormat, TensorShape,
@@ -102,17 +101,15 @@ impl ConcreteOperatorCandidate {
     pub fn new(
         operator: OperatorFamily,
         inputs: impl IntoIterator<Item = OperandRequirement>,
-        output: OperandRequirement,
+        output: TensorFormat,
     ) -> Self {
         Self {
             plan: OperatorPlan {
                 operator,
                 dispatch: default_dispatch(operator),
-                requirements: StorageRequirements {
-                    inputs: inputs.into_iter().collect(),
-                    output,
-                    output_aliasing: OutputAliasing::Fresh,
-                },
+                inputs: inputs.into_iter().collect(),
+                output,
+                reuse_inputs: None,
             },
             format_policy: OperatorFormatPolicy::Concrete,
         }
@@ -128,8 +125,8 @@ impl ConcreteOperatorCandidate {
         self
     }
 
-    pub fn with_output_aliasing(mut self, aliasing: OutputAliasing) -> Self {
-        self.plan.requirements.output_aliasing = aliasing;
+    pub fn with_reusable_inputs(mut self, inputs: impl IntoIterator<Item = u16>) -> Self {
+        self.plan.reuse_inputs = Some(inputs.into_iter().collect());
         self
     }
 }
@@ -274,8 +271,7 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                         && weights.memory_class == MemoryClass::Ipu21Standard
                     {
                         grid.push(candidate.clone());
-                        candidate.plan.requirements.inputs[1].local_staging =
-                            LocalOperandStaging::MatchRemote;
+                        candidate.plan.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
                     }
                     grid.push(candidate);
                 }
@@ -304,7 +300,7 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                 rows_f16.clone(),
             )
             .with_preserved_input_layout(input)
-            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
+            .with_reusable_inputs([0, 1]),
         );
     }
     let mut grid_add = pointwise_operator_candidate(
@@ -313,7 +309,7 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
         rows_f16.clone(),
     );
     grid_add.format_policy = OperatorFormatPolicy::RowMajorGrid;
-    candidates.push(grid_add.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])));
+    candidates.push(grid_add.with_reusable_inputs([0, 1]));
     let mut norm = pointwise_operator_candidate(
         OperatorFamily::LayerNorm,
         [rows_f16.clone(), rows_f16.clone(), rows_f16.clone()],
@@ -334,7 +330,7 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
         )
-        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
+        .with_reusable_inputs([0, 1]),
         pointwise_operator_candidate(
             OperatorFamily::FlashAttention {
                 options: AttentionOptions::default(),
@@ -367,7 +363,7 @@ pub(super) fn pointwise_operator_candidate(
     ConcreteOperatorCandidate::new(
         operator,
         inputs.into_iter().map(OperandRequirement::new),
-        OperandRequirement::new(output),
+        output,
     )
 }
 
@@ -377,7 +373,7 @@ pub(super) fn format_preserving_unary_candidate(
 ) -> ConcreteOperatorCandidate {
     pointwise_operator_candidate(operator, [format.clone()], format)
         .with_preserved_input_layout(0)
-        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+        .with_reusable_inputs([0])
 }
 
 pub(super) fn gemm_plan(
@@ -404,18 +400,16 @@ pub(super) fn gemm_plan(
     OperatorPlan {
         operator,
         dispatch,
-        requirements: StorageRequirements {
-            inputs,
-            output: OperandRequirement::new(TensorFormat {
-                precision: if matches!(precision, Precision::F8F143 { .. }) {
-                    Precision::F16
-                } else {
-                    precision
-                },
-                layout: output,
-            }),
-            output_aliasing: OutputAliasing::Fresh,
+        inputs,
+        output: TensorFormat {
+            precision: if matches!(precision, Precision::F8F143 { .. }) {
+                Precision::F16
+            } else {
+                precision
+            },
+            layout: output,
         },
+        reuse_inputs: None,
     }
 }
 

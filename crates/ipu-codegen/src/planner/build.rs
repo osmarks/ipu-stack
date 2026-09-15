@@ -403,11 +403,9 @@ impl<C: CostModel> Builder<'_, C> {
                     .filter(|(plan, early)| {
                         !early
                             || self.config.capacity_baseline
-                                && types.iter().zip(&plan.requirements.inputs).any(
-                                    |(input, requirement)| {
-                                        input.format.precision != requirement.format.precision
-                                    },
-                                )
+                                && types.iter().zip(&plan.inputs).any(|(input, requirement)| {
+                                    input.format.precision != requirement.format.precision
+                                })
                     })
                     .filter_map(|(plan, early_cast)| {
                         let early_cast =
@@ -417,11 +415,8 @@ impl<C: CostModel> Builder<'_, C> {
                             let implementation = self.fragments.get(plan, &inputs, &output)?;
                             let mut state = ValueBuilder::default();
                             let mut conversions = Vec::new();
-                            for (index, ((source, requirement), &automatic)) in types
-                                .iter()
-                                .zip(&plan.requirements.inputs)
-                                .zip(&automatic)
-                                .enumerate()
+                            for (index, ((source, requirement), &automatic)) in
+                                types.iter().zip(&plan.inputs).zip(&automatic).enumerate()
                             {
                                 let id = state.value(operation.results[0], source.clone());
                                 if automatic {
@@ -460,8 +455,7 @@ impl<C: CostModel> Builder<'_, C> {
                         {
                             let mut source = source.clone();
                             if automatic[index] && parameters[index] {
-                                source.format.layout.order =
-                                    plan.requirements.inputs[index].format.layout.order;
+                                source.format.layout.order = plan.inputs[index].format.layout.order;
                                 source.format.layout = parameter_homes::compact_parameter_layout(
                                     &source,
                                     self.copies.get(&ids[index]).copied().unwrap_or(1),
@@ -554,7 +548,7 @@ impl<C: CostModel> Builder<'_, C> {
             self.recipe.plans.insert(operation.id, selected.clone());
             // Persistent storage is chosen independently of compute replication.
             // Only automatic homes can change; explicitly bound inputs stay fixed.
-            for (&id, requirement) in ids.iter().zip(&selected.requirements.inputs) {
+            for (&id, requirement) in ids.iter().zip(&selected.inputs) {
                 if self.state.automatic_inputs.contains(&id)
                     && self.state.parameter_values.contains(&id)
                 {

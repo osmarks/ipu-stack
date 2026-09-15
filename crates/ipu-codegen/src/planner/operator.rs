@@ -67,9 +67,8 @@ pub enum OperatorDispatch {
     LayerNorm {
         parts: u16,
     },
-    Pointwise {
-        kernel: TileKernelSpec,
-    },
+    /// Run the family's local kernel independently on its selected shards.
+    LocalKernel,
     BlockedGemm {
         inner_block: u32,
         output_column_block: u32,
@@ -120,12 +119,6 @@ pub struct ProductGrid {
     pub rows: u16,
     pub columns: u16,
     pub inner: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum EmptyOutputShardPolicy {
-    Skip,
-    Reject,
 }
 
 impl OperatorDispatch {
@@ -192,16 +185,6 @@ impl OperatorDispatch {
         }
         partial
     }
-
-    pub(super) fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
-        match self {
-            Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
-            Self::View => EmptyOutputShardPolicy::Reject,
-            Self::BlockedGemm { .. } | Self::Attention { .. } | Self::LayerNorm { .. } => {
-                EmptyOutputShardPolicy::Reject
-            }
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -251,12 +234,6 @@ impl OperandRequirement {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum OutputAliasing {
-    Fresh,
-    MayAliasInputs(Vec<u16>),
-}
-
 pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
     layout
         .resolve(shape)
@@ -266,61 +243,40 @@ pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> b
 pub(super) fn default_dispatch(operator: OperatorFamily) -> OperatorDispatch {
     match operator {
         OperatorFamily::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
-        OperatorFamily::LayerNorm => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::LayerNorm,
-        },
-        OperatorFamily::Gelu => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Gelu,
-        },
-        OperatorFamily::Add => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Add,
-        },
         OperatorFamily::View(_) | OperatorFamily::Slice(_) => OperatorDispatch::View,
-        OperatorFamily::FlashAttention {
-            options,
-            accumulate,
-        } => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::FlashAttention {
-                options,
-                accumulate,
-            },
-        },
+        _ => OperatorDispatch::LocalKernel,
     }
 }
 
-pub(super) fn alias_compatible(
-    index: usize,
-    requirements: &[OperandRequirement],
-    inputs: &[TensorType],
-    output_requirement: &OperandRequirement,
-    output_shape: &TensorShape,
-) -> bool {
-    requirements
-        .get(index)
-        .zip(inputs.get(index))
-        .is_some_and(|(requirement, input)| {
-            input.shape == *output_shape && requirement.format == output_requirement.format
+impl OperatorFamily {
+    pub(super) fn local_kernel(self) -> Option<TileKernelSpec> {
+        Some(match self {
+            Self::LayerNorm => TileKernelSpec::LayerNorm,
+            Self::Gelu => TileKernelSpec::Gelu,
+            Self::Add => TileKernelSpec::Add,
+            Self::FlashAttention {
+                options,
+                accumulate,
+            } => TileKernelSpec::FlashAttention {
+                options,
+                accumulate,
+            },
+            Self::Gemm { .. } | Self::View(_) | Self::Slice(_) => return None,
         })
+    }
 }
 
-pub(super) fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
-    requirement.format.layout.resolve(shape).is_ok()
-}
-
-/// Planned formats, materialization and reuse of whole-device operands.
-/// Kernel access tails and bank constraints belong to the emitted calls.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StorageRequirements {
-    pub inputs: Vec<OperandRequirement>,
-    pub output: OperandRequirement,
-    pub output_aliasing: OutputAliasing,
-}
-
+/// Selected algorithm, input materialization, and result format. Local access
+/// requirements belong to the kernel calls emitted from this plan.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperatorPlan {
     pub operator: OperatorFamily,
     pub dispatch: OperatorDispatch,
-    pub requirements: StorageRequirements,
+    pub inputs: Vec<OperandRequirement>,
+    pub output: TensorFormat,
+    /// None allocates a fresh result. Some requires one compatible, writable
+    /// input from this preference list; an empty list makes the plan infeasible.
+    pub reuse_inputs: Option<Vec<u16>>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
@@ -340,6 +296,20 @@ pub enum OperatorPlanError {
 }
 
 impl OperatorPlan {
+    pub(super) fn can_reuse_input(
+        &self,
+        index: u16,
+        inputs: &[TensorType],
+        output: &TensorShape,
+    ) -> bool {
+        self.inputs
+            .get(usize::from(index))
+            .zip(inputs.get(usize::from(index)))
+            .is_some_and(|(requirement, input)| {
+                input.shape == *output && requirement.format == self.output
+            })
+    }
+
     /// Apply this plan's formats to the logical operand shapes.
     pub(super) fn tensor_types(
         &self,
@@ -348,7 +318,7 @@ impl OperatorPlan {
     ) -> (Vec<TensorType>, TensorType) {
         let inputs = inputs
             .iter()
-            .zip(&self.requirements.inputs)
+            .zip(&self.inputs)
             .map(|(input, requirement)| TensorType {
                 shape: input.shape.clone(),
                 format: requirement.format.clone(),
@@ -356,39 +326,27 @@ impl OperatorPlan {
             .collect();
         let output = TensorType {
             shape: output.clone(),
-            format: self.requirements.output.format.clone(),
+            format: self.output.clone(),
         };
         (inputs, output)
     }
 
     pub(super) fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
-        if self.requirements.inputs.len() != inputs.len()
-            || !valid_requirement(&self.requirements.output, output)
+        if self.inputs.len() != inputs.len()
+            || self.output.layout.resolve(output).is_err()
             || !self
-                .requirements
                 .inputs
                 .iter()
                 .zip(inputs)
-                .all(|(requirement, input)| valid_requirement(requirement, &input.shape))
+                .all(|(requirement, input)| requirement.format.layout.resolve(&input.shape).is_ok())
         {
             return false;
         }
-        let alias_valid = match &self.requirements.output_aliasing {
-            OutputAliasing::Fresh => true,
-            OutputAliasing::MayAliasInputs(indices) => {
-                !indices.is_empty()
-                    && indices.iter().any(|index| {
-                        alias_compatible(
-                            usize::from(*index),
-                            &self.requirements.inputs,
-                            inputs,
-                            &self.requirements.output,
-                            output,
-                        )
-                    })
-            }
-        };
-        if !alias_valid {
+        if self.reuse_inputs.as_ref().is_some_and(|indices| {
+            !indices
+                .iter()
+                .any(|&index| self.can_reuse_input(index, inputs, output))
+        }) {
             return false;
         }
         let (planned_inputs, planned_output) = self.tensor_types(inputs, output);
@@ -399,10 +357,10 @@ impl OperatorPlan {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> Result<(), OperatorPlanError> {
-        if inputs.len() != self.requirements.inputs.len() {
+        if inputs.len() != self.inputs.len() {
             return Err(OperatorPlanError::OperandArity);
         }
-        if self.dispatch.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
+        if !matches!(self.dispatch, OperatorDispatch::LocalKernel)
             && layout_has_empty_shards(&output.format.layout, &output.shape)
         {
             return Err(OperatorPlanError::EmptyOutputShard);
@@ -604,26 +562,13 @@ impl OperatorPlan {
                 Ok(())
             }
             (
-                OperatorFamily::LayerNorm,
-                OperatorDispatch::Pointwise {
-                    kernel: TileKernelSpec::LayerNorm,
-                },
+                OperatorFamily::LayerNorm
+                | OperatorFamily::Gelu
+                | OperatorFamily::Add
+                | OperatorFamily::FlashAttention { .. },
+                OperatorDispatch::LocalKernel,
             )
-            | (OperatorFamily::LayerNorm, OperatorDispatch::LayerNorm { .. })
-            | (
-                OperatorFamily::Gelu,
-                OperatorDispatch::Pointwise {
-                    kernel: TileKernelSpec::Gelu,
-                    ..
-                },
-            )
-            | (
-                OperatorFamily::Add,
-                OperatorDispatch::Pointwise {
-                    kernel: TileKernelSpec::Add,
-                    ..
-                },
-            ) => {
+            | (OperatorFamily::LayerNorm, OperatorDispatch::LayerNorm { .. }) => {
                 let output_tiles = output.format.layout.tiling.tile_count;
                 if inputs
                     .iter()
@@ -672,30 +617,6 @@ impl OperatorPlan {
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
                 {
                     Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
-            }
-            (
-                OperatorFamily::FlashAttention {
-                    options,
-                    accumulate,
-                },
-                OperatorDispatch::Pointwise {
-                    kernel:
-                        TileKernelSpec::FlashAttention {
-                            options: kernel_options,
-                            accumulate: kernel_accumulate,
-                        },
-                    ..
-                },
-            ) if options == kernel_options && accumulate == kernel_accumulate => {
-                let output_tiles = output.format.layout.tiling.tile_count;
-                if inputs
-                    .iter()
-                    .any(|input| input.format.layout.tiling.tile_count != output_tiles)
-                {
-                    Err(OperatorPlanError::IncompatibleTileGroups)
                 } else {
                     Ok(())
                 }

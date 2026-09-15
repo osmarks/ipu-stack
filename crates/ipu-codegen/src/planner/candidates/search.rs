@@ -12,7 +12,7 @@ use crate::planner::candidates::{
 };
 use crate::planner::catalogue::OperatorFormatPolicy;
 use crate::planner::error::{LoweringError, LoweringResult};
-use crate::planner::operator::{OperandMaterialization, OperatorPlan, OutputAliasing};
+use crate::planner::operator::{OperandMaterialization, OperatorPlan};
 use crate::tensor::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, TensorShape, TensorType,
 };
@@ -126,9 +126,7 @@ impl<'a> CandidateSearch<'a> {
                 &direct_consumer_layouts,
                 output_demands,
             ) {
-                if let OutputAliasing::MayAliasInputs(indices) =
-                    &mut plan.requirements.output_aliasing
-                {
+                if let Some(indices) = &mut plan.reuse_inputs {
                     // An input is writable only when this is its final use.
                     // Parameters remain live across host inference calls.
                     indices.retain(|&index| {
@@ -148,7 +146,7 @@ impl<'a> CandidateSearch<'a> {
                 input_types
                     .iter()
                     .zip(automatic_inputs)
-                    .zip(&plan.requirements.inputs)
+                    .zip(&plan.inputs)
                     .all(|((input, &automatic), requirement)| {
                         let current = &input.format.layout;
                         automatic
@@ -183,18 +181,20 @@ impl<'a> CandidateSearch<'a> {
             .into_iter()
             .flat_map(|plan| {
                 let mut complete = plan.clone();
-                for requirement in &mut complete.requirements.inputs {
+                for requirement in &mut complete.inputs {
                     requirement.materialization = OperandMaterialization::Complete;
                 }
-                let panel_population = input_types.iter().zip(&plan.requirements.inputs).any(
-                    |(input, requirement)| {
-                        input.format.layout.order != requirement.format.layout.order
-                            && requires_direct_population(requirement.format.layout.order)
-                            && input
-                                .format
-                                .supports_micro_panel_exchange(&requirement.format)
-                    },
-                );
+                let panel_population =
+                    input_types
+                        .iter()
+                        .zip(&plan.inputs)
+                        .any(|(input, requirement)| {
+                            input.format.layout.order != requirement.format.layout.order
+                                && requires_direct_population(requirement.format.layout.order)
+                                && input
+                                    .format
+                                    .supports_micro_panel_exchange(&requirement.format)
+                        });
                 // Cross-order panel exchange is currently implemented for a
                 // complete value, not the dispatch-slice staging ABI.
                 if panel_population {

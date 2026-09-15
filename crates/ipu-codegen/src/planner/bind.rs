@@ -100,7 +100,7 @@ pub(super) fn emit_selected(
         .map(|value| values[value])
         .collect::<Vec<_>>();
     let mut bound = Vec::with_capacity(inputs.len());
-    for (index, (&input, requirement)) in inputs.iter().zip(&plan.requirements.inputs).enumerate() {
+    for (index, (&input, requirement)) in inputs.iter().zip(&plan.inputs).enumerate() {
         bound.push(ensure_format(
             input,
             requirement.format.clone(),
@@ -114,7 +114,7 @@ pub(super) fn emit_selected(
     }
     let output = TensorType {
         shape: output_shape,
-        format: plan.requirements.output.format.clone(),
+        format: plan.output.clone(),
     };
     let input_types = bound
         .iter()

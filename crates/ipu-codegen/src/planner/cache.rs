@@ -48,7 +48,7 @@ mod tests {
         let plan = ConcreteOperatorCandidate::new(
             OperatorFamily::Gelu,
             [OperandRequirement::new(output.format.clone())],
-            OperandRequirement::new(output.format.clone()),
+            output.format.clone(),
         )
         .plan;
         let variants = (1..=4)

@@ -6,7 +6,7 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {

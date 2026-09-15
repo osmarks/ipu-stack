@@ -171,7 +171,7 @@ impl OutputDemands {
                     if operator_matches(&operation.kind, candidate.operator())
                         && candidate.format_policy() == OperatorFormatPolicy::Concrete
                         && let Some(candidate) = candidate.concrete()
-                        && let Some(requirement) = candidate.plan.requirements.inputs.get(index)
+                        && let Some(requirement) = candidate.plan.inputs.get(index)
                     {
                         requests.insert(
                             input,

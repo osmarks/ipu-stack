@@ -19,8 +19,7 @@ use crate::planner::catalogue::{
 };
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
-    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
-    StorageRequirements, alias_compatible,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan,
 };
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AxisTiling, BlockMajorOrder,
@@ -152,14 +151,12 @@ fn view_plan(operator: OperatorFamily, source: TensorFormat, layout: Layout) -> 
     OperatorPlan {
         operator,
         dispatch: OperatorDispatch::View,
-        requirements: StorageRequirements {
-            output: OperandRequirement::new(TensorFormat {
-                precision: source.precision,
-                layout,
-            }),
-            inputs: vec![OperandRequirement::new(source)],
-            output_aliasing: OutputAliasing::Fresh,
+        output: TensorFormat {
+            precision: source.precision,
+            layout,
         },
+        inputs: vec![OperandRequirement::new(source)],
+        reuse_inputs: None,
     }
 }
 
@@ -329,17 +326,15 @@ pub(super) fn plans(
                         padded_query_dimension,
                         padded_value_dimension,
                     },
-                    requirements: StorageRequirements {
-                        inputs: [&query_format, &key_format, &value_format]
-                            .into_iter()
-                            .map(|format| {
-                                OperandRequirement::new(format.clone())
-                                    .with_materialization(OperandMaterialization::DispatchSlices)
-                            })
-                            .collect(),
-                        output: OperandRequirement::new(output_format.clone()),
-                        output_aliasing: OutputAliasing::Fresh,
-                    },
+                    inputs: [&query_format, &key_format, &value_format]
+                        .into_iter()
+                        .map(|format| {
+                            OperandRequirement::new(format.clone())
+                                .with_materialization(OperandMaterialization::DispatchSlices)
+                        })
+                        .collect(),
+                    output: output_format.clone(),
+                    reuse_inputs: None,
                 };
                 plans.extend(attention::product_variants(plan, inputs, config));
             }
@@ -377,14 +372,13 @@ pub(super) fn plans(
             .filter_map(OperatorCandidate::concrete)
             .filter(|candidate| {
                 operator_matches(&operation.kind, candidate.plan.operator)
-                    && candidate.plan.requirements.inputs.len() == 1
+                    && candidate.plan.inputs.len() == 1
                     && matches!(
                         candidate.format_policy,
                         OperatorFormatPolicy::PreserveInputLayout(0)
                     )
-                    && matches!(candidate.plan.dispatch, OperatorDispatch::Pointwise { .. })
-                    && candidate.plan.requirements.inputs[0].format.precision
-                        == input.format.precision
+                    && matches!(candidate.plan.dispatch, OperatorDispatch::LocalKernel)
+                    && candidate.plan.inputs[0].format.precision == input.format.precision
             })
         {
             // Elementwise codelets and local copy paths access 64-bit words.
@@ -392,14 +386,7 @@ pub(super) fn plans(
             if !output.elements().is_multiple_of(u64::from(grain)) {
                 continue;
             }
-            let tiles = candidate
-                .plan
-                .requirements
-                .output
-                .format
-                .layout
-                .tiling
-                .tile_count;
+            let tiles = candidate.plan.output.layout.tiling.tile_count;
             let Some(&width) = output.0.last() else {
                 continue;
             };
@@ -434,13 +421,7 @@ pub(super) fn plans(
             .map(|(_, (_, grain, candidate))| (*grain, *candidate))
             .collect::<Vec<_>>();
         for (grain, candidate) in flat_candidates {
-            let tiles = candidate
-                .requirements
-                .output
-                .format
-                .layout
-                .tiling
-                .tile_count;
+            let tiles = candidate.output.layout.tiling.tile_count;
             let mut layouts = vec![Layout::logical_linear(tiles, grain)];
             if let Some(retained_grain) = input
                 .format
@@ -471,11 +452,9 @@ pub(super) fn plans(
                 let plan = OperatorPlan {
                     operator: candidate.operator,
                     dispatch: candidate.dispatch.clone(),
-                    requirements: StorageRequirements {
-                        inputs: vec![OperandRequirement::new(format.clone())],
-                        output: OperandRequirement::new(format),
-                        output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
-                    },
+                    inputs: vec![OperandRequirement::new(format.clone())],
+                    output: format,
+                    reuse_inputs: Some(vec![0]),
                 };
                 if !plans.contains(&plan) {
                     plans.push(plan);
@@ -525,20 +504,14 @@ pub(super) fn plans(
                     format_policy,
                     OperatorFormatPolicy::RowMajorGrid | OperatorFormatPolicy::RowMajorRows
                 ) {
-                    let capacity = candidate
-                        .requirements
-                        .output
-                        .format
-                        .layout
-                        .tiling
-                        .tile_count;
+                    let capacity = candidate.output.layout.tiling.tile_count;
                     let Some(&columns) = output.0.last() else {
                         continue;
                     };
                     if columns == 0 {
                         continue;
                     }
-                    let grain = (8 / candidate.requirements.output.format.precision.bytes()) as u32;
+                    let grain = (8 / candidate.output.precision.bytes()) as u32;
                     let mut row_parts = 1u16;
                     let mut axes = Vec::new();
                     // Keep complete rows local before using spare tiles for columns.
@@ -581,13 +554,12 @@ pub(super) fn plans(
                         replicas: 1,
                         axes,
                     });
-                    candidate.requirements.output.format.layout = layout.clone();
+                    candidate.output.layout = layout.clone();
                     let output_type = TensorType {
                         shape: output.clone(),
-                        format: candidate.requirements.output.format.clone(),
+                        format: candidate.output.clone(),
                     };
-                    for (requirement, input) in candidate.requirements.inputs.iter_mut().zip(inputs)
-                    {
+                    for (requirement, input) in candidate.inputs.iter_mut().zip(inputs) {
                         requirement.format.layout = layout.clone();
                         if let Some(tiling) =
                             crate::tensor::broadcast_operand_tiling(input, &output_type)
@@ -599,19 +571,17 @@ pub(super) fn plans(
                 if let OperatorFormatPolicy::PreserveInputLayout(index) = format_policy {
                     let Some((actual, requirement)) = inputs
                         .get(usize::from(index))
-                        .zip(candidate.requirements.inputs.get_mut(usize::from(index)))
+                        .zip(candidate.inputs.get_mut(usize::from(index)))
                     else {
                         continue;
                     };
                     // Preserve ownership/order, not necessarily precision. The
                     // conversion inserter supplies the kernel's operand type.
-                    if candidate.requirements.output.format.precision
-                        != requirement.format.precision
-                    {
+                    if candidate.output.precision != requirement.format.precision {
                         continue;
                     }
                     requirement.format.layout = actual.format.layout.clone();
-                    candidate.requirements.output.format.layout = actual.format.layout.clone();
+                    candidate.output.layout = actual.format.layout.clone();
                     if candidate.operator == OperatorFamily::Add {
                         // Packed elementwise addition is layout transparent only
                         // for equal shapes. Suffix broadcasts require row-major
@@ -622,7 +592,7 @@ pub(super) fn plans(
                         {
                             continue;
                         }
-                        for requirement in &mut candidate.requirements.inputs {
+                        for requirement in &mut candidate.inputs {
                             requirement.format.layout = actual.format.layout.clone();
                         }
                     }
@@ -631,15 +601,8 @@ pub(super) fn plans(
                 if format_policy == OperatorFormatPolicy::RowMajorRows {
                     let base = &variants[0];
                     let width = *output.0.last().unwrap();
-                    let rows = base.requirements.output.format.layout.tiling.tile_count;
-                    let capacity = concrete
-                        .plan
-                        .requirements
-                        .output
-                        .format
-                        .layout
-                        .tiling
-                        .tile_count;
+                    let rows = base.output.layout.tiling.tile_count;
+                    let capacity = concrete.plan.output.layout.tiling.tile_count;
                     let additions = [2u16, 4, 8, 16, 32]
                         .into_iter()
                         .filter_map(|parts| {
@@ -650,7 +613,7 @@ pub(super) fn plans(
                             }
                             let mut variant = base.clone();
                             variant.dispatch = OperatorDispatch::LayerNorm { parts };
-                            let tiling = &mut variant.requirements.output.format.layout.tiling;
+                            let tiling = &mut variant.output.layout.tiling;
                             tiling.tile_count = rows * parts;
                             for axis in &mut tiling.axes {
                                 if axis.axis.resolve(output.0.len()).ok()? + 1 == output.0.len() {
@@ -662,11 +625,9 @@ pub(super) fn plans(
                             }
                             let output_type = TensorType {
                                 shape: output.clone(),
-                                format: variant.requirements.output.format.clone(),
+                                format: variant.output.clone(),
                             };
-                            for (requirement, input) in
-                                variant.requirements.inputs.iter_mut().zip(inputs)
-                            {
+                            for (requirement, input) in variant.inputs.iter_mut().zip(inputs) {
                                 requirement.format.layout = output_type.format.layout.clone();
                                 requirement.format.layout.tiling =
                                     crate::tensor::broadcast_operand_tiling(input, &output_type)?;
@@ -711,15 +672,16 @@ pub(super) fn plans(
                 .collect::<Vec<_>>();
             variants.extend(additions);
         }
-        for candidate in variants {
+        for mut candidate in variants {
             if !candidate.supports(inputs, output) {
                 continue;
             }
-            let aliasing = resolved_output_aliasing(&candidate, inputs, output);
-            let mut plan = candidate;
-            plan.requirements.output_aliasing = aliasing;
-            if !plans.contains(&plan) {
-                plans.push(plan);
+            if let Some(mut indices) = candidate.reuse_inputs.take() {
+                indices.retain(|&index| candidate.can_reuse_input(index, inputs, output));
+                candidate.reuse_inputs = Some(indices);
+            }
+            if !plans.contains(&candidate) {
+                plans.push(candidate);
             }
         }
     }
@@ -734,20 +696,11 @@ pub(super) fn plans(
     plans.retain(|plan| {
         (config.gemm_output_packing != GemmOutputPacking::Packed
             || !matches!(plan.operator, OperatorFamily::Gemm { .. })
-            || plan
-                .requirements
-                .output
-                .format
-                .layout
-                .order
-                .gemm_output_group()
-                .is_some())
+            || plan.output.layout.order.gemm_output_group().is_some())
             && plan_fits_operator_memory(plan, inputs, output, config)
     });
     if let Some(constraint) = gemm_constraint {
-        plans.retain(|plan| {
-            gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
-        });
+        plans.retain(|plan| gemm_plan_matches(constraint, &plan.dispatch, &plan.inputs));
         tracing::info!(
             source_operation = constraint.source_operation,
             matching_plans = plans.len(),
@@ -805,7 +758,7 @@ pub(super) fn independent_parameter_storage(
     if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm { .. }) {
         return Vec::new();
     }
-    let Some(requirement) = candidate.requirements.inputs.get(input_index) else {
+    let Some(requirement) = candidate.inputs.get(input_index) else {
         return Vec::new();
     };
     let ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
@@ -834,7 +787,7 @@ pub(super) fn independent_parameter_storage(
             output_column_block,
             ..
         } => output_column_block,
-        OperatorDispatch::Pointwise { .. }
+        OperatorDispatch::LocalKernel
         | OperatorDispatch::Attention { .. }
         | OperatorDispatch::LayerNorm { .. }
         | OperatorDispatch::View => {
@@ -876,15 +829,14 @@ pub(super) fn independent_parameter_storage(
         .into_iter()
         .map(|(column_partitions, inner_partitions)| {
             let mut independent = candidate.clone();
-            independent.requirements.inputs[input_index].format.layout =
-                Layout::block_major_matrix_storage(
-                    inner_block,
-                    output_column_block,
-                    column_partitions,
-                    inner_partitions,
-                    1,
-                    requirement.format.layout.memory_class,
-                );
+            independent.inputs[input_index].format.layout = Layout::block_major_matrix_storage(
+                inner_block,
+                output_column_block,
+                column_partitions,
+                inner_partitions,
+                1,
+                requirement.format.layout.memory_class,
+            );
             independent
         })
         .collect()
@@ -926,13 +878,9 @@ fn packed_gemm_output(plan: &OperatorPlan, output: &TensorShape) -> Option<Opera
         tiling.padding = Padding::Zero;
         Some(())
     };
-    pad(&mut packed.requirements.inputs[left].format.layout, row, 16)?;
-    pad(
-        &mut packed.requirements.inputs[right].format.layout,
-        column,
-        64,
-    )?;
-    let layout = &mut packed.requirements.output.format.layout;
+    pad(&mut packed.inputs[left].format.layout, row, 16)?;
+    pad(&mut packed.inputs[right].format.layout, column, 64)?;
+    let layout = &mut packed.output.layout;
     pad(layout, row, 16)?;
     pad(layout, column, 64)?;
     layout.order = ElementOrder::BlockMajor(match orientation {
@@ -1420,18 +1368,14 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                                 ],
                                 dispatch,
                             );
-                            staged.requirements.inputs[physical_right_index].local_staging =
-                                local_staging;
+                            staged.inputs[physical_right_index].local_staging = local_staging;
                             if config.gemm_output_packing != GemmOutputPacking::Native
                                 && (grouped_output.is_some()
                                     || config.gemm_output_packing == GemmOutputPacking::Packed)
                                 && let Some(packed) = packed_gemm_output(&staged, output)
                                 && (config.gemm_output_packing == GemmOutputPacking::Packed
                                     || output_demands.iter().any(|demand| {
-                                        demand.matches(
-                                            &packed.requirements.output.format.layout,
-                                            output,
-                                        )
+                                        demand.matches(&packed.output.layout, output)
                                     }))
                             {
                                 variants.push(packed);
@@ -1450,9 +1394,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         .iter()
         .filter(|candidate| {
             candidate
-                .requirements
                 .output
-                .format
                 .layout
                 .tiling
                 .axes
@@ -1464,11 +1406,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         variants
             .into_iter()
             .filter(|candidate| {
-                gemm_plan_matches(
-                    constraint,
-                    &candidate.dispatch,
-                    &candidate.requirements.inputs,
-                )
+                gemm_plan_matches(constraint, &candidate.dispatch, &candidate.inputs)
             })
             .collect::<Vec<_>>()
     } else {
@@ -1492,9 +1430,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         retained_grouped_variants = retained
             .iter()
             .filter(|candidate| candidate
-                .requirements
                 .output
-                .format
                 .layout
                 .tiling
                 .axes
@@ -1555,7 +1491,6 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
         inner_partitions,
         result_partitions,
         inputs: candidate
-            .requirements
             .inputs
             .iter()
             .map(|input| {
@@ -1568,13 +1503,11 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
             })
             .collect(),
         output: (
-            candidate.requirements.output.format.precision,
-            candidate.requirements.output.format.layout.order,
-            candidate.requirements.output.format.layout.memory_class,
+            candidate.output.precision,
+            candidate.output.layout.order,
+            candidate.output.layout.memory_class,
             candidate
-                .requirements
                 .output
-                .format
                 .layout
                 .tiling
                 .axes
@@ -1717,7 +1650,7 @@ pub(super) fn retain_operator_candidates_for_demands(
             }
             let family = demands
                 .iter()
-                .map(|d| d.matches(&plan.requirements.output.format.layout, output))
+                .map(|d| d.matches(&plan.output.layout, output))
                 .collect::<Vec<_>>();
             if families.insert(family) {
                 selected.insert(index);
@@ -1771,7 +1704,7 @@ pub(super) fn retain_operator_candidates_for_demands(
                 .find(|(_, (candidate, objective, signature))| {
                     candidate.operator == plan.operator
                         && candidate.dispatch == plan.dispatch
-                        && candidate.requirements.output == plan.requirements.output
+                        && candidate.output == plan.output
                         && signature.inputs != compatibility.inputs
                         && objective.cycles == metrics.cycles
                         && objective.memory.standard_contiguous_overflow()
@@ -1844,31 +1777,6 @@ pub(super) fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxi
         tiling.block_size = tiling.block_size.div_ceil(2) * 2;
         tiling.padding_multiple = tiling.padding_multiple.div_ceil(2) * 2;
         tiling.padding = Padding::Zero;
-    }
-}
-
-pub(super) fn resolved_output_aliasing(
-    candidate: &OperatorPlan,
-    inputs: &[TensorType],
-    output: &TensorShape,
-) -> OutputAliasing {
-    match &candidate.requirements.output_aliasing {
-        OutputAliasing::MayAliasInputs(indices) => OutputAliasing::MayAliasInputs(
-            indices
-                .iter()
-                .copied()
-                .filter(|index| {
-                    alias_compatible(
-                        usize::from(*index),
-                        &candidate.requirements.inputs,
-                        inputs,
-                        &candidate.requirements.output,
-                        output,
-                    )
-                })
-                .collect(),
-        ),
-        aliasing => aliasing.clone(),
     }
 }
 
