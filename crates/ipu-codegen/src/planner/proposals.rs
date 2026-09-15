@@ -5,6 +5,8 @@ use crate::graph::ComputeGraph;
 use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeSet;
 
+pub(super) const PACKING_ROWS: [u16; 4] = [32, 64, 128, 256];
+
 /// A proposal contains decisions and, when available, a more specific ranking
 /// estimate. This estimate never changes the executable program's own costing.
 pub(crate) struct RecipeProposal {
@@ -32,21 +34,40 @@ pub(crate) fn proposals(
     let mut candidates = Vec::new();
     // Operator defaults cover casts introduced by a layout change. Pair that
     // change with donation only for the affected families and direct consumers.
-    let mut propose = |mut recipe: Recipe, sources: &BTreeSet<crate::OperationId>| {
-        candidates.push(recipe.clone());
-        if config.diagnostic_checkpoints || sources.is_empty() {
-            return;
+    let mut propose = |recipe: Recipe, sources: &BTreeSet<crate::OperationId>| {
+        let mut variants = vec![recipe];
+        // Layout/cast changes can remove a packing site or change its capacity.
+        // Propose dropping the affected choices explicitly; rebuilding never
+        // silently ignores an unavailable request.
+        if !variants[0].packing.is_empty()
+            && (variants[0].plans != incumbent.recipe.plans
+                || variants[0].open_boundaries != incumbent.recipe.open_boundaries
+                || variants[0].cast_before_copies != incumbent.recipe.cast_before_copies)
+        {
+            let mut cleared = variants[0].clone();
+            cleared
+                .packing
+                .retain(|site, _| !sources.contains(&site.source));
+            if cleared.packing.len() != variants[0].packing.len() {
+                variants.push(cleared);
+            }
         }
-        let storage = recipe
-            .cast_storage
-            .as_mut()
-            .expect("candidate recipe has effective defaults");
-        for &source in sources {
-            let opposite = storage.for_operator(Some(source)).opposite();
-            storage.operators.insert(source, opposite);
-            storage.sites.retain(|site, _| site.source != source);
+        for mut recipe in variants {
+            candidates.push(recipe.clone());
+            if config.diagnostic_checkpoints || sources.is_empty() {
+                continue;
+            }
+            let storage = recipe
+                .cast_storage
+                .as_mut()
+                .expect("candidate recipe has effective defaults");
+            for &source in sources {
+                let opposite = storage.for_operator(Some(source)).opposite();
+                storage.operators.insert(source, opposite);
+                storage.sites.retain(|site, _| site.source != source);
+            }
+            candidates.push(recipe);
         }
-        candidates.push(recipe);
     };
     let unchanged = BTreeSet::new();
     propose(incumbent.recipe.clone(), &cast_sources);
@@ -60,10 +81,20 @@ pub(crate) fn proposals(
             propose(recipe, &unchanged);
         }
     }
-    for rows in [32, 64, 128, 256] {
-        if incumbent.recipe.packing_rows != Some(rows) {
-            let mut recipe = incumbent.recipe.clone();
-            recipe.packing_rows = Some(rows);
+    for rows in PACKING_ROWS {
+        let mut recipe = incumbent.recipe.clone();
+        recipe.packing = incumbent
+            .packing_choices
+            .iter()
+            .filter_map(|(site, choices)| {
+                choices
+                    .iter()
+                    .find(|choice| choice.rows.get() == rows)
+                    .cloned()
+                    .map(|choice| (site.clone(), choice))
+            })
+            .collect();
+        if recipe.packing != incumbent.recipe.packing {
             propose(recipe, &cast_sources);
         }
     }

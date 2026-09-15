@@ -33,72 +33,36 @@ impl OwnerChoices {
         mapping: &[u16],
         tile_count: u16,
     ) -> Result<(), ProgramError> {
-        let mapping = device_permutation(mapping, tile_count)?;
-        if mapping.iter().copied().eq(0..tile_count) {
-            return Ok(());
+        if !mapping.iter().copied().eq(0..tile_count) {
+            for input in inputs {
+                self.inputs.entry(input).or_default();
+            }
+            for operator in operators {
+                self.operators.entry(operator).or_default();
+            }
         }
-        for input in inputs {
-            self.inputs.entry(input).or_default();
-        }
-        for operator in operators {
-            self.operators.entry(operator).or_default();
-        }
-        remap_assignments(
+        crate::tensor::remap_owners(
             self.inputs
                 .values_mut()
                 .chain(self.operators.values_mut())
                 .chain(self.results.values_mut()),
-            &mapping,
+            mapping,
             tile_count,
         )
+        .map_err(Into::into)
     }
-}
-
-fn device_permutation(
-    mapping: &[u16],
-    tile_count: u16,
-) -> Result<std::sync::Arc<[u16]>, ProgramError> {
-    let mut sorted = mapping.to_vec();
-    sorted.sort_unstable();
-    if !sorted.into_iter().eq(0..tile_count) {
-        return Err(ProgramError::Invalid(
-            "tile mapping must be a bijection over active tiles".into(),
-        ));
-    }
-    Ok(mapping.into())
-}
-
-fn remap_assignments<'a>(
-    owners: impl Iterator<Item = &'a mut OwnerMap>,
-    mapping: &std::sync::Arc<[u16]>,
-    tile_count: u16,
-) -> Result<(), ProgramError> {
-    let mut bases = std::collections::HashMap::<_, _, foldhash::fast::FixedState>::default();
-    for owners in owners {
-        owners.validate(1, tile_count)?;
-        let base = owners.with_rotation(0);
-        let remapped = bases.entry(base).or_insert_with_key(|base| {
-            base.remapped(mapping)
-                .expect("validated owner and device maps")
-        });
-        *owners = remapped.with_rotation(owners.rotation());
-    }
-    Ok(())
 }
 
 impl MidProgram {
     /// Relabel an already constructed program before expansion, for explicit
     /// transfer captures and equivalence checks. Search changes Recipe choices.
     pub(crate) fn remap_tiles(&mut self, mapping: &[u16]) -> Result<(), ProgramError> {
-        let mapping = device_permutation(mapping, self.tile_count)?;
-        if mapping.iter().copied().eq(0..self.tile_count) {
-            return Ok(());
-        }
-        remap_assignments(
+        crate::tensor::remap_owners(
             self.values.iter_mut().map(|value| &mut value.owners),
-            &mapping,
+            mapping,
             self.tile_count,
         )
+        .map_err(Into::into)
     }
 
     pub(crate) fn apply_ownership(&mut self, choices: &OwnerChoices) -> Result<(), ProgramError> {

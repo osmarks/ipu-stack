@@ -55,16 +55,26 @@ pub(crate) fn build_candidate(
             .unwrap_or(program)
     };
     if !config.diagnostic_checkpoints {
-        if let Some(rows) = recipe.packing_rows {
-            let program = selected.program;
-            selected.program = program.with_distributed_packing(rows).unwrap_or(program);
-        }
+        selected.recipe.resolve_packing_choices(&selected.program)?;
+        selected.packing_choices = selected
+            .program
+            .packing_choices(&super::proposals::PACKING_ROWS, &selected.recipe.packing);
+        selected.program.apply_packing(&selected.recipe.packing)?;
         if recipe.parallel_reductions > 1 {
             let program = selected.program;
             selected.program = program
                 .with_overlapped_reductions(recipe.parallel_reductions)
                 .unwrap_or(program);
         }
+    } else {
+        if !selected.recipe.packing.is_empty() {
+            return Err(crate::mid::ProgramError::Invalid(
+                "packing choices cannot apply with diagnostic checkpoints".into(),
+            )
+            .into());
+        }
+        // The old global hint was disabled by diagnostic checkpoints too.
+        selected.recipe.legacy_packing_rows = None;
     }
     if recipe.disjoint_copy_sources {
         let program = selected.program;
@@ -228,6 +238,7 @@ pub(crate) fn select(
     Ok(Candidate {
         cast_sites: BTreeSet::new(),
         cast_storage_sites: BTreeSet::new(),
+        packing_choices: BTreeMap::new(),
         program,
         recipe: builder.recipe,
         alternatives: builder.alternatives,

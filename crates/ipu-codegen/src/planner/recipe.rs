@@ -23,7 +23,11 @@ pub(crate) struct Recipe {
     /// Version-one checkpoint ordinals, resolved once against the constructed family.
     #[serde(default, skip_serializing)]
     pub legacy_cast_sites: BTreeSet<(Option<OperationId>, u32)>,
-    pub packing_rows: Option<u16>,
+    #[serde(default, with = "crate::mid::site_map")]
+    pub packing: BTreeMap<crate::mid::WorkSite, crate::mid::PanelPacking>,
+    /// Checkpoint-only global preference, resolved once against eligible copies.
+    #[serde(default, skip_serializing)]
+    pub legacy_packing_rows: Option<std::num::NonZeroU16>,
     pub parallel_reductions: usize,
     pub disjoint_copy_sources: bool,
     #[serde(default)]
@@ -44,7 +48,30 @@ impl Recipe {
             mapping,
             tile_count,
         )?;
+        crate::tensor::remap_owners(
+            recipe
+                .packing
+                .values_mut()
+                .map(|choice| &mut choice.workspace),
+            mapping,
+            tile_count,
+        )?;
         Ok(recipe)
+    }
+
+    pub(crate) fn resolve_packing_choices(
+        &mut self,
+        program: &MidProgram,
+    ) -> Result<(), crate::mid::ProgramError> {
+        if let Some(rows) = self.legacy_packing_rows.take() {
+            if !self.packing.is_empty() {
+                return Err(crate::mid::ProgramError::Invalid(
+                    "recipe mixes global and scoped packing choices".into(),
+                ));
+            }
+            self.packing = program.legacy_packing_choices(rows)?;
+        }
+        Ok(())
     }
 
     /// Legacy ordinals are interpreted once, at the checkpoint/construction
@@ -110,7 +137,7 @@ impl Recipe {
             boundaries: Vec<ValueId>,
             casts: Vec<crate::mid::WorkSite>,
             early_casts: Vec<OperationId>,
-            packing_rows: (Option<u16>, Option<u16>),
+            packing: BTreeSet<crate::mid::WorkSite>,
             parallel_reductions: (usize, usize),
             disjoint_copy_sources: (bool, bool),
             cast_storage: (&'a Option<CastStoragePolicy>, &'a Option<CastStoragePolicy>),
@@ -139,7 +166,13 @@ impl Recipe {
                 .symmetric_difference(&before.early_casts)
                 .copied()
                 .collect(),
-            packing_rows: (before.packing_rows, self.packing_rows),
+            packing: self
+                .packing
+                .keys()
+                .chain(before.packing.keys())
+                .filter(|site| self.packing.get(*site) != before.packing.get(*site))
+                .cloned()
+                .collect(),
             parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
             disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
             cast_storage: (&before.cast_storage, &self.cast_storage),
@@ -154,4 +187,5 @@ pub(crate) struct Candidate {
     pub alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
     pub cast_sites: BTreeSet<crate::mid::WorkSite>,
     pub cast_storage_sites: BTreeSet<crate::mid::WorkSite>,
+    pub packing_choices: BTreeMap<crate::mid::WorkSite, Vec<crate::mid::PanelPacking>>,
 }

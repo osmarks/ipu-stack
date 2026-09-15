@@ -49,7 +49,7 @@ pub struct ResultSite {
 
 /// JSON object keys cannot represent structured work identities. Keep their
 /// fields intact as key/value pairs, rejecting ambiguous duplicate requests.
-pub(super) mod map {
+pub(crate) mod map {
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
     use std::collections::BTreeMap;
 

@@ -5,6 +5,7 @@
 mod layout;
 mod owners;
 pub use owners::OwnerMap;
+pub(crate) use owners::remap_owners;
 mod resolved;
 pub use layout::*;
 mod view;

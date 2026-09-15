@@ -133,8 +133,19 @@ rewrite realizes reuse only for safe, storage-saving donations and records the
 result in the ordinary allocation aliases. Search proposes individual choices
 and joint layout/donation changes for an operator and its direct consumers;
 unrelated policies stay fixed. Checkpoint loading migrates the old global boolean,
-which is absent from current recipes. Packing and grouping policies remain global
-and are still a refactor requirement.
+which is absent from current recipes.
+
+[Panel packing](../crates/ipu-codegen/src/mid/packing.rs) has a separate choice
+for each named copy: panel rows and an absolute workspace owner map. It inserts
+a copy into that workspace, local packing compute, and a copy to the original
+result. The result retains its selected layout and home; the workspace can use
+more tiles. Before rewriting, the planner asks for feasible choices from its
+existing four row sizes. An unavailable requested site or workspace is an error.
+Layout/cast proposals may explicitly remove affected packing choices, while
+unrelated choices remain fixed. Version-five checkpoints resolve the old global
+row hint once; new checkpoints retain only named choices. Joint tile-mapping
+proposals also remap packing workspaces. Reduction/preparation grouping remains
+global and is still a refactor requirement.
 
 Mid values carry an
 [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto

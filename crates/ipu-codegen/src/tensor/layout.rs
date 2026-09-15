@@ -795,6 +795,8 @@ impl Layout {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LayoutError {
+    #[error("tile mapping must be a bijection over {tiles} active tiles")]
+    InvalidTilePermutation { tiles: u16 },
     #[error("invalid owner embedding for {owners} logical owners on {tiles} device tiles")]
     InvalidOwnerMap { owners: u16, tiles: u16 },
     #[error("layout requires {declared} tiles but the graph has {available}")]

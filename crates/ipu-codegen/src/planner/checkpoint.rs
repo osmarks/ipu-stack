@@ -6,7 +6,7 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
@@ -57,6 +57,9 @@ impl State {
         if saved["version"] == 3 {
             migrate_ownership_schema(&mut saved, graph, config.tile_count)?;
         }
+        if saved["version"] == 4 {
+            migrate_packing_schema(&mut saved)?;
+        }
         let mut state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
@@ -79,15 +82,18 @@ impl State {
         }
         if !state.recipe.early_casts.is_empty()
             || !state.recipe.legacy_cast_sites.is_empty()
+            || state.recipe.legacy_packing_rows.is_some()
             || state.visited.iter().any(|recipe| {
-                !recipe.early_casts.is_empty() || !recipe.legacy_cast_sites.is_empty()
+                !recipe.early_casts.is_empty()
+                    || !recipe.legacy_cast_sites.is_empty()
+                    || recipe.legacy_packing_rows.is_some()
             })
         {
-            // Ordinal and source-wide visits cannot be compared to named
+            // Ordinal and global visits cannot be compared to named
             // choices without rebuilding each plan. Keep the incumbent and
             // search budget; discard only these obsolete visit identities.
             state.visited.clear();
-            tracing::info!("migrating legacy cast choices; cleared obsolete search visits");
+            tracing::info!("migrating legacy site choices; cleared obsolete search visits");
         }
         state.recipe.normalize(config);
         for recipe in &mut state.visited {
@@ -216,8 +222,31 @@ fn migrate_ownership_schema(
             }
         }
     }
-    saved["version"] = VERSION.into();
+    saved["version"] = 4.into();
     tracing::info!("migrated global tile mapping into scoped recipe ownership");
+    Ok(())
+}
+
+fn migrate_packing_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> {
+    let migrate = |recipe: &mut serde_json::Value| -> PackageBuildResult<()> {
+        let object = recipe
+            .as_object_mut()
+            .ok_or_else(|| invalid("checkpoint recipe is not an object"))?;
+        if let Some(rows) = object.remove("packing_rows") {
+            if object.insert("legacy_packing_rows".into(), rows).is_some() {
+                return Err(invalid("checkpoint has multiple global packing requests"));
+            }
+        }
+        Ok(())
+    };
+    migrate(&mut saved["recipe"])?;
+    if let Some(visited) = saved["visited"].as_array_mut() {
+        for recipe in visited {
+            migrate(recipe)?;
+        }
+    }
+    saved["version"] = VERSION.into();
+    tracing::info!("migrating global packing rows to named copy choices");
     Ok(())
 }
 
@@ -282,6 +311,147 @@ fn context_difference(saved: &str, current: &str) -> String {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
+
+    #[test]
+    fn legacy_packing_becomes_scoped_and_layout_search_can_replace_it() {
+        use crate::planner::catalogue::pointwise_operator_candidate;
+        use crate::planner::operator::OutputAliasing;
+        use crate::tensor::{BlockMajorOrder, ElementOrder, Layout, Precision, TensorFormat};
+
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [512, 32]).unwrap();
+        let z = graph.host_input("z", [512, 32]).unwrap();
+        let a = graph.gelu(x).unwrap();
+        let b = graph.gelu(z).unwrap();
+        graph.set_outputs([a, b]).unwrap();
+        let plain = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(64),
+        };
+        let mut target = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(2),
+        };
+        target.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: 256,
+            column_block: 16,
+        });
+        let plan = |format: TensorFormat| {
+            pointwise_operator_candidate(
+                crate::planner::OperatorFamily::Gelu,
+                [format.clone()],
+                format,
+            )
+            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+            .plan
+        };
+        let mut config = PipelineConfig::new(64)
+            .with_input(x, plain.clone())
+            .with_input(z, plain.clone());
+        let mut recipe = Recipe::default();
+        recipe.open_boundaries.extend([a, b]);
+        for operation in graph.operations() {
+            recipe.plans.insert(operation.id, plan(target.clone()));
+        }
+        let fragments = crate::planner::FragmentCache::default();
+        let baseline =
+            crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &recipe)
+                .unwrap();
+        assert_eq!(baseline.packing_choices.len(), 2);
+        let mut scoped = baseline.recipe.clone();
+        scoped.packing = baseline
+            .packing_choices
+            .iter()
+            .map(|(site, choices)| {
+                (
+                    site.clone(),
+                    choices
+                        .iter()
+                        .find(|choice| choice.rows.get() == 128)
+                        .unwrap()
+                        .clone(),
+                )
+            })
+            .collect();
+        let expected =
+            crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &scoped)
+                .unwrap();
+        let mut state = State::load(&graph, &config, None).unwrap();
+        state.recipe = baseline.recipe;
+        state.attempts = 17;
+        let mut saved = serde_json::to_value(state).unwrap();
+        saved["version"] = 4.into();
+        saved["recipe"].as_object_mut().unwrap().remove("packing");
+        saved["recipe"]["packing_rows"] = 128.into();
+        saved["visited"] = serde_json::json!([saved["recipe"].clone()]);
+        let path =
+            std::env::temp_dir().join(format!("ipu-packing-migration-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        config.load_search_state = Some(path.clone());
+        config.save_search_state = Some(path.clone());
+        let mut resumed = State::load(&graph, &config, None).unwrap();
+        assert_eq!(resumed.attempts, 17);
+        assert!(resumed.visited.is_empty());
+        let mut actual = crate::planner::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &resumed.recipe,
+        )
+        .unwrap();
+        assert_eq!(actual.program, expected.program);
+        assert!(actual.recipe == expected.recipe);
+        resumed.save(&config, &actual, &config).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], VERSION);
+        assert!(saved["recipe"].get("packing_rows").is_none());
+        assert!(saved["recipe"].get("legacy_packing_rows").is_none());
+        assert!(State::load(&graph, &config, None).unwrap().recipe == actual.recipe);
+
+        let source = graph.operations()[0].id;
+        let alternative = plan(plain);
+        actual
+            .alternatives
+            .insert(source, vec![alternative.clone()]);
+        let proposals = crate::planner::proposals(&graph, &config, &actual, None);
+        let changed = |recipe: &Recipe| recipe.plans.get(&source) == Some(&alternative);
+        let preserved = proposals
+            .iter()
+            .find(|p| changed(&p.recipe) && p.recipe.packing == actual.recipe.packing)
+            .unwrap();
+        assert!(
+            crate::planner::build_candidate(
+                &graph,
+                &config,
+                &Ipu21CostModel,
+                &fragments,
+                &preserved.recipe
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("packing")
+        );
+        let cleared = proposals
+            .iter()
+            .find(|p| {
+                changed(&p.recipe)
+                    && p.recipe.packing.len() == 1
+                    && p.recipe.packing.keys().all(|site| site.source != source)
+            })
+            .unwrap();
+        crate::planner::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &cleared.recipe,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn legacy_mapping_migrates_incumbent_and_visits_into_owner_choices() {

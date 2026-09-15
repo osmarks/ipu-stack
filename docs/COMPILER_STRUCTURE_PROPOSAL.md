@@ -84,7 +84,7 @@ and individual result homes. The old whole-device mapping neighborhood is an
 ordinary joint Recipe proposal, ranked with its fabric-load estimate; the
 separate mapping optimizer and low remapping pass are removed. Checkpoint
 version four migrates previous mappings into those choices. Family storage,
-packing/grouping scope and cache boundaries below still require work.
+grouping scope and cache boundaries below still require work.
 Architectural SRAM, supervisor encodings, register IDs and physical routing now
 belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
 the target topology through explicit functions. Package validation and the driver
@@ -105,8 +105,12 @@ boundary. Missing requests and ambiguous names are rejected. Cast storage now
 uses a typed mid policy with site overrides, operator defaults and an effective
 initial default. Layout proposals pair donation with the affected operator and
 its direct consumers; they do not toggle donation throughout the graph. Old
-global cast-storage settings migrate at checkpoint loading. Packing and grouping
-policies below have not yet moved to that scope.
+global cast-storage settings migrate at checkpoint loading. Packing now selects
+panel rows and an explicit workspace per named copy, preserving the destination's
+layout and home. Construction rejects unavailable choices; layout proposals can
+explicitly remove affected choices. Version-five checkpoints migrate the previous
+global row hint once, and physical relabeling includes packing workspaces.
+Grouping policies below have not yet moved to that scope.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

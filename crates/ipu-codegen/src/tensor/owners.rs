@@ -4,6 +4,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Relabel physical assignments through one device permutation. Intern the
+/// resulting bases so repeated domains keep sharing their embedding arrays.
+pub(crate) fn remap_owners<'a>(
+    owners: impl Iterator<Item = &'a mut OwnerMap>,
+    mapping: &[u16],
+    tile_count: u16,
+) -> Result<(), LayoutError> {
+    let mut sorted = mapping.to_vec();
+    sorted.sort_unstable();
+    if !sorted.into_iter().eq(0..tile_count) {
+        return Err(LayoutError::InvalidTilePermutation { tiles: tile_count });
+    }
+    if mapping.iter().copied().eq(0..tile_count) {
+        return Ok(());
+    }
+    let mapping: Arc<[u16]> = mapping.into();
+    let mut bases = std::collections::HashMap::<_, _, foldhash::fast::FixedState>::default();
+    for owners in owners {
+        owners.validate(1, tile_count)?;
+        let base = owners.with_rotation(0);
+        let remapped = bases.entry(base).or_insert_with_key(|base| {
+            base.remapped(&mapping)
+                .expect("validated owner and device maps")
+        });
+        *owners = remapped.with_rotation(owners.rotation());
+    }
+    Ok(())
+}
+
 /// Rotate logical owner ordinals, then embed them onto device tiles. An omitted
 /// embedding uses the whole device; an explicit embedding can name any subset.
 /// Cloning values shares the embedding's storage. Keeping the rotation before
