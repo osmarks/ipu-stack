@@ -48,7 +48,6 @@ pub(super) fn run(
     if reuse_cast_inputs {
         cast::donate(program)?;
     }
-    padding::omit_unread_fp8_input_padding(program);
-    padding::reuse_finite_padding(program);
+    padding::eliminate(program)?;
     Ok(())
 }

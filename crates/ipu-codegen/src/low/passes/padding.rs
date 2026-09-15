@@ -1,97 +1,24 @@
-//! Remove padding initialization when readers do not need it.
-//!
-//! Packing kernels can skip unread input padding and write their own zeros.
-//! Separately, numerical inputs and operation results are assumed finite. For an all-F16
-//! program, zeroing the tensor arena once establishes an invariant preserved
-//! by writes, copies and allocation reuse. This second proof cannot apply to
-//! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
+//! Remove padding clears using resolved kernel access contracts and graph provenance.
+//! Finite scratch is valid only in an all-F16 arena initialized once at load time.
 
+use crate::CopyOrder;
+use crate::kernel::PaddingRequirement;
+use crate::low::storage::storage_location;
 use crate::low::*;
 use crate::mid::MidOperationKind;
-use crate::tensor::{AmpOrder, ElementOrder, Precision};
+use crate::tensor::Precision;
 use std::collections::BTreeSet;
 
-/// Row-major FP8 packing reads only logical columns/rows and writes its own
-/// output padding. Drop input padding clears when that is the sole reader.
 #[tracing::instrument(skip_all)]
-pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
-    let shards = &program.shards;
-    let kernels = &program.kernel_runs;
+pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
     let uses = crate::low::uses::StorageUses::analyze(program);
     let root = |id: BlockValueId| uses.roots[id.index() as usize];
-    let mut candidates = vec![false; uses.allocations.len()];
-    let mut forbidden = uses
-        .allocations
-        .iter()
-        .map(|use_| use_.non_kernel_read)
-        .collect::<Vec<_>>();
-    for run in program.kernel_calls() {
-        for view in &run.inputs {
-            let block = &shards[view.shard.index() as usize];
-            let columns = view.extents.last();
-            let ignores_padding = matches!(run.kernel, MidOperationKind::Cast {
-                from: Precision::F16, to: Precision::F8F143 { .. }
-            } | MidOperationKind::Gelu)
-                && matches!(run.requirements.outputs[0].format.precision, Precision::F8F143 { .. })
-                && block.tensor_type.format.precision == Precision::F16
-                && block.tensor_type.format.layout.order == ElementOrder::RowMajor
-                && matches!(run.requirements.outputs[0].format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
-                && (run.kernel == MidOperationKind::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
-                && view.extents == block.extents
-                && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
-                // Matrix-row padding is skipped by the packed row bounds;
-                // padding in outer dimensions still requires initialization.
-                && view.extents.iter().rev().skip(2).all(|axis| axis.logical_end == axis.physical_end)
-                && (view.extents.len() < 2 || {
-                    let rows = view.extents[view.extents.len()-2];
-                    rows.logical_end == rows.physical_end || (matches!(run.kernel, MidOperationKind::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
-                });
-            if ignores_padding {
-                candidates[root(view.shard)] = true;
-            } else {
-                forbidden[root(view.shard)] = true;
-            }
-        }
-        if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
-            for view in &run.outputs {
-                forbidden[root(view.shard)] = true;
-            }
-        }
-    }
-    let mut removed = 0;
-    let mut keep = |operation: &BlockOperation| {
-        if let BlockOperation::Compute { run: id, .. } = operation {
-            let run = &kernels[id.0 as usize];
-            if matches!(
-                run.kernel,
-                MidOperationKind::FillZero {
-                    padding_only: true,
-                    ..
-                }
-            ) && candidates[root(run.outputs[0].shard)]
-                && !forbidden[root(run.outputs[0].shard)]
-            {
-                removed += 1;
-                return false;
-            }
-        }
-        true
-    };
-    program.body.retain(&mut keep);
-    tracing::info!(removed, "eliminated unread FP8 cast input padding clears");
-}
-
-#[tracing::instrument(skip_all)]
-pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
-    if program
+    let mut clears = vec![Vec::new(); uses.allocations.len()];
+    let mut removable = vec![false; program.kernel_runs.len()];
+    let all_f16 = program
         .shards
         .iter()
-        .any(|shard| shard.tensor_type.format.precision != Precision::F16)
-    {
-        return;
-    }
-    let uses = crate::low::uses::StorageUses::analyze(program);
-    let root = |id: BlockValueId| uses.roots[id.index() as usize];
+        .all(|shard| shard.tensor_type.format.precision == Precision::F16);
     let mut parameter_storage = program
         .inputs
         .iter()
@@ -124,8 +51,21 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                     }
                 }
             }
-            BlockOperation::Compute { run, .. } => {
-                let run = &program.kernel_runs[run.0 as usize];
+            BlockOperation::Compute { run: id, .. } => {
+                let run = &program.kernel_runs[id.0 as usize];
+                if matches!(
+                    run.kernel,
+                    MidOperationKind::FillZero {
+                        padding_only: true,
+                        ..
+                    }
+                ) {
+                    let backing = root(run.outputs[0].shard);
+                    if !uses.allocations[backing].non_kernel_read {
+                        clears[backing].push(*id);
+                        removable[id.0 as usize] = true;
+                    }
+                }
                 if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
                     // Arithmetic results are not known-zero-padded parameters.
                     for output in run.outputs.iter() {
@@ -137,6 +77,16 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                 }
             }
             _ => {}
+        }
+    }
+    if !removable.iter().any(|&remove| remove) {
+        return Ok(());
+    }
+    for (&root, sources) in &incoming {
+        if sources.contains(&root) {
+            for id in &clears[root] {
+                removable[id.0 as usize] = false;
+            }
         }
     }
     // Writes through aliases also invalidate an input's original parameter
@@ -156,90 +106,81 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
             break;
         }
     }
-    let mut candidates = vec![false; uses.allocations.len()];
-    let mut forbidden = uses
-        .allocations
-        .iter()
-        .map(|use_| use_.non_kernel_read)
-        .collect::<Vec<_>>();
+
+    let mut needs_finite = vec![false; program.kernel_runs.len()];
     for run in program.kernel_calls() {
-        // Parameter packing supplies exact zero coefficients beyond logical K.
-        // Only the activation operand can therefore tolerate arbitrary finite K
-        // padding. Missing logical values and explicit reduction zeros cannot.
-        let finite_left = matches!(run.kernel, MidOperationKind::Gemm { .. })
-            && run.inputs.len() == 2
-            && parameter_storage.contains(&root(run.inputs[1].shard));
-        for (index, view) in run.inputs.iter().enumerate() {
-            if finite_left && index == 0 {
-                candidates[root(view.shard)] = true;
-            } else {
-                forbidden[root(view.shard)] = true;
-            }
+        if run
+            .inputs
+            .iter()
+            .all(|input| clears[root(input.shard)].is_empty())
+        {
+            continue;
         }
-        if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
-            for view in &run.outputs {
-                forbidden[root(view.shard)] = true;
+        let call = run.call().map_err(crate::kernel::KernelError::from)?;
+        for (operand, input) in run.inputs.iter().enumerate() {
+            let readers = &clears[root(input.shard)];
+            if readers.is_empty() {
+                continue;
+            }
+            let (regions, finite) = match call
+                .input_padding(run, operand)
+                .map_err(crate::kernel::KernelError::from)?
+            {
+                PaddingRequirement::Unread(regions) => (regions, false),
+                PaddingRequirement::FiniteIfZero { region, zero }
+                    if all_f16
+                        && parameter_storage.contains(&root(zero.shard))
+                        && zero
+                            .extents
+                            .iter()
+                            .zip(&program.shards[zero.shard.index() as usize].extents)
+                            .any(|(region, storage)| region.start >= storage.logical_end) =>
+                {
+                    (vec![region], true)
+                }
+                _ => (Vec::new(), false),
+            };
+            let ranges = regions
+                .iter()
+                .map(|region| {
+                    let bound = region.bind(&program.shards)?;
+                    Ok((bound.traversal(CopyOrder::Physical)?, bound.backing.1))
+                })
+                .collect::<Result<Vec<_>, crate::storage::StorageError>>()?;
+            for &id in readers {
+                let clear = &program.kernel_runs[id.0 as usize];
+                let MidOperationKind::FillZero { offset, bytes, .. } = clear.kernel else {
+                    unreachable!();
+                };
+                let start =
+                    storage_location(&program.shards, clear.outputs[0].shard).1 + i64::from(offset);
+                let end = start + i64::from(bytes);
+                removable[id.0 as usize] &= ranges.iter().any(|(ranges, base)| {
+                    ranges.spans().any(|range| {
+                        let begin = base + i64::from(range.offset);
+                        begin <= start && end <= begin + i64::from(range.bytes)
+                    })
+                });
+                needs_finite[id.0 as usize] |= finite;
             }
         }
     }
-    let shards = &program.shards;
-    let kernels = &program.kernel_runs;
-    let mut valid_row_ranges = std::collections::BTreeMap::new();
     let mut removed = 0;
-    let mut keep = |operation: &BlockOperation| {
-        if let BlockOperation::Compute { run: id, .. } = operation {
-            let run = &kernels[id.0 as usize];
-            if let MidOperationKind::FillZero {
-                offset,
-                bytes,
-                padding_only: true,
-            } = run.kernel
-                && candidates[root(run.outputs[0].shard)]
-                && !forbidden[root(run.outputs[0].shard)]
-            {
-                // Keep discarded row padding zero: arbitrary nonzero rows
-                // could overflow even though their outputs are unobserved.
-                let ranges = valid_row_ranges
-                    .entry(run.outputs[0].shard)
-                    .or_insert_with(|| {
-                        let shard = &shards[run.outputs[0].shard.index() as usize];
-                        let mut rows = shard.extents.clone();
-                        let rank = rows.len();
-                        let inner = match shard.tensor_type.format.layout.order {
-                            ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor => {
-                                rank.checked_sub(1)?
-                            }
-                            ElementOrder::Amp(AmpOrder::TransposedLeft) => rank.checked_sub(2)?,
-                            _ => return None,
-                        };
-                        for (axis, extent) in rows.iter_mut().enumerate() {
-                            if axis != inner {
-                                extent.physical_end = extent.logical_end;
-                            }
-                        }
-                        crate::storage::byte_traversal(shard.storage(), &rows, true).ok()
-                    });
-                if !ranges.as_ref().is_some_and(|ranges| {
-                    ranges.spans().any(|range| {
-                        range.offset <= offset
-                            && u64::from(offset) + u64::from(bytes)
-                                <= u64::from(range.offset) + u64::from(range.bytes)
-                    })
-                }) {
-                    return true;
-                }
-                removed += 1;
-                return false;
-            }
+    program.body.retain(&mut |operation| {
+        if let BlockOperation::Compute { run: id, .. } = operation
+            && removable[id.0 as usize]
+        {
+            program.requires_finite_scratch |= needs_finite[id.0 as usize];
+            removed += 1;
+            return false;
         }
         true
-    };
-    program.body.retain(&mut keep);
-    program.requires_finite_scratch |= removed != 0;
+    });
     tracing::info!(
         removed,
-        "eliminated finite GEMM padding clears using load-time SRAM initialization"
+        "eliminated padding clears using kernel access contracts"
     );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,12 +188,12 @@ mod tests {
     use super::*;
     use crate::kernel::{GemmKernelMode, GemmWeightLoad};
     use crate::mid::{MidInput, MidValueId};
-    use crate::tensor::{Layout, ShardExtent, TensorTiling};
+    use crate::tensor::{AmpOrder, ElementOrder, Layout, ShardExtent, TensorTiling};
     use crate::{AccumulationPrecision, KernelAccess, KernelRequirements, TensorType};
 
     fn fixture() -> TileGraph {
         let tensor_type = TensorType::new(
-            [2, 64],
+            [2, 48],
             Precision::F16,
             Layout::row_major(TensorTiling::replicated(1)),
         );
@@ -266,7 +207,7 @@ mod tests {
             ShardExtent {
                 axis: 1,
                 start: 0,
-                logical_end: 50,
+                logical_end: 48,
                 physical_end: 64,
             },
         ];
@@ -274,7 +215,15 @@ mod tests {
             shard: BlockValueId(id),
             extents: extents.clone(),
         };
-        let run = |kernel, inputs, output| {
+        let run = |kernel, inputs: Vec<ShardView>, output| {
+            let requirements = KernelRequirements {
+                inputs: inputs
+                    .iter()
+                    .map(|_| KernelAccess::new(tensor_type.format.clone(), 8))
+                    .collect(),
+                outputs: vec![KernelAccess::new(tensor_type.format.clone(), 8)],
+                distinct_elements: Vec::new(),
+            };
             KernelRun::new(
                 WorkProvenance {
                     operation: None,
@@ -284,14 +233,10 @@ mod tests {
                 kernel,
                 inputs,
                 vec![view(output)],
-                KernelRequirements {
-                    inputs: Vec::new(),
-                    outputs: vec![KernelAccess::new(tensor_type.format.clone(), 8)],
-                    distinct_elements: Vec::new(),
-                },
+                requirements,
             )
         };
-        TileGraph {
+        let mut program = TileGraph {
             tile_count: 1,
             requires_finite_scratch: false,
             shards: (0..3)
@@ -356,7 +301,18 @@ mod tests {
             outputs: Vec::new(),
             logical_values: Vec::new(),
             checkpoints: Vec::new(),
+        };
+        for (id, rows, columns) in [(1, 48, 16), (2, 2, 16)] {
+            let shard = &mut program.shards[id];
+            shard.tensor_type.shape = crate::TensorShape(vec![rows, columns]);
+            shard.extents[0].logical_end = rows;
+            shard.extents[0].physical_end = if id == 1 { 64 } else { rows };
+            shard.extents[1].logical_end = columns;
+            shard.extents[1].physical_end = columns;
         }
+        program.kernel_runs[1].inputs[1].extents = program.shards[1].extents.clone();
+        program.kernel_runs[1].outputs[0].extents = program.shards[2].extents.clone();
+        program
     }
 
     fn has_clear(program: &TileGraph) -> bool {
@@ -387,7 +343,7 @@ mod tests {
                     })));
             }
             let before = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
-            reuse_finite_padding(&mut program);
+            eliminate(&mut program).unwrap();
             let after = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
             assert!(after.total < before.total);
             assert!(!has_clear(&program));
@@ -411,7 +367,7 @@ mod tests {
             let cost = crate::estimate::scheduled_program_cycles(&executed, &[]).unwrap();
             assert_eq!(after.total, cost.total * u64::from(count));
             let mut again = (*program).clone();
-            reuse_finite_padding(&mut again);
+            eliminate(&mut again).unwrap();
             assert_eq!(again, *program, "removal must be idempotent");
         }
     }
@@ -442,11 +398,17 @@ mod tests {
     fn cast_padding_elision_requires_exclusive_column_only_reader() {
         let mut baseline = fixture();
         let graph = &mut baseline;
+        graph.shards[2] = BlockValue {
+            id: BlockValueId(2),
+            ..graph.shards[0].clone()
+        };
         graph.shards[0].extents[1].logical_end = 48;
         let run = &mut graph.kernel_runs[1];
         run.inputs.truncate(1);
+        run.outputs[0].extents = graph.shards[2].extents.clone();
         run.inputs[0].extents[1].logical_end = 48;
         let metadata = Arc::make_mut(&mut run.metadata);
+        metadata.requirements.inputs.truncate(1);
         metadata.kernel = MidOperationKind::Cast {
             from: Precision::F16,
             to: Precision::F8F143 { scale_exponent: -4 },
@@ -454,7 +416,8 @@ mod tests {
         metadata.requirements.outputs[0].format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         metadata.requirements.outputs[0].format.precision =
             Precision::F8F143 { scale_exponent: -4 };
-        for case in 0..11 {
+        graph.shards[2].tensor_type.format = metadata.requirements.outputs[0].format.clone();
+        for case in 0..15 {
             let mut program = baseline.clone();
             let graph = &mut program;
             match case {
@@ -465,8 +428,9 @@ mod tests {
                 2 => graph.outputs.push(MidValueId::from_index(1)),
                 3 => append_copy(graph, 0, 1, 128),
                 5 | 6 => {
-                    Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel =
-                        MidOperationKind::Gelu;
+                    // Non-vector-aligned logical columns select physical reads.
+                    graph.shards[0].extents[1].logical_end = 50;
+                    graph.kernel_runs[1].inputs[0].extents[1].logical_end = 50;
                     if case == 6 {
                         graph.shards[0].extents[0].logical_end = 1;
                         graph.kernel_runs[1].inputs[0].extents[0].logical_end = 1;
@@ -510,12 +474,55 @@ mod tests {
                             body,
                         })));
                 }
+                11 | 12 => {
+                    let physical = if case == 11 { 2 } else { 65536 };
+                    let logical = physical - 1;
+                    for id in [0, 2] {
+                        graph.shards[id].extents[0].logical_end = logical;
+                        graph.shards[id].extents[0].physical_end = physical;
+                    }
+                    graph.kernel_runs[1].inputs[0].extents = graph.shards[0].extents.clone();
+                    graph.kernel_runs[1].outputs[0].extents = graph.shards[2].extents.clone();
+                    Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
+                        MidOperationKind::FillZero {
+                            offset: logical * 128,
+                            bytes: 128,
+                            padding_only: true,
+                        };
+                }
+                13 => {
+                    // A clear crossing from live data into padding cannot be dropped.
+                    Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
+                        MidOperationKind::FillZero {
+                            offset: 88,
+                            bytes: 40,
+                            padding_only: true,
+                        };
+                }
+                14 => {
+                    // Another alias reads the first four elements of the padding.
+                    let mut alias = graph.shards[0].clone();
+                    alias.id = BlockValueId(3);
+                    alias.definition = ShardDefinition::Alias(BlockValueId(0));
+                    alias.extents[1].logical_end = 52;
+                    let mut reader = graph.kernel_runs[1].clone();
+                    reader.inputs[0] = ShardView {
+                        shard: alias.id,
+                        extents: alias.extents.clone(),
+                    };
+                    graph.shards.push(alias);
+                    graph.kernel_runs.push(reader);
+                    graph.body.operations.push(BlockOperation::Compute {
+                        tile: 0,
+                        run: KernelRunId(2),
+                    });
+                }
                 _ => {}
             }
-            omit_unread_fp8_input_padding(&mut program);
+            eliminate(&mut program).unwrap();
             assert_eq!(
                 has_clear(&program),
-                !(case <= 1 || case == 5 || case == 7),
+                !(case <= 1 || case == 7 || case == 11),
                 "case {case}"
             );
         }
@@ -524,10 +531,10 @@ mod tests {
     #[test]
     fn finite_padding_requires_zero_weights_and_no_other_consumers() {
         let mut program = fixture();
-        reuse_finite_padding(&mut program);
+        eliminate(&mut program).unwrap();
         assert!(!has_clear(&program));
         assert!(program.requires_finite_scratch);
-        for case in 0..5 {
+        for case in 0..8 {
             let mut program = fixture();
             let graph = &mut program;
             match case {
@@ -543,6 +550,7 @@ mod tests {
                 }
                 3 => {
                     graph.shards[0].extents[0].logical_end = 1;
+                    graph.kernel_runs[1].inputs[0].extents[0].logical_end = 1;
                     Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
                         MidOperationKind::FillZero {
                             offset: 224,
@@ -550,9 +558,22 @@ mod tests {
                             padding_only: true,
                         };
                 }
-                _ => graph.outputs.push(MidValueId::from_index(1)),
+                4 => graph.outputs.push(MidValueId::from_index(1)),
+                5 => {
+                    graph.shards[1].extents[0].logical_end = 56;
+                    graph.kernel_runs[1].inputs[1].extents[0].logical_end = 56;
+                }
+                6 => {
+                    // A parameter alias with a shifted K origin is not a matching coefficient panel.
+                    graph.shards[1].extents[0].start = 8;
+                    graph.kernel_runs[1].inputs[1].extents[0].start = 8;
+                }
+                _ => {
+                    // A narrower call view does not make live parameter coefficients zero.
+                    graph.shards[1].extents[0].logical_end = 64;
+                }
             }
-            reuse_finite_padding(&mut program);
+            eliminate(&mut program).unwrap();
             assert!(has_clear(&program), "case {case}");
         }
     }
@@ -573,9 +594,9 @@ mod tests {
         let mut movement = last.movement().clone();
         movement.destination = BlockValueId(1);
         *last = crate::kernel::CopyRun::bind(movement, &overwritten.shards).unwrap();
-        reuse_finite_padding(&mut program);
-        reuse_finite_padding(&mut mixed);
-        reuse_finite_padding(&mut overwritten);
+        eliminate(&mut program).unwrap();
+        eliminate(&mut mixed).unwrap();
+        eliminate(&mut overwritten).unwrap();
         assert!(!has_clear(&program));
         assert!(has_clear(&mixed));
         assert!(has_clear(&overwritten));

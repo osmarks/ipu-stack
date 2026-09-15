@@ -12,6 +12,8 @@ mod gemm;
 mod inventory;
 mod normalization;
 mod output;
+mod padding;
+pub(crate) use padding::PaddingRequirement;
 mod pointwise;
 pub(crate) mod rearrange;
 mod reduce;
