@@ -14,13 +14,13 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     let arity = match kernel {
         MidOperationKind::LayerNorm => 3,
         MidOperationKind::AddLayerNorm | MidOperationKind::LayerNormApply { .. } => 4,
         MidOperationKind::LayerNormMoments => 1,
         MidOperationKind::AddLayerNormMoments => 2,
-        _ => return Err(KernelAbiError::RequirementMismatch),
+        _ => return Err(KernelError::RequirementMismatch),
     };
     check_arity(
         inputs,
@@ -43,7 +43,7 @@ pub(super) fn call(
             || (*kernel == MidOperationKind::AddLayerNorm
                 && (input.extents != output.extents || inputs[1].extents != output.extents))
         {
-            return Err(KernelAbiError::RequirementMismatch);
+            return Err(KernelError::RequirementMismatch);
         }
         return Ok(KernelCall::exact(
             if *kernel == MidOperationKind::LayerNorm {
@@ -60,23 +60,23 @@ pub(super) fn call(
             || outputs[1].format != input.format
             || inputs[1].format != input.format)
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let width = input.matrix_extent(true, true)?;
     let source_count = input.logical_elements()?;
     let rows = source_count
         .checked_div(width)
-        .ok_or(KernelAbiError::RequirementMismatch)?;
+        .ok_or(KernelError::RequirementMismatch)?;
     let statistics = rows
         .checked_mul(2)
-        .ok_or(KernelAbiError::ElementCountOverflow)?;
+        .ok_or(KernelError::ElementCountOverflow)?;
     if !width.is_multiple_of(4)
         || input.matrix_extent(false, true)? != width
         || input.format.precision != Precision::F16
         || input.format.layout.order != ElementOrder::RowMajor
         || output.format.layout.order != ElementOrder::RowMajor
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let (symbol, arguments) = match kernel {
         MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
@@ -86,7 +86,7 @@ pub(super) fn call(
                 || (*kernel == MidOperationKind::AddLayerNormMoments
                     && input.count()? != source_count)
             {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             (
                 if *kernel == MidOperationKind::LayerNormMoments {
@@ -100,7 +100,7 @@ pub(super) fn call(
         MidOperationKind::LayerNormApply { parts } => {
             let statistics = statistics
                 .checked_mul(u32::from(*parts))
-                .ok_or(KernelAbiError::ElementCountOverflow)?;
+                .ok_or(KernelError::ElementCountOverflow)?;
             if *parts == 0
                 || output.format.precision != Precision::F16
                 || inputs[1..3]
@@ -111,11 +111,11 @@ pub(super) fn call(
                 || output.matrix_extent(true, true)? != width
                 || output_elements != source_count
             {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             ("layer_norm_apply", vec![rows, width, u32::from(*parts)])
         }
-        _ => return Err(KernelAbiError::RequirementMismatch),
+        _ => return Err(KernelError::RequirementMismatch),
     };
     Ok(KernelCall::exact(symbol, arguments))
 }

@@ -59,12 +59,12 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 1, 1)?;
     let MidOperationKind::Cast { from, to } = *kernel else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
-    let symbol = symbol(from, to).ok_or_else(|| KernelAbiError::Unavailable(kernel.clone()))?;
+    let symbol = symbol(from, to).ok_or_else(|| KernelError::Unavailable(kernel.clone()))?;
     let count = outputs[0].count()?;
     if !matches!(from, Precision::F8F143 { .. }) && !matches!(to, Precision::F8F143 { .. }) {
         return Ok(KernelCall::exact(symbol, vec![count]));
@@ -127,7 +127,7 @@ pub(super) fn call(
 }
 
 /// Select and validate the FP16-to-FP8 traversal once for both calls and costs.
-fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32, KernelAbiError> {
+fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32, KernelError> {
     let order = output.format.layout.order;
     let row_pack = input.format.layout.order == ElementOrder::RowMajor
         && order == ElementOrder::Amp(AmpOrder::Left);
@@ -146,13 +146,13 @@ fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32
                     })
         })
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     if order.fp8_cast_panel_rows(1, 1) == 0 {
         return Ok(0);
     }
     if input.extents.len() < 2 {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let columns = u64::from(output.trailing_dimension(0).unwrap());
     if columns == 0
@@ -160,7 +160,7 @@ fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32
             && (!columns.is_multiple_of(32)
                 || !input.dimension(input.extents.len() - 1).is_multiple_of(4)))
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let count = output.elements();
     let rows = count / columns;
@@ -177,12 +177,12 @@ fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32
         && !count.is_multiple_of(
             panels
                 .checked_mul(32)
-                .ok_or(KernelAbiError::ElementCountOverflow)?,
+                .ok_or(KernelError::ElementCountOverflow)?,
         )
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
-    u32::try_from(panels).map_err(|_| KernelAbiError::ElementCountOverflow)
+    u32::try_from(panels).map_err(|_| KernelError::ElementCountOverflow)
 }
 
 pub(crate) fn symbol(from: Precision, to: Precision) -> Option<&'static str> {
@@ -248,17 +248,17 @@ impl CastChunks {
 pub(super) fn input_padding(
     call: &KernelCall,
     run: &KernelRun,
-) -> Result<PaddingRequirement, KernelAbiError> {
+) -> Result<PaddingRequirement, KernelError> {
     let input = &run.inputs[0];
     let [_, row_bounds, _, panel_rows, columns, stride] = call.arguments.as_slice() else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     if *stride == 0 || *panel_rows == 0 {
         return Ok(PaddingRequirement::Required);
     }
     let rank = input.extents.len();
     if rank < 2 {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     // These are the actual bounds decoded by cast_f8.cpp. A zero
     // descriptor reads physical rows, including on the overflow fallback.
@@ -279,7 +279,7 @@ pub(super) fn input_padding(
         extent.start = extent
             .start
             .checked_add(count)
-            .ok_or(KernelAbiError::ElementCountOverflow)?;
+            .ok_or(KernelError::ElementCountOverflow)?;
         extent.logical_end = extent.logical_end.max(extent.start);
         if extent.start < extent.physical_end {
             regions.push(region);

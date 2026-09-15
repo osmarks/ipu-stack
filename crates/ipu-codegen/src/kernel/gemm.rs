@@ -97,16 +97,16 @@ pub(super) fn access(
     )
 }
 
-pub(super) fn product_flops(run: &KernelRun) -> Result<[u64; 2], KernelAbiError> {
+pub(super) fn product_flops(run: &KernelRun) -> Result<[u64; 2], KernelError> {
     let MidOperationKind::Gemm {
         axes, inner_block, ..
     } = run.kernel
     else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     let axis = |a: crate::TensorAxis, rank| {
         a.resolve(rank)
-            .map_err(|_| KernelAbiError::RequirementMismatch)
+            .map_err(|_| KernelError::RequirementMismatch)
     };
     let li = axis(axes.left_inner, run.inputs[0].extents.len())?;
     let ri = axis(axes.right_inner, run.inputs[1].extents.len())?;
@@ -149,7 +149,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 2, 1)?;
     let output = outputs[0];
     let MidOperationKind::Gemm {
@@ -162,14 +162,14 @@ pub(super) fn call(
         ..
     } = *kernel
     else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     if (weights == GemmWeightLoad::Interleaved && multiply == Precision::F32)
         || (matches!(multiply, Precision::F8F143 { .. })
             && (accumulate != AccumulationPrecision::F16
                 || output.format.precision != Precision::F16))
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     // Scales affect call arguments, not the compiled AMP instruction stream.
     let (precision, arguments) = match multiply {
@@ -195,7 +195,7 @@ pub(super) fn call(
 
 /// Packed stores use the leading address of one column group, with the row
 /// permutation encoded by the GEMM. Other outputs require a contiguous view.
-pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool, KernelAbiError> {
+pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool, KernelError> {
     if !matches!(
         run.kernel,
         MidOperationKind::Gemm {
@@ -205,7 +205,7 @@ pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool,
     ) {
         return Ok(false);
     }
-    let order = run.requirements.outputs[0].format.layout.order;
+    let order = run.requirements.outputs[0].layout.order;
     let Some(group) = order.gemm_output_group() else {
         return Ok(false);
     };
@@ -214,11 +214,9 @@ pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool,
         .extents
         .len()
         .checked_sub(if order.gemm_output_transposed() { 2 } else { 1 })
-        .ok_or(KernelAbiError::MissingGemmRows)?;
+        .ok_or(KernelError::MissingGemmRows)?;
     let row = if column + 1 == view.extents.len() {
-        column
-            .checked_sub(1)
-            .ok_or(KernelAbiError::MissingGemmRows)?
+        column.checked_sub(1).ok_or(KernelError::MissingGemmRows)?
     } else {
         column + 1
     };
@@ -231,12 +229,12 @@ pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool,
         || end <= start
         || start / group != (end - 1) / group
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     Ok(true)
 }
 
-pub(crate) fn gemm_rows(output: TensorStorage<'_>) -> Result<u32, KernelAbiError> {
+pub(crate) fn gemm_rows(output: TensorStorage<'_>) -> Result<u32, KernelError> {
     let column = output
         .extents
         .len()
@@ -245,14 +243,14 @@ pub(crate) fn gemm_rows(output: TensorStorage<'_>) -> Result<u32, KernelAbiError
         } else {
             1
         })
-        .ok_or(KernelAbiError::MissingGemmRows)?;
+        .ok_or(KernelError::MissingGemmRows)?;
     output
         .widths()
         .enumerate()
         .filter(|(axis, _)| *axis != column)
         .try_fold(1u32, |rows, (_, width)| rows.checked_mul(width))
         .filter(|&rows| rows != 0)
-        .ok_or(KernelAbiError::MissingGemmRows)
+        .ok_or(KernelError::MissingGemmRows)
 }
 
 pub(super) fn specialized_gemm_symbol(
@@ -484,21 +482,21 @@ pub(crate) fn f16_packed_gemm_cycles(
 pub(super) fn input_padding(
     run: &KernelRun,
     inner: u32,
-) -> Result<PaddingRequirement, KernelAbiError> {
+) -> Result<PaddingRequirement, KernelError> {
     let input = &run.inputs[0];
     let MidOperationKind::Gemm { axes, .. } = run.kernel else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     let mut region = input.clone();
     let mut zero = run.inputs[1].clone();
     let left = axes
         .left_inner
         .resolve(region.extents.len())
-        .map_err(|_| KernelAbiError::RequirementMismatch)?;
+        .map_err(|_| KernelError::RequirementMismatch)?;
     let right = axes
         .right_inner
         .resolve(zero.extents.len())
-        .map_err(|_| KernelAbiError::RequirementMismatch)?;
+        .map_err(|_| KernelError::RequirementMismatch)?;
     let l = region.extents[left];
     let r = zero.extents[right];
     if l.start != r.start {
@@ -508,7 +506,7 @@ pub(super) fn input_padding(
     let end = l.physical_end.min(r.physical_end).min(
         l.start
             .checked_add(inner)
-            .ok_or(KernelAbiError::ElementCountOverflow)?,
+            .ok_or(KernelError::ElementCountOverflow)?,
     );
     if start >= end {
         return Ok(PaddingRequirement::Required);

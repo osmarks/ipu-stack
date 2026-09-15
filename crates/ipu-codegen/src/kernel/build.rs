@@ -19,7 +19,7 @@ pub struct KernelBuildPlan {
 impl KernelBuildPlan {
     /// Collect resolved implementation keys; only GEMM needs additional grouping
     /// to share worker objects across row-count variants.
-    pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelAbiError> {
+    pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelError> {
         let implementations = program
             .body
             .walk()
@@ -40,7 +40,7 @@ impl KernelBuildPlan {
 
     pub(super) fn from_implementations(
         implementations: BTreeSet<KernelImplementation>,
-    ) -> Result<Self, KernelAbiError> {
+    ) -> Result<Self, KernelError> {
         let exact_symbols = implementations
             .iter()
             .filter_map(|key| match key {
@@ -136,14 +136,14 @@ impl KernelBuildPlan {
     pub(super) fn symbol<'a>(
         &'a self,
         implementation: &KernelImplementation,
-    ) -> Result<&'a str, KernelAbiError> {
+    ) -> Result<&'a str, KernelError> {
         match implementation {
             KernelImplementation::Exact(symbol) => Ok(symbol),
             _ => self
                 .symbols
                 .get(implementation)
                 .map(String::as_str)
-                .ok_or(KernelAbiError::RequirementMismatch),
+                .ok_or(KernelError::RequirementMismatch),
         }
     }
 

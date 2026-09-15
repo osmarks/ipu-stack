@@ -549,14 +549,18 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    run.requirements.outputs[0].storage.alignment,
+                    run.accesses(&shards)
+                        .find(|(id, _)| *id == output)
+                        .unwrap()
+                        .1
+                        .alignment,
                     if donated { CAST_PREFIX_BYTES } else { 8 }
                 );
             }
             assert_eq!(
                 metadata.len(),
-                2,
-                "ordinary and donated casts need distinct cached contracts"
+                1,
+                "storage changes must not duplicate format metadata"
             );
             let mut written = 0;
             for run in low

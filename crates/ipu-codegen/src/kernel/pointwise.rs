@@ -15,7 +15,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     check_arity(
         inputs,
         outputs,
@@ -30,7 +30,7 @@ pub(super) fn call(
     if let Some(mut arguments) = fp8_arguments(kernel, inputs, output)? {
         let symbol = if *kernel == MidOperationKind::BiasGelu {
             if inputs[1].count()? != inputs[0].matrix_extent(true, true)? {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             "bias_gelu_f8"
         } else {
@@ -47,11 +47,11 @@ pub(super) fn call(
                 || output.format.precision != Precision::F16
                 || inputs[0].format.layout != output.format.layout
             {
-                return Err(KernelAbiError::Unavailable(kernel.clone()));
+                return Err(KernelError::Unavailable(kernel.clone()));
             }
             let symbol = "gelu_tanh_approx_f16";
             if !count.is_multiple_of(2) {
-                return Err(KernelAbiError::UnsupportedElementCount {
+                return Err(KernelError::UnsupportedElementCount {
                     symbol,
                     count,
                     divisor: 2,
@@ -62,7 +62,7 @@ pub(super) fn call(
         MidOperationKind::BiasGelu => {
             let width = f16_row_width(kernel, inputs, output)?;
             if inputs[0].extents != output.extents || inputs[1].count()? != width {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             Ok(KernelCall::exact(
                 "bias_gelu_f16",
@@ -71,11 +71,11 @@ pub(super) fn call(
         }
         MidOperationKind::Add => {
             if output.format.precision != Precision::F16 {
-                return Err(KernelAbiError::Unavailable(kernel.clone()));
+                return Err(KernelError::Unavailable(kernel.clone()));
             }
             for &input in inputs {
                 if input.extents.len() > output.extents.len() {
-                    return Err(KernelAbiError::RequirementMismatch);
+                    return Err(KernelError::RequirementMismatch);
                 }
                 let mut suffix = false;
                 for (n, m) in input.widths().zip(
@@ -86,7 +86,7 @@ pub(super) fn call(
                     suffix |= n != 1;
                     // The codelet repeats a contiguous suffix, not arbitrary strides.
                     if (suffix && n != m) || n == 0 {
-                        return Err(KernelAbiError::RequirementMismatch);
+                        return Err(KernelError::RequirementMismatch);
                     }
                 }
             }
@@ -95,7 +95,7 @@ pub(super) fn call(
                 vec![count, inputs[0].count()?, inputs[1].count()?],
             ))
         }
-        _ => Err(KernelAbiError::RequirementMismatch),
+        _ => Err(KernelError::RequirementMismatch),
     }
 }
 

@@ -236,7 +236,7 @@ mod tests {
     use crate::kernel::{GemmKernelMode, GemmWeightLoad};
     use crate::mid::{MidInput, MidValueId};
     use crate::tensor::{AmpOrder, ElementOrder, Layout, ShardExtent, TensorTiling};
-    use crate::{AccumulationPrecision, KernelAccess, KernelRequirements, TensorType};
+    use crate::{AccumulationPrecision, KernelRequirements, TensorType};
 
     fn fixture() -> TileGraph {
         let tensor_type = TensorType::new(
@@ -264,11 +264,8 @@ mod tests {
         };
         let run = |kernel, inputs: Vec<ShardView>, output| {
             let requirements = KernelRequirements {
-                inputs: inputs
-                    .iter()
-                    .map(|_| KernelAccess::new(tensor_type.format.clone(), 8))
-                    .collect(),
-                outputs: vec![KernelAccess::new(tensor_type.format.clone(), 8)],
+                inputs: inputs.iter().map(|_| tensor_type.format.clone()).collect(),
+                outputs: vec![tensor_type.format.clone()],
                 distinct_elements: Vec::new(),
             };
             KernelRun::new(
@@ -460,10 +457,9 @@ mod tests {
             from: Precision::F16,
             to: Precision::F8F143 { scale_exponent: -4 },
         };
-        metadata.requirements.outputs[0].format.layout.order = ElementOrder::Amp(AmpOrder::Left);
-        metadata.requirements.outputs[0].format.precision =
-            Precision::F8F143 { scale_exponent: -4 };
-        graph.shards[2].tensor_type.format = metadata.requirements.outputs[0].format.clone();
+        metadata.requirements.outputs[0].layout.order = ElementOrder::Amp(AmpOrder::Left);
+        metadata.requirements.outputs[0].precision = Precision::F8F143 { scale_exponent: -4 };
+        graph.shards[2].tensor_type.format = metadata.requirements.outputs[0].clone();
         for case in 0..15 {
             let mut program = baseline.clone();
             let graph = &mut program;

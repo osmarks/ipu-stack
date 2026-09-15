@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 impl crate::mid::MidOperationKind {
     /// Address requirements for one operand and the family’s distinct-element
-    /// group. Binding applies this same contract when interning and constructing
-    /// metadata; shifted storage affects the cast contract, not the allocator.
+    /// group. Storage consumers evaluate the contract against the current output;
+    /// shifted storage affects the cast contract, not the allocator.
     pub(super) fn access(
         &self,
         operand: MemoryOperand,
@@ -64,7 +64,7 @@ impl KernelCall {
         kernel: &crate::mid::MidOperationKind,
         inputs: &[TensorStorage<'_>],
         outputs: &[TensorStorage<'_>],
-    ) -> Result<Self, KernelAbiError> {
+    ) -> Result<Self, KernelError> {
         use crate::mid::MidOperationKind::*;
         match kernel {
             Gemm { .. } => gemm::call(kernel, inputs, outputs),
@@ -81,7 +81,7 @@ impl KernelCall {
             Rearrange { .. } => rearrange::call(kernel, inputs, outputs),
             ReductionSum { .. } => reduce::call(kernel, inputs, outputs),
             FillZero { .. } => copy::fill_call(kernel, inputs, outputs),
-            _ => Err(KernelAbiError::RequirementMismatch),
+            _ => Err(KernelError::RequirementMismatch),
         }
     }
 
@@ -169,7 +169,7 @@ pub fn materialize_kernel_run(
     let resolve = |operand: MemoryOperand| -> Result<TileAddress, KernelError> {
         let view = run
             .operand_view(operand)
-            .ok_or(KernelAbiError::RequirementMismatch)?;
+            .ok_or(KernelError::RequirementMismatch)?;
         let offset = view_offset(run, operand, shards)?;
         Ok(crate::low::storage::resolve_address(
             shards,

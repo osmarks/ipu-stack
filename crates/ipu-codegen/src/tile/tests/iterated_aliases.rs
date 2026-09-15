@@ -155,19 +155,10 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
 }
 
 #[test]
-fn repeat_pointers_use_complete_placed_access_requirements() {
+fn repeat_pointers_use_placed_sequence_strides() {
     let (low, _) = iterated_sum(2);
     for count in [1, 2] {
         let mut graph = (*low.program).clone();
-        for run in &mut graph.kernel_runs {
-            for input in &mut std::sync::Arc::make_mut(&mut run.metadata)
-                .requirements
-                .inputs
-            {
-                input.storage.alignment = 64;
-                input.storage.access_tail_bytes = 96;
-            }
-        }
         let BlockOperation::Repeat(repeat) = &mut graph.body.operations[0] else {
             panic!("repeat")
         };
@@ -190,7 +181,7 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
             .unwrap();
             let sequence = &low.repeat_runs[0].binding.iterated[0];
             let stride = placement.sequence_strides[&sequence.argument];
-            assert!(stride >= 256 + 96 && stride.is_multiple_of(64));
+            assert!(stride >= 256 && stride.is_multiple_of(8));
             for (index, shard) in sequence.inputs.iter().enumerate() {
                 assert_eq!(
                     placement.shard_addresses[shard],

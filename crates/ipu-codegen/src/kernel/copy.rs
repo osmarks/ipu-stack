@@ -16,30 +16,12 @@ use ipu_target::ipu21::WORKER_CONTEXTS;
 /// Coarse launch allowance when mid has not selected a local helper yet.
 pub(crate) const WORKER_CALL_CYCLES: u64 = 288;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CopyKernel {
-    U16,
-    U32,
-    U64,
-    StridedU32,
-    StridedU64,
-}
-impl CopyKernel {
-    fn width(self) -> u32 {
-        match self {
-            Self::U16 => 2,
-            Self::U32 | Self::StridedU32 => 4,
-            Self::U64 | Self::StridedU64 => 8,
-        }
-    }
-}
-
 /// A local copy in the executable low graph. The descriptor and helper cannot
 /// be mutated independently: coalescing constructs another checked binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyRun {
     movement: LocalCopy,
-    kernel: CopyKernel,
+    word_bytes: u32,
     access: [StorageAccess; 2],
 }
 
@@ -64,25 +46,22 @@ impl CopyRun {
         if row_bytes == 0 {
             return Err(StorageError::InvalidView);
         }
-        let kernel = if rows != 1 {
-            [CopyKernel::StridedU64, CopyKernel::StridedU32]
-                .into_iter()
-                .find(|kernel| {
-                    let width = kernel.width();
-                    aligned(width)
-                        && row_bytes.is_multiple_of(width)
-                        && source_stride.is_multiple_of(width)
-                        && destination_stride.is_multiple_of(width)
-                })
+        let word_bytes = if rows != 1 {
+            [8, 4].into_iter().find(|&width| {
+                aligned(width)
+                    && row_bytes.is_multiple_of(width)
+                    && source_stride.is_multiple_of(width)
+                    && destination_stride.is_multiple_of(width)
+            })
         } else if aligned(8)
             && movement.bytes >= WORKER_CONTEXTS * 8
             && movement.bytes.is_multiple_of(8)
         {
-            Some(CopyKernel::U64)
+            Some(8)
         } else if aligned(4) && movement.bytes.is_multiple_of(4) {
-            Some(CopyKernel::U32)
+            Some(4)
         } else if aligned(2) && movement.bytes.is_multiple_of(2) {
-            Some(CopyKernel::U16)
+            Some(2)
         } else {
             None
         }
@@ -119,7 +98,7 @@ impl CopyRun {
             }
             // The halfword helper reads/modifies an aligned 32-bit word. Align
             // the base so it needs no prefix; retain any access past a short tail.
-            let alignment = kernel.width().max(4);
+            let alignment = word_bytes.max(4);
             let physical_end = end
                 .checked_next_multiple_of(alignment)
                 .ok_or(StorageError::Overflow)?;
@@ -130,7 +109,7 @@ impl CopyRun {
         }
         Ok(Self {
             movement,
-            kernel,
+            word_bytes,
             access,
         })
     }
@@ -146,17 +125,18 @@ impl CopyRun {
     }
 
     pub(crate) fn symbol(&self) -> &'static str {
-        match self.kernel {
-            CopyKernel::U16 => crate::kernel::copy::COPY_U16_SYMBOL,
-            CopyKernel::U32 => crate::kernel::copy::COPY_U32_SYMBOL,
-            CopyKernel::U64 => crate::kernel::copy::COPY_U64_SYMBOL,
-            CopyKernel::StridedU32 => crate::kernel::copy::COPY_STRIDED_U32_SYMBOL,
-            CopyKernel::StridedU64 => crate::kernel::copy::COPY_STRIDED_U64_SYMBOL,
+        match (self.movement.pattern, self.word_bytes) {
+            (CopyPattern::Contiguous, 2) => COPY_U16_SYMBOL,
+            (CopyPattern::Contiguous, 4) => COPY_U32_SYMBOL,
+            (CopyPattern::Contiguous, 8) => COPY_U64_SYMBOL,
+            (CopyPattern::Strided { .. }, 4) => COPY_STRIDED_U32_SYMBOL,
+            (CopyPattern::Strided { .. }, 8) => COPY_STRIDED_U64_SYMBOL,
+            _ => unreachable!("copy binding selected an unsupported word width"),
         }
     }
 
     pub(crate) fn call(&self) -> KernelCall {
-        let words = self.movement.bytes / self.kernel.width();
+        let words = self.movement.bytes / self.word_bytes;
         let arguments = match self.movement.pattern {
             CopyPattern::Strided {
                 rows,
@@ -164,12 +144,12 @@ impl CopyRun {
                 source_stride,
                 destination_stride,
             } => vec![
-                row_bytes / self.kernel.width(),
+                row_bytes / self.word_bytes,
                 rows,
                 source_stride,
                 destination_stride,
             ],
-            CopyPattern::Contiguous if self.kernel == CopyKernel::U64 => {
+            CopyPattern::Contiguous if self.word_bytes == 8 => {
                 return KernelCall::copy_u64(words);
             }
             CopyPattern::Contiguous => vec![words],
@@ -222,13 +202,13 @@ pub(super) fn fill_call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 0, 1)?;
     let MidOperationKind::FillZero { bytes, .. } = *kernel else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     if !bytes.is_multiple_of(8) {
-        return Err(KernelAbiError::UnsupportedElementCount {
+        return Err(KernelError::UnsupportedElementCount {
             symbol: crate::kernel::copy::FILL_ZERO_U64_SYMBOL,
             count: bytes,
             divisor: 8,

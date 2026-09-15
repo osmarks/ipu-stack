@@ -3,9 +3,8 @@ use crate::estimate::Ipu21CostModel;
 use crate::mid::MidOperationKind;
 use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, ComputeGraph, KernelAccess, KernelRequirements, Layout, MemoryClass,
-    PipelineConfig, ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason,
-    lower_to_tiles,
+    AccumulationPrecision, ComputeGraph, KernelRequirements, Layout, MemoryClass, PipelineConfig,
+    ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower_to_tiles,
 };
 
 #[test]
@@ -72,7 +71,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
     for run in &low.kernel_runs {
         if matches!(run.kernel, MidOperationKind::Add) {
             assert_eq!(
-                run.requirements.outputs[0].format.layout.order,
+                run.requirements.outputs[0].layout.order,
                 ElementOrder::Amp(AmpOrder::Left)
             );
             packed_adds += 1;
@@ -121,11 +120,11 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                 MidOperationKind::Cast { to, .. } if to == fp8 => {
                     casts += 1;
                     assert_eq!(
-                        run.requirements.inputs[0].format.layout.order,
-                        run.requirements.outputs[0].format.layout.order
+                        run.requirements.inputs[0].layout.order,
+                        run.requirements.outputs[0].layout.order
                     );
                     assert_ne!(
-                        run.requirements.outputs[0].format.layout.order,
+                        run.requirements.outputs[0].layout.order,
                         ElementOrder::RowMajor
                     );
                     let abi = run.call().unwrap();
@@ -139,7 +138,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     gemms += 1;
                     assert_eq!(multiply, fp8);
                     assert_eq!(accumulate, AccumulationPrecision::F16);
-                    assert_eq!(run.requirements.outputs[0].format.precision, Precision::F16);
+                    assert_eq!(run.requirements.outputs[0].precision, Precision::F16);
                     assert_eq!(run.call().unwrap().arguments, vec![(-8i32) as u32]);
                     let mut rescaled = run.clone();
                     let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
@@ -147,7 +146,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         *multiply = Precision::F8F143 { scale_exponent: 1 };
                     }
                     for input in &mut metadata.requirements.inputs {
-                        input.format.precision = Precision::F8F143 { scale_exponent: 1 };
+                        input.precision = Precision::F8F143 { scale_exponent: 1 };
                     }
                     assert_eq!(
                         run.call().unwrap().implementation,
@@ -221,7 +220,7 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
             }],
             KernelRequirements {
                 inputs: Vec::new(),
-                outputs: vec![KernelAccess::new(format, 8)],
+                outputs: vec![format],
                 distinct_elements: Vec::new(),
             },
         );
@@ -595,7 +594,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         }],
         KernelRequirements {
             inputs: Vec::new(),
-            outputs: vec![KernelAccess::new(tensor_type.format, 8)],
+            outputs: vec![tensor_type.format],
             distinct_elements: Vec::new(),
         },
     );
@@ -674,11 +673,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
                         .is_multiple_of(16)
                 );
                 assert_eq!(
-                    run.requirements.outputs[0]
-                        .format
-                        .layout
-                        .order
-                        .gemm_output_group(),
+                    run.requirements.outputs[0].layout.order.gemm_output_group(),
                     Some(64)
                 );
                 let step =
@@ -688,7 +683,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
                 let source = &low.shards[run.outputs[0].shard.index() as usize];
                 assert_eq!(
                     source.tensor_type.format.layout.order,
-                    run.requirements.outputs[0].format.layout.order
+                    run.requirements.outputs[0].layout.order
                 );
             }
             assert!(products > 0);
@@ -730,8 +725,8 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
             vec![view(0)],
             vec![view(1)],
             KernelRequirements {
-                inputs: vec![KernelAccess::new(format(Precision::F32), 8)],
-                outputs: vec![KernelAccess::new(format(Precision::F16), 8)],
+                inputs: vec![format(Precision::F32)],
+                outputs: vec![format(Precision::F16)],
                 distinct_elements: Vec::new(),
             },
         );
@@ -844,8 +839,8 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
         ),
     ] {
         let requirements = KernelRequirements {
-            inputs: vec![KernelAccess::new(format.clone(), 8); inputs],
-            outputs: vec![KernelAccess::new(format.clone(), 8)],
+            inputs: vec![format.clone(); inputs],
+            outputs: vec![format.clone()],
             distinct_elements: vec![],
         };
         let view = ShardView {
@@ -868,7 +863,7 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
             vec![view],
             requirements,
         );
-        assert_eq!(run.call(), Err(KernelAbiError::Unavailable(kernel)));
+        assert_eq!(run.call(), Err(KernelError::Unavailable(kernel)));
     }
 }
 
@@ -902,15 +897,15 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
         vec![view(0, [1, 2]), view(1, [1, 2])],
         vec![view(2, [1, 2])],
         KernelRequirements {
-            inputs: vec![KernelAccess::new(format.clone(), 8); 2],
-            outputs: vec![KernelAccess::new(format, 8)],
+            inputs: vec![format.clone(); 2],
+            outputs: vec![format],
             distinct_elements: vec![],
         },
     );
     run.call().unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
     run.inputs[1] = view(1, [2, (1 << 31) + 1]);
-    assert_eq!(run.call(), Err(KernelAbiError::ElementCountOverflow));
+    assert_eq!(run.call(), Err(KernelError::ElementCountOverflow));
 }
 
 #[test]
@@ -994,9 +989,7 @@ fn binding_checks_backing_strides_before_placement() {
             &incompatible,
             &mut Vec::new(),
         ),
-        Err(KernelError::Abi(KernelAbiError::Unavailable(
-            MidOperationKind::Gelu
-        )))
+        Err(KernelError::Unavailable(MidOperationKind::Gelu))
     ));
 }
 #[test]

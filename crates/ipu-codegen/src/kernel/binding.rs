@@ -9,22 +9,22 @@ use std::sync::Arc;
 
 // Kernel-specific arithmetic on address-free local storage geometry.
 impl TensorStorage<'_> {
-    pub(super) fn logical_elements(self) -> Result<u32, KernelAbiError> {
+    pub(super) fn logical_elements(self) -> Result<u32, KernelError> {
         self.extents.iter().try_fold(1u32, |count, extent| {
             count
                 .checked_mul(extent.logical_end - extent.start)
-                .ok_or(KernelAbiError::ElementCountOverflow)
+                .ok_or(KernelError::ElementCountOverflow)
         })
     }
-    pub(super) fn count(self) -> Result<u32, KernelAbiError> {
-        u32::try_from(self.elements()).map_err(|_| KernelAbiError::ElementCountOverflow)
+    pub(super) fn count(self) -> Result<u32, KernelError> {
+        u32::try_from(self.elements()).map_err(|_| KernelError::ElementCountOverflow)
     }
-    pub(super) fn matrix_extent(self, logical: bool, columns: bool) -> Result<u32, KernelAbiError> {
+    pub(super) fn matrix_extent(self, logical: bool, columns: bool) -> Result<u32, KernelError> {
         let axis = self
             .extents
             .len()
             .checked_sub(if columns { 1 } else { 2 })
-            .ok_or(KernelAbiError::RequirementMismatch)?;
+            .ok_or(KernelError::RequirementMismatch)?;
         Ok(if logical {
             self.logical_dimension(axis)
         } else {
@@ -63,34 +63,15 @@ pub enum MemoryOperand {
     Input(u16),
 }
 
-/// Access contract of an actual kernel buffer, without candidate planning policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelAccess {
-    pub format: TensorFormat,
-    pub storage: crate::low::storage::StorageAccess,
-}
-
-impl KernelAccess {
-    pub fn new(format: TensorFormat, alignment: u32) -> Self {
-        Self {
-            format,
-            storage: crate::low::storage::StorageAccess {
-                alignment,
-                access_tail_bytes: 0,
-            },
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRequirements {
-    pub inputs: Vec<KernelAccess>,
-    pub outputs: Vec<KernelAccess>,
+    pub inputs: Vec<TensorFormat>,
+    pub outputs: Vec<TensorFormat>,
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum KernelAbiError {
+pub enum KernelError {
     #[error("kernel requirements do not match the tile-kernel family")]
     RequirementMismatch,
     #[error("FP8 hardware scale {0} is outside -32..=31")]
@@ -109,12 +90,7 @@ pub enum KernelAbiError {
         count: u32,
         divisor: u32,
     },
-}
 
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum KernelError {
-    #[error(transparent)]
-    Abi(#[from] KernelAbiError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -124,6 +100,24 @@ pub enum KernelError {
 }
 
 impl KernelRun {
+    pub(crate) fn accesses<'a>(
+        &'a self,
+        shards: &'a [BlockValue],
+    ) -> impl Iterator<Item = (crate::BlockValueId, crate::low::storage::StorageAccess)> + 'a {
+        let output = &shards[self.outputs[0].shard.index() as usize];
+        self.inputs
+            .iter()
+            .enumerate()
+            .map(|(i, view)| (MemoryOperand::Input(i as u16), view))
+            .chain(
+                self.outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, view)| (MemoryOperand::Output(i as u16), view)),
+            )
+            .map(move |(operand, view)| (view.shard, self.kernel.access(operand, output).0))
+    }
+
     pub(crate) fn cycles(&self) -> u64 {
         self.call().map_or(u64::MAX, |call| call.cycles())
     }
@@ -140,14 +134,14 @@ impl KernelRun {
             ),
         };
         TensorStorage {
-            format: &access.format,
+            format: access,
             extents: &view.extents,
         }
     }
 
     /// Bind a complete local invocation. The low builder supplies resolved views;
     /// the kernel owner establishes all address-independent call requirements.
-    /// Metadata interning shares formats and access contracts across tile calls.
+    /// Metadata interning shares operand formats and element constraints across tile calls.
     pub(crate) fn bind(
         provenance: WorkProvenance,
         kernel: MidOperationKind,
@@ -156,52 +150,36 @@ impl KernelRun {
         shards: &[BlockValue],
         metadata: &mut Vec<Arc<KernelRunMetadata>>,
     ) -> Result<Self, KernelError> {
-        let output = outputs.first().ok_or(KernelAbiError::RequirementMismatch)?;
+        let output = outputs.first().ok_or(KernelError::RequirementMismatch)?;
         let tile = output.bind(shards)?.shard.tile;
         for view in inputs.iter().chain(&outputs) {
             if view.bind(shards)?.shard.tile != tile {
-                return Err(KernelAbiError::RequirementMismatch.into());
+                return Err(KernelError::RequirementMismatch);
             }
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;
         let output_shard = &shards[output.shard.index() as usize];
-        let operands = || {
-            (0..inputs.len())
-                .map(|index| (MemoryOperand::Input(index as u16), &inputs[index]))
-                .chain(
-                    (0..outputs.len())
-                        .map(|index| (MemoryOperand::Output(index as u16), &outputs[index])),
-                )
-        };
         let shared = metadata.iter().find(|metadata| {
             metadata.provenance == provenance
                 && metadata.kernel == kernel
-                && metadata.requirements.inputs.len() == inputs.len()
-                && metadata.requirements.outputs.len() == outputs.len()
-                && operands()
-                    .zip(
-                        metadata
-                            .requirements
-                            .inputs
-                            .iter()
-                            .chain(&metadata.requirements.outputs),
-                    )
-                    .all(|((operand, view), requirement)| {
-                        *format(view) == requirement.format
-                            && kernel.access(operand, output_shard).0 == requirement.storage
-                    })
+                && metadata
+                    .requirements
+                    .inputs
+                    .iter()
+                    .eq(inputs.iter().map(format))
+                && metadata
+                    .requirements
+                    .outputs
+                    .iter()
+                    .eq(outputs.iter().map(format))
         });
         let shared = if let Some(shared) = shared {
             Arc::clone(shared)
         } else {
-            let mut accesses = operands().map(|(operand, view)| KernelAccess {
-                format: format(view).clone(),
-                storage: kernel.access(operand, output_shard).0,
-            });
             let distinct = kernel.access(MemoryOperand::Output(0), output_shard).1;
             let requirements = KernelRequirements {
-                inputs: accesses.by_ref().take(inputs.len()).collect(),
-                outputs: accesses.collect(),
+                inputs: inputs.iter().map(|view| format(view).clone()).collect(),
+                outputs: outputs.iter().map(|view| format(view).clone()).collect(),
                 distinct_elements: if distinct.is_empty() {
                     Vec::new()
                 } else {
@@ -245,7 +223,7 @@ pub(super) fn view_offset(
 ) -> Result<u32, KernelError> {
     let view = run
         .operand_view(operand)
-        .ok_or(KernelAbiError::RequirementMismatch)?;
+        .ok_or(KernelError::RequirementMismatch)?;
     let bound = view.bind(shards)?;
     let spans = bound.traversal(crate::CopyOrder::Physical)?;
     let packed = operand == MemoryOperand::Output(0) && gemm::packed_output(run, bound.shard)?;
@@ -273,11 +251,11 @@ pub(super) fn view_offset(
     Ok(span.offset)
 }
 
-pub(super) fn fp8_scale_argument(scale: i32) -> Result<u32, KernelAbiError> {
+pub(super) fn fp8_scale_argument(scale: i32) -> Result<u32, KernelError> {
     if (-32..=31).contains(&scale) {
         Ok(u32::from_ne_bytes(scale.to_ne_bytes()))
     } else {
-        Err(KernelAbiError::Fp8Scale(scale))
+        Err(KernelError::Fp8Scale(scale))
     }
 }
 
@@ -319,7 +297,7 @@ impl KernelCall {
 }
 
 impl KernelRun {
-    pub(crate) fn call(&self) -> Result<KernelCall, KernelAbiError> {
+    pub(crate) fn call(&self) -> Result<KernelCall, KernelError> {
         if self.inputs.len() != self.requirements.inputs.len()
             || self.outputs.len() != self.requirements.outputs.len()
             || self
@@ -329,7 +307,7 @@ impl KernelRun {
                 .flatten()
                 .any(|&operand| self.operand_view(operand).is_none())
         {
-            return Err(KernelAbiError::RequirementMismatch);
+            return Err(KernelError::RequirementMismatch);
         }
         let inputs = (0..self.inputs.len())
             .map(|index| self.geometry(MemoryOperand::Input(index as u16)))
@@ -346,15 +324,15 @@ pub(super) fn check_arity(
     outputs: &[TensorStorage<'_>],
     expected_inputs: usize,
     expected_outputs: usize,
-) -> Result<(), KernelAbiError> {
+) -> Result<(), KernelError> {
     if inputs.len() != expected_inputs {
-        return Err(KernelAbiError::PointerArity {
+        return Err(KernelError::PointerArity {
             expected: expected_inputs,
             actual: inputs.len(),
         });
     }
     if outputs.len() != expected_outputs {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     Ok(())
 }
@@ -385,7 +363,7 @@ pub(super) fn fp8_arguments(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     output: TensorStorage<'_>,
-) -> Result<Option<Vec<u32>>, KernelAbiError> {
+) -> Result<Option<Vec<u32>>, KernelError> {
     let Some(capability) = kernel.output_capability(output.format.precision) else {
         return Ok(None);
     };
@@ -412,7 +390,7 @@ pub(super) fn fp8_arguments(
                 || input.format.layout.order != capability.input_order
         })
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let Precision::F8F143 { scale_exponent } = output.format.precision else {
         unreachable!();
@@ -430,9 +408,9 @@ pub(super) fn f16_row_width(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     output: TensorStorage<'_>,
-) -> Result<u32, KernelAbiError> {
+) -> Result<u32, KernelError> {
     if output.format.precision != Precision::F16 {
-        return Err(KernelAbiError::Unavailable(kernel.clone()));
+        return Err(KernelError::Unavailable(kernel.clone()));
     }
     let width = output.matrix_extent(true, true)?;
     if width == 0
@@ -442,7 +420,7 @@ pub(super) fn f16_row_width(
             .iter()
             .any(|input| input.format.precision != Precision::F16)
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     Ok(width)
 }
@@ -458,7 +436,7 @@ impl KernelCall {
         &self,
         run: &KernelRun,
         operand: usize,
-    ) -> Result<PaddingRequirement, KernelAbiError> {
+    ) -> Result<PaddingRequirement, KernelError> {
         if operand != 0 {
             return Ok(PaddingRequirement::Required);
         }

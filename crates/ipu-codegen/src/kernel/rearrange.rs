@@ -26,13 +26,13 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 1, 1)?;
     let MidOperationKind::Rearrange { from, to } = kernel else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     if !supported(from.order, to.order, outputs[0].format.precision) {
-        return Err(KernelAbiError::Unavailable(kernel.clone()));
+        return Err(KernelError::Unavailable(kernel.clone()));
     }
     let rows = outputs[0].matrix_extent(true, false)?;
     let physical_rows = outputs[0].matrix_extent(false, false)?;
@@ -42,7 +42,7 @@ pub(super) fn call(
         .widths()
         .take(inputs[0].extents.len().saturating_sub(2))
         .try_fold(1u32, |count, width| count.checked_mul(width))
-        .ok_or(KernelAbiError::ElementCountOverflow)?;
+        .ok_or(KernelError::ElementCountOverflow)?;
     let unpack = from.order != ElementOrder::RowMajor;
     let geometry = if unpack { inputs[0] } else { outputs[0] };
     let shape = (
@@ -63,7 +63,7 @@ pub(super) fn call(
         vec![
             rows,
             physical_rows,
-            order_index(to.order, false).ok_or(KernelAbiError::RequirementMismatch)?,
+            order_index(to.order, false).ok_or(KernelError::RequirementMismatch)?,
             columns,
             physical_columns,
             matrices,

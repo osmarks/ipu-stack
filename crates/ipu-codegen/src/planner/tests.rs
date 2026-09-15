@@ -130,7 +130,7 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
     let mut applies = 0;
     for run in &low.kernel_runs {
         if matches!(run.kernel, MidOperationKind::LayerNormMoments) {
-            assert_eq!(run.requirements.outputs[0].format.precision, Precision::F32);
+            assert_eq!(run.requirements.outputs[0].precision, Precision::F32);
             run.call().unwrap();
             moments += 1;
         }
@@ -1016,14 +1016,14 @@ fn randomized_single_use_views_compose_into_panel_copies() {
             assert_eq!(run.inputs.len(), run.requirements.inputs.len());
             for (operand, requirement) in run.inputs.iter().zip(&run.requirements.inputs) {
                 assert_eq!(
-                    requirement.format,
+                    *requirement,
                     tiled.shards[operand.shard.index() as usize]
                         .tensor_type
                         .format
                 );
             }
             assert_eq!(
-                run.requirements.outputs[0].format,
+                run.requirements.outputs[0],
                 tiled.shards[run.outputs[0].shard.index() as usize]
                     .tensor_type
                     .format
@@ -1623,7 +1623,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
                 run.kernel,
                 MidOperationKind::AttentionSoftmax { .. }
             ) && matches!(
-                run.requirements.outputs[0].format.precision,
+                run.requirements.outputs[0].precision,
                 Precision::F8F143 { .. }
             )));
             // Quantization precedes query replication on unreplicated V panels.
@@ -1634,10 +1634,10 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
                     to: Precision::F8F143 { .. }
                 }
             ) && matches!(
-                run.requirements.outputs[0].format.layout.order,
+                run.requirements.outputs[0].layout.order,
                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block: 64, .. })
             )
-                && run.requirements.outputs[0].format.layout.tiling.replicas == 1));
+                && run.requirements.outputs[0].layout.tiling.replicas == 1));
         }
     }
 }

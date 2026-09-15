@@ -582,13 +582,8 @@ fn collect_requirements(
                         }
                     }
                 }
-                for (view, requirement) in run
-                    .inputs
-                    .iter()
-                    .zip(&run.requirements.inputs)
-                    .chain(run.outputs.iter().zip(&run.requirements.outputs))
-                {
-                    requirements[view.shard.index() as usize].include(requirement.storage);
+                for (shard, access) in run.accesses(&program.shards) {
+                    requirements[shard.index() as usize].include(access);
                 }
             }
             BlockOperation::Copy { copy, .. } => {

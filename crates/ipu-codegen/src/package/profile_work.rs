@@ -30,7 +30,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let accesses = tensors
                 .iter()
-                .map(|tensor| crate::KernelAccess::new(tensor.format.clone(), 8))
+                .map(|tensor| tensor.format.clone())
                 .collect::<Vec<_>>();
             let run = crate::KernelRun::new(
                 crate::WorkProvenance {
@@ -75,7 +75,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         .iter()
         .map(|e| u64::from(e.physical_end - e.start))
         .product();
-    let precision = run.requirements.outputs[0].format.precision;
+    let precision = run.requirements.outputs[0].precision;
     // Usual allocation alignment permits the ACC/SQACC statistics loops.
     // Small/tail widths use the pair loops; addresses are not available here.
     let statistics_width = run

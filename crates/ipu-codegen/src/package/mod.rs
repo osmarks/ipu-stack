@@ -86,7 +86,7 @@ pub enum PackageBuildError {
     #[error("tile scheduling failed: {0}")]
     Low(#[from] crate::ExpansionError),
     #[error("kernel planning failed: {0}")]
-    Kernel(#[from] crate::KernelAbiError),
+    Kernel(#[from] crate::KernelError),
     #[error("placement failed: {0}")]
     Placement(#[from] crate::PlacementError),
     #[error("exchange lowering failed: {0}")]

@@ -8,33 +8,33 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     let MidOperationKind::ReductionSum { partials } = *kernel else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     check_arity(inputs, outputs, if partials == 1 { 1 } else { 2 }, 1)?;
     if outputs[0].format.precision != Precision::F16 {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let count = outputs[0].count()?;
     if inputs[0].count()? != count {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     if partials == 1 {
         if !count.is_multiple_of(4) {
-            return Err(KernelAbiError::RequirementMismatch);
+            return Err(KernelError::RequirementMismatch);
         }
         return Ok(KernelCall::copy_u64(count / 4));
     }
     if inputs[1].count()?
         != count
             .checked_mul(u32::from(partials.saturating_sub(1)))
-            .ok_or(KernelAbiError::RequirementMismatch)?
+            .ok_or(KernelError::RequirementMismatch)?
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     if partials < 2 || !count.is_multiple_of(8) {
-        return Err(KernelAbiError::UnsupportedElementCount {
+        return Err(KernelError::UnsupportedElementCount {
             symbol: "reduce_sum_f16",
             count,
             divisor: 8,

@@ -33,14 +33,9 @@ pub(in crate::low) fn eliminate_copies(program: &mut crate::low::TileGraph) -> S
                         }
                     }
                 }
-                for (view, requirement) in run
-                    .inputs
-                    .iter()
-                    .zip(&run.requirements.inputs)
-                    .chain(run.outputs.iter().zip(&run.requirements.outputs))
-                {
-                    let root = roots[view.shard.index() as usize];
-                    alignment[root] = alignment[root].max(requirement.storage.alignment);
+                for (shard, access) in run.accesses(&program.shards) {
+                    let root = roots[shard.index() as usize];
+                    alignment[root] = alignment[root].max(access.alignment);
                 }
             }
             BlockOperation::Copy { copy, .. } => {

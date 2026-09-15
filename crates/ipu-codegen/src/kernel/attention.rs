@@ -132,10 +132,10 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
-) -> Result<KernelCall, KernelAbiError> {
+) -> Result<KernelCall, KernelError> {
     let output = outputs
         .first()
-        .ok_or(KernelAbiError::RequirementMismatch)?
+        .ok_or(KernelError::RequirementMismatch)?
         .format
         .precision;
     let (implementation, arguments) = match *kernel {
@@ -146,7 +146,7 @@ pub(super) fn call(
                     .iter()
                     .any(|input| input.format.precision != Precision::F16)
             {
-                return Err(KernelAbiError::Unavailable(kernel.clone()));
+                return Err(KernelError::Unavailable(kernel.clone()));
             }
             (
                 KernelImplementation::Attention(attention_shape(kernel, inputs)?),
@@ -159,7 +159,7 @@ pub(super) fn call(
             padded_key_columns,
         } => {
             let workspaces = softmax_workspace_specs(output, key_columns != padded_key_columns)
-                .ok_or(KernelAbiError::RequirementMismatch)?;
+                .ok_or(KernelError::RequirementMismatch)?;
             check_arity(inputs, outputs, 1, 1 + workspaces.len())?;
             let rows = gemm_rows(outputs[0])?;
             if key_columns == 0
@@ -169,15 +169,14 @@ pub(super) fn call(
                 || outputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
                 || outputs[0].matrix_extent(false, true)? != padded_key_columns
                 || inputs[0].matrix_extent(false, true)? != padded_key_columns
-                || u32::try_from(inputs[0].rows())
-                    .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                || u32::try_from(inputs[0].rows()).map_err(|_| KernelError::ElementCountOverflow)?
                     != rows
                 || workspaces
                     .iter()
                     .zip(&outputs[1..])
                     .any(|(workspace, &geometry)| !workspace.accepts(geometry, rows))
             {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             (
                 KernelImplementation::Softmax(
@@ -204,7 +203,7 @@ pub(super) fn call(
             final_block,
         } => {
             if output != Precision::F32 && !(output == Precision::F16 && final_block) {
-                return Err(KernelAbiError::Unavailable(kernel.clone()));
+                return Err(KernelError::Unavailable(kernel.clone()));
             }
             let previous = output == Precision::F16 && !initial;
             check_arity(inputs, outputs, if previous { 3 } else { 2 }, 1)?;
@@ -212,14 +211,13 @@ pub(super) fn call(
             let accumulator_width = value_dimension
                 .checked_add(2)
                 .and_then(|width| width.div_ceil(16).checked_mul(16))
-                .ok_or(KernelAbiError::ElementCountOverflow)?;
+                .ok_or(KernelError::ElementCountOverflow)?;
             if value_dimension == 0
                 || value_dimension > padded_value_dimension
                 || inputs[0].format.precision != Precision::F16
                 || inputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
                 || inputs[0].matrix_extent(false, true)? != padded_value_dimension
-                || u32::try_from(inputs[0].rows())
-                    .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                || u32::try_from(inputs[0].rows()).map_err(|_| KernelError::ElementCountOverflow)?
                     != rows
                 || outputs[0].format.layout.order != ElementOrder::RowMajor
                 || outputs[0].matrix_extent(false, true)?
@@ -234,10 +232,10 @@ pub(super) fn call(
                         || inputs[2].format.layout.order != ElementOrder::RowMajor
                         || inputs[2].matrix_extent(false, true)? != accumulator_width
                         || u32::try_from(inputs[2].rows())
-                            .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                            .map_err(|_| KernelError::ElementCountOverflow)?
                             != rows))
             {
-                return Err(KernelAbiError::RequirementMismatch);
+                return Err(KernelError::RequirementMismatch);
             }
             // The initial FP16 stage has no previous accumulator. Supply its
             // unused ABI pointer slot here, without a fabricated mid operand.
@@ -251,7 +249,7 @@ pub(super) fn call(
                 arguments,
             )
         }
-        _ => return Err(KernelAbiError::RequirementMismatch),
+        _ => return Err(KernelError::RequirementMismatch),
     };
     Ok(KernelCall {
         implementation,
@@ -272,16 +270,16 @@ pub(crate) struct AttentionKernelShape {
 fn attention_shape<'a>(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'a>],
-) -> Result<AttentionKernelShape, KernelAbiError> {
+) -> Result<AttentionKernelShape, KernelError> {
     let MidOperationKind::FlashAttention {
         options,
         accumulate,
     } = kernel
     else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     if options.causal || *accumulate != AccumulationPrecision::F32 {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let (Some(query), Some(key), Some(value), None) = (
         inputs.first().copied(),
@@ -289,7 +287,7 @@ fn attention_shape<'a>(
         inputs.get(2).copied(),
         inputs.get(3),
     ) else {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     };
     let rank = query.extents.len();
     if rank < 2
@@ -302,13 +300,13 @@ fn attention_shape<'a>(
         || query.dimension(rank - 1) != key.dimension(rank - 1)
         || key.dimension(rank - 2) != value.dimension(rank - 2)
     {
-        return Err(KernelAbiError::RequirementMismatch);
+        return Err(KernelError::RequirementMismatch);
     }
     let matrices = query
         .widths()
         .take(rank - 2)
         .try_fold(1u32, |count, width| count.checked_mul(width))
-        .ok_or(KernelAbiError::ElementCountOverflow)?;
+        .ok_or(KernelError::ElementCountOverflow)?;
     let scale = options
         .scale
         .as_value()
@@ -361,7 +359,7 @@ impl KernelBuildPlan {
     pub(super) fn add_attention(
         &mut self,
         stages: &BTreeSet<KernelImplementation>,
-    ) -> Result<(), KernelAbiError> {
+    ) -> Result<(), KernelError> {
         for key in stages.iter().cloned() {
             let (name, symbol, source, flags) = match key {
                 KernelImplementation::Attention(ref shape) => {
@@ -379,7 +377,7 @@ impl KernelBuildPlan {
                         Precision::F8F143 { scale_exponent } => {
                             format!("{name}_f8_s{scale_exponent}")
                         }
-                        _ => return Err(KernelAbiError::RequirementMismatch),
+                        _ => return Err(KernelError::RequirementMismatch),
                     };
                     let name = symbol.replace('-', "m");
                     let symbol = name.clone();
@@ -393,7 +391,7 @@ impl KernelBuildPlan {
                     ];
                     if let Precision::F8F143 { scale_exponent } = precision {
                         if !padded.is_multiple_of(32) {
-                            return Err(KernelAbiError::RequirementMismatch);
+                            return Err(KernelError::RequirementMismatch);
                         }
                         flags.extend([
                             "-DATTENTION_OUTPUT_F8".into(),
@@ -406,7 +404,7 @@ impl KernelBuildPlan {
                     let suffix = match output {
                         Precision::F16 => "out16",
                         Precision::F32 => "out32",
-                        _ => return Err(KernelAbiError::RequirementMismatch),
+                        _ => return Err(KernelError::RequirementMismatch),
                     };
                     let name = format!("attention_merge_v{values}_p{padded}_{suffix}");
                     let symbol = format!("{name}_f16");
