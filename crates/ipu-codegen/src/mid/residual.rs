@@ -270,7 +270,7 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
 
 #[cfg(test)]
 mod tests {
-    use crate::compile::PipelineConfig;
+    use crate::PipelineConfig;
     use crate::estimate::Ipu21CostModel;
     use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
     use crate::mid::{MidInput, MidProgram};

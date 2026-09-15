@@ -1,7 +1,3 @@
-use crate::compile::{
-    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmPlanConstraint,
-    PipelineConfig,
-};
 use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
 use crate::graph::{
     AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId,
@@ -36,6 +32,10 @@ use crate::tensor::{
     AxisTiling, BlockMajorOrder, ElementOrder, GridOrder, Layout, LayoutError, MemoryClass,
     Padding, Precision, ShardExtent, TensorAxis, TensorFormat, TensorShape, TensorTiling,
     TensorType,
+};
+use crate::{
+    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmPlanConstraint,
+    PipelineConfig,
 };
 use std::collections::{BTreeMap, BTreeSet};
 const RANDOM_CASES: usize = 128;

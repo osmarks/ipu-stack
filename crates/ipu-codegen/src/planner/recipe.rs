@@ -1,5 +1,5 @@
 //! Operator layouts and whole-program optimization settings, separate from mid.
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidProgram;
 use crate::planner::operator::OperatorPlan;

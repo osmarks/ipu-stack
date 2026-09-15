@@ -1,4 +1,4 @@
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
 use crate::mid::{
     CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,

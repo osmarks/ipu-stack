@@ -657,24 +657,18 @@ fn build_tile(
         data: linked.bytes[segment.offset..segment.offset + segment.range.len()].to_vec(),
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }));
-    let mut exchange_rows = BTreeMap::<u32, Vec<u8>>::new();
-    for row in &generated.exchange_rows {
-        let bytes = row
+    segments.extend(generated.exchange_rows.iter().map(|row| {
+        let data = row
             .words
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
-        if exchange_rows.insert(row.address, bytes).is_some() {
-            return Err(invalid(
-                "duplicate exchange-row address in one tile program",
-            ));
+        Segment {
+            address: row.address,
+            memory_size: data.len() as u32,
+            data,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
         }
-    }
-    segments.extend(exchange_rows.into_iter().map(|(address, data)| Segment {
-        address,
-        memory_size: data.len() as u32,
-        data,
-        flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }));
     segments.extend_from_slice(host_segments);
     segments.push(Segment {

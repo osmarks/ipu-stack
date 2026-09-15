@@ -1,5 +1,5 @@
 //! Expand, screen, and place a concrete whole-device program.
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 #[cfg(test)]
 use crate::estimate::Ipu21CostModel;
 use crate::low::{LowProgram, lower_to_tiles};

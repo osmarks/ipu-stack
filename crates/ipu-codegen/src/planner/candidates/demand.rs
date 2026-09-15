@@ -2,7 +2,7 @@
 //! not selected implementations or execution costs. Views and layout-preserving
 //! GELU pass requests upstream; the forward planner prices every alternative.
 
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::graph::{Operation, OperationKind, ValueId};
 use crate::planner::candidates::direct_consumer_layouts;
 use crate::planner::candidates::operator_matches;

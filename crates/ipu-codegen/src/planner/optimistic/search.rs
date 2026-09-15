@@ -1,4 +1,4 @@
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::{Ipu21CostModel, MemoryPeaks, MemoryUsage};
 use crate::graph::{ComputeGraph, GraphInputKind, OperationKind, ValueId};
 use crate::planner::optimistic::ConversionPath;

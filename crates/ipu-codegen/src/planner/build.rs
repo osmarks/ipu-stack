@@ -1,6 +1,6 @@
 //! Deterministic whole-device lowering with explicit, canonical boundaries.
 
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::{CostModel, MemoryPeaks};
 use crate::graph::{
     ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,

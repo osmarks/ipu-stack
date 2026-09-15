@@ -1,5 +1,5 @@
 //! Portable search decisions, without physical addresses or scheduler caches.
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::graph::ComputeGraph;
 use crate::package::{PackageBuildResult, invalid};
 use crate::planner::{Candidate, Recipe};

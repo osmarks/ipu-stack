@@ -1,16 +1,596 @@
-use ipu_target::ipu21::instruction::{
-    SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
-    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
-    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
+//! Compiler driver: search over executable mid candidates, then compile each
+//! through explicit expansion, support sizing, placement and exchange feedback.
+//! The accepted result owns one final placement, schedule, package and cache.
+mod benchmark;
+mod config;
+mod exchange_placement;
+mod screen;
+
+use crate::estimate::Ipu21CostModel;
+use crate::estimate::memory_profile::write as memory_profile;
+use crate::kernel::KernelBuildPlan;
+use crate::low::LowProgram;
+use crate::memory::TileMemoryMap;
+use crate::package::{
+    DiagnosticCheckpoint, PackageBuildResult, active_topology, build_phase, diagnostic_tensor,
+    invalid, package_inputs, package_multiply_precisions, package_precisions, validate_tile_count,
 };
-use ipu_target::ipu21::registers::{
-    INCOMING_BASE, INCOMING_DCOUNT, INCOMING_FORMAT, INCOMING_MUX, INCOMING_MUXPAIR, OUTGOING_BASE,
-};
+use crate::planner::{Candidate, Recipe, build};
+use crate::planner::{checkpoint, proposals};
+use ipu_elf::Toolchain;
+use ipu_target::ipu21::fabric::Topology;
+use rayon::prelude::*;
+use std::{path::PathBuf, sync::Arc};
+
+#[derive(Clone, Debug)]
+pub struct PackageConfig {
+    /// Host-triggered inference calls after a single parameter upload.
+    pub invocations: u32,
+    pub toolchain: Toolchain,
+    pub runtime_source: PathBuf,
+    pub kernel_source_directory: PathBuf,
+    pub pipeline: PipelineConfig,
+    /// Initial bijection from planned tile indices to execution tile indices.
+    /// A supplied map disables automatic ownership-remapping proposals.
+    pub tile_mapping: Option<Vec<u16>>,
+}
+
+struct EvaluatedCandidate {
+    program: LowProgram,
+    placement: crate::Placement,
+    exchanges: crate::exchange::LoweredExchanges,
+    application: ipu_package::Application,
+    support_memory: TileMemoryMap,
+    exchange_code_base: u32,
+    cycles: u64,
+    cache: crate::ExchangeScheduleCache,
+}
+
+/// Compiles and packages a compute graph into a directly loadable IPU21
+/// application.
+#[tracing::instrument(
+    name = "ipu_codegen.package.build",
+    skip(graph, config),
+    fields(tile_count = config.pipeline.tile_count, operations = graph.operations().len())
+)]
+pub fn build_package(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+) -> PackageBuildResult<CompiledPackage> {
+    build_package_with_checkpoints(graph, config, false)
+}
+
+/// Builds an ordinary optimized package with resumable PBRK0 traps after each
+/// top-level operator and returns the storage map needed for non-invasive
+/// numerical inspection.
+pub fn build_diagnostic_package(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+) -> PackageBuildResult<CompiledPackage> {
+    build_package_with_checkpoints(graph, config, true)
+}
+
+fn build_package_with_checkpoints(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+    diagnostic: bool,
+) -> PackageBuildResult<CompiledPackage> {
+    let mut config = config.clone();
+    config.pipeline.diagnostic_checkpoints = diagnostic;
+    if diagnostic {
+        config.pipeline.profiling = false;
+    }
+    let built = compile_graph(graph, &config)?;
+    let low = &built.program;
+    let topology = active_topology(low.tile_count)?;
+    let inputs = package_inputs(low, &built.placement, &topology)?;
+    let outputs = low
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            diagnostic_tensor(
+                low,
+                &built.placement,
+                &topology,
+                *output,
+                Some(format!("output.{index}")),
+            )
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let mut checkpoints = Vec::new();
+    for (source, results) in low.checkpoints.iter().filter(|_| diagnostic) {
+        let source = *source;
+        let tensors = results
+            .iter()
+            .map(|&value| diagnostic_tensor(low, &built.placement, &topology, value, None))
+            .collect::<PackageBuildResult<Vec<_>>>()?;
+        // An elided view has no independently materialized boundary; its
+        // consumer's checkpoint covers the composed mapping instead.
+        if tensors.iter().all(|tensor| tensor.shards.is_empty()) {
+            continue;
+        }
+        for tensor in &tensors {
+            tracing::debug!(
+                operation = source.index(),
+                value = tensor.value.index(),
+                shape = ?tensor.shape.0,
+                precision = ?tensor.precision,
+                shards = tensor.shards.len(),
+                order = ?tensor.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
+                memory_class = ?tensor.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
+                first_extents = ?tensor.shards.first().map(|shard| &shard.storage.extents),
+                "recorded diagnostic tensor"
+            );
+        }
+        checkpoints.push(DiagnosticCheckpoint {
+            operation: source,
+            breakpoint: (checkpoints.len() & 1) as u8,
+            tensors,
+        });
+    }
+    Ok(CompiledPackage {
+        application: built.application,
+        inputs,
+        outputs,
+        checkpoints,
+        precisions: package_precisions(low),
+        multiply_precisions: package_multiply_precisions(low),
+        exchange_phases: built.exchanges.phases,
+        exchange_schedule: built.exchanges.schedule_snapshot,
+        exchange_code_base: built.exchange_code_base,
+    })
+}
+
+fn compile_graph(
+    graph: &ComputeGraph,
+    package: &PackageConfig,
+) -> PackageBuildResult<EvaluatedCandidate> {
+    let config = &package.pipeline;
+    let tile_mapping = package.tile_mapping.as_deref();
+    validate_tile_count(u32::from(config.tile_count))?;
+    let runtime = build_phase("compile_runtime", || {
+        let artifact = package
+            .toolchain
+            .compile(&package.runtime_source, "static_runtime", &[])?;
+        Ok(std::fs::read(artifact.object)?)
+    })?;
+    let selected = build_phase("plan_package", || {
+        let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+        let fragments = crate::planner::cache::FragmentCache::default();
+        let expansions = Arc::new(crate::storage::GeometryCache::default());
+        let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
+        let mut fixed = config.clone();
+        let resuming = config.load_search_state.is_some();
+        if resuming {
+            fixed.inputs = state.inputs.clone();
+        }
+        let mut incumbent =
+            build::build_candidate(graph, &fixed, &costs, &fragments, &state.recipe)?;
+        if resuming {
+            incumbent.alternatives = state.alternatives.clone();
+        }
+        memory_profile(graph, config, &incumbent.program, "baseline")?;
+        let mut selected = evaluate_candidate(
+            &incumbent.program,
+            package,
+            Arc::clone(&expansions),
+            crate::ExchangeScheduleCache::default(),
+            &runtime,
+        )?;
+        tracing::info!(
+            cycles = selected.cycles,
+            resuming,
+            "validated search incumbent"
+        );
+        let budget_end = state
+            .attempts
+            .checked_add(config.optimization_steps)
+            .ok_or_else(|| invalid("search step budget overflow"))?;
+        // Fix logical homes once, including on a baseline-only checkpoint.
+        for (input, planned) in graph.inputs().iter().zip(&incumbent.program.inputs) {
+            fixed.inputs.insert(
+                input.value,
+                incumbent.program.values[planned.value.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone(),
+            );
+        }
+        state.save(config, &incumbent, &fixed)?;
+        while state.attempts < budget_end {
+            let traffic = if tile_mapping.is_none() {
+                crate::exchange::MappingTraffic::new(&selected.program, &selected.placement)
+                    .map_err(
+                        |error| tracing::info!(%error, "could not estimate ownership proposals"),
+                    )
+                    .ok()
+            } else {
+                None
+            };
+            let proposed = proposals(graph, config, &incumbent, traffic.as_ref());
+            let proposed_count = proposed.len();
+            let screened = proposed
+                .into_par_iter()
+                .enumerate()
+                .filter(|(_, proposal)| !state.visited.contains(&proposal.recipe))
+                .map(|(proposal, proposed)| {
+                    let recipe = proposed.recipe;
+                    let span =
+                        tracing::debug_span!("local_screen", round = state.attempts, proposal);
+                    let _entered = span.enter();
+                    let candidate =
+                        build::build_candidate(graph, &fixed, &costs, &fragments, &recipe);
+                    let candidate = match candidate {
+                        Ok(candidate) => {
+                            let visited = state.visited.contains(&candidate.recipe);
+                            let estimate = proposed
+                                .estimated_cycles
+                                .unwrap_or(candidate.program.estimated_cycles);
+                            let keep = !visited && estimate < incumbent.program.estimated_cycles;
+                            tracing::debug!(
+                                incumbent_estimate = incumbent.program.estimated_cycles,
+                                candidate_estimate = estimate,
+                                visited, keep, delta = ?candidate.recipe.changes(&incumbent.recipe),
+                                "screened local recipe"
+                            );
+                            if keep {
+                                Ok((candidate, estimate))
+                            } else if visited {
+                                Err(Skipped::Visited)
+                            } else {
+                                Err(Skipped::NotCheaper)
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "discarded invalid local recipe");
+                            Err(Skipped::Invalid)
+                        }
+                    };
+                    (proposal, recipe, candidate)
+                })
+                .collect::<Vec<_>>();
+            let mut visited = proposed_count - screened.len();
+            let mut invalid = 0;
+            let mut not_cheaper = 0;
+            let mut deduplicated = 0;
+            let mut pending: Vec<ShortlistedCandidate> = Vec::new();
+            for (proposal, raw, result) in screened {
+                let (candidate, estimate) = match result {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        match reason {
+                            Skipped::Invalid => invalid += 1,
+                            Skipped::NotCheaper => not_cheaper += 1,
+                            Skipped::Visited => {
+                                visited += 1;
+                                if !state.visited.contains(&raw) {
+                                    state.visited.push(raw);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if let Some(same) = pending
+                    .iter_mut()
+                    .find(|old| old.baseline.program == candidate.program)
+                {
+                    same.estimated_cycles = same.estimated_cycles.min(estimate);
+                    same.recipes.extend([raw, candidate.recipe]);
+                    deduplicated += 1;
+                } else {
+                    let recipes = vec![raw, candidate.recipe.clone()];
+                    pending.push(ShortlistedCandidate {
+                        proposal,
+                        estimated_cycles: estimate,
+                        baseline: candidate,
+                        recipes,
+                    });
+                }
+            }
+            pending.sort_by_key(|candidate| candidate.estimated_cycles);
+            let truncated = pending.len().saturating_sub(budget_end - state.attempts);
+            pending.truncate(budget_end - state.attempts);
+            tracing::info!(
+                round = state.attempts,
+                proposed = proposed_count,
+                invalid,
+                visited,
+                not_cheaper,
+                deduplicated,
+                truncated,
+                shortlisted = pending.len(),
+                "screened local search round"
+            );
+            if pending.is_empty() {
+                state.save(config, &incumbent, &fixed)?;
+                break;
+            }
+            for (index, candidate) in pending.iter().enumerate() {
+                let scope = format!("local-{}-candidate-{index}", state.attempts);
+                if let Err(error) =
+                    memory_profile(graph, &fixed, &candidate.baseline.program, &scope)
+                {
+                    tracing::warn!(%error, scope, "skipped candidate memory profile");
+                }
+            }
+            tracing::info!(
+                candidates = pending.len(),
+                threads = rayon::current_num_threads(),
+                "evaluating ordered local candidates concurrently"
+            );
+            // One Rayon pool serves both candidate builds and their internal work.
+            // find_first cancels unstarted later work once the earliest improvement
+            // is known. Each speculative build owns its schedule-cache snapshot;
+            // only the selected cache becomes the next incumbent's cache.
+            let winner = pending
+                .par_iter()
+                .enumerate()
+                .map(|(index, candidate)| {
+                    let attempt = state.attempts + index;
+                    let span = tracing::info_span!(
+                        "local_candidate",
+                        attempt,
+                        proposal = candidate.proposal
+                    );
+                    let _entered = span.enter();
+                    let result = evaluate_candidate(
+                        &candidate.baseline.program,
+                        package,
+                        Arc::clone(&expansions),
+                        selected.cache.clone(),
+                        &runtime,
+                    );
+                    match result {
+                        Ok(plan) if plan.cycles < selected.cycles => Some((index, plan)),
+                        Ok(plan) => {
+                            let candidate_cycles = plan.cycles;
+                            tracing::info!(
+                                candidate_cycles,
+                                cycles = selected.cycles,
+                                "retained faster incumbent"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            tracing::info!(%error, "retained feasible incumbent");
+                            None
+                        }
+                    }
+                })
+                .find_first(Option::is_some)
+                .flatten();
+            let Some((index, plan)) = winner else {
+                state.attempts += pending.len();
+                remember(&mut state.visited, pending.iter());
+                state.save(config, &incumbent, &fixed)?;
+                // All shortlisted programs failed. A truncated tail is available
+                // on resume; otherwise the unchanged incumbent has no new proposals.
+                break;
+            };
+            let candidate_cycles = plan.cycles;
+            remember(&mut state.visited, pending[..=index].iter());
+            let mut candidate = pending.swap_remove(index).baseline;
+            tracing::info!(
+                attempt = state.attempts + index,
+                before = selected.cycles,
+                after = candidate_cycles,
+                delta = ?candidate.recipe.changes(&incumbent.recipe),
+                "accepted local layout improvement"
+            );
+            state.attempts += index + 1;
+            for (id, alternatives) in incumbent.alternatives {
+                candidate.alternatives.entry(id).or_insert(alternatives);
+            }
+            incumbent = candidate;
+            selected = plan;
+            state.save(config, &incumbent, &fixed)?;
+        }
+        Ok(selected)
+    })?;
+    if let Some(directory) = &config.memory_profile_directory {
+        crate::place::profile::write(
+            directory,
+            &selected.program,
+            &selected.placement,
+            &selected.support_memory,
+            &selected.application,
+        )?;
+    }
+    Ok(selected)
+}
+
+enum Skipped {
+    Invalid,
+    Visited,
+    NotCheaper,
+}
+
+/// All recipes lowering to one program travel together until validation. Do not
+/// mark aliases of a truncated or cancelled candidate as visited.
+struct ShortlistedCandidate {
+    proposal: usize,
+    estimated_cycles: u64,
+    baseline: Candidate,
+    recipes: Vec<Recipe>,
+}
+
+fn remember<'a>(
+    visited: &mut Vec<Recipe>,
+    candidates: impl IntoIterator<Item = &'a ShortlistedCandidate>,
+) {
+    for recipe in candidates
+        .into_iter()
+        .flat_map(|candidate| &candidate.recipes)
+    {
+        if !visited.contains(recipe) {
+            visited.push(recipe.clone());
+        }
+    }
+}
+
+/// Compile one complete candidate. Provisional addresses are local to sizing;
+/// only the final placement, exchanges and package escape this procedure.
+fn evaluate_candidate(
+    mid: &crate::MidProgram,
+    package: &PackageConfig,
+    expansions: Arc<crate::storage::GeometryCache>,
+    mut cache: crate::ExchangeScheduleCache,
+    runtime: &[u8],
+) -> PackageBuildResult<EvaluatedCandidate> {
+    let config = &package.pipeline;
+    let (program, _) = screen::expand_and_screen(mid, config, expansions)?;
+    let provisional_placement = build_phase("place_provisional_storage", || {
+        Ok(crate::place::place(&program)?)
+    })?;
+    let topology = active_topology(program.tile_count)?;
+    let provisional_exchanges = build_phase("schedule_provisional_exchanges", || {
+        Ok(crate::exchange::lower_exchanges_cached(
+            &program,
+            &provisional_placement,
+            &topology,
+            config.exchange_stream_words,
+            false,
+            &mut cache,
+        )?)
+    })?;
+    let kernel_plan = build_phase("plan_kernels", || {
+        Ok(KernelBuildPlan::from_program(&program)?)
+    })?;
+    let objects = build_phase("compile_kernels", || {
+        let mut objects = vec![runtime.to_vec()];
+        for compilation in &kernel_plan.compilations {
+            let artifact = package.toolchain.compile(
+                package.kernel_source_directory.join(compilation.source),
+                &compilation.name,
+                &compilation.flags,
+            )?;
+            objects.push(std::fs::read(&artifact.object)?);
+        }
+        Ok(objects)
+    })?;
+    let support = package::size_support(
+        &program,
+        &provisional_placement,
+        &provisional_exchanges.phases,
+        config,
+        objects,
+        kernel_plan,
+        package.invocations,
+    )?;
+    drop(provisional_exchanges);
+    drop(provisional_placement);
+    let mut placement = build_phase("place_storage", || {
+        Ok(crate::place::place_with_auxiliary(
+            &program,
+            &support.available_ranges,
+            0,
+            &support.profile_requests,
+        )?)
+    })?;
+    let mut exchanges = build_phase("lower_exchanges", || {
+        Ok(crate::exchange::lower_exchanges_cached(
+            &program,
+            &placement,
+            &topology,
+            config.exchange_stream_words,
+            config.exchange_diagnostics,
+            &mut cache,
+        )?)
+    })?;
+    build_phase("optimize_exchange_placement", || {
+        if let Some(proposal) = exchange_placement::propose_exchange_placement(
+            &program,
+            &support.available_ranges,
+            &support.profile_requests,
+            &placement,
+        )? {
+            // A failed/slower alternative cannot contaminate the accepted cache.
+            let mut alternative_cache = cache.clone();
+            match crate::exchange::lower_exchanges_cached(
+                &program,
+                &proposal.placement,
+                &topology,
+                config.exchange_stream_words,
+                false,
+                &mut alternative_cache,
+            ) {
+                Ok(alternative) => {
+                    let baseline_cycles =
+                        exchange_placement::exchange_cycles(&program, &exchanges.phases);
+                    let candidate_cycles =
+                        exchange_placement::exchange_cycles(&program, &alternative.phases);
+                    let row_bytes = crate::tile::compact_exchange_table_bytes(
+                        &alternative.phases,
+                        u16::try_from(Topology::c600().tile_count())?,
+                        program.tile_count,
+                    )?;
+                    let row_capacity = support.exchange_row_capacity();
+                    let accepted = candidate_cycles < baseline_cycles && row_bytes <= row_capacity;
+                    tracing::info!(offset = proposal.offset, baseline_score = %proposal.baseline_score,
+                        score = %proposal.score, baseline_cycles, candidate_cycles, row_bytes,
+                        row_capacity, accepted, "evaluated exchange placement candidate");
+                    if accepted {
+                        placement = proposal.placement;
+                        exchanges = alternative;
+                        cache = alternative_cache;
+                    }
+                }
+                Err(error) => tracing::info!(offset = proposal.offset, %error,
+                    "rejected unschedulable exchange placement"),
+            }
+        }
+        Ok(())
+    })?;
+    let final_cost =
+        crate::estimate::scheduled_program_cycles(&program.program, &exchanges.phases)?;
+    tracing::info!(
+        final_cycles = final_cost.total,
+        final_exchange = final_cost.exchange,
+        "costed final placed program"
+    );
+    let application = package::emit_package(
+        &program,
+        &placement,
+        &exchanges.phases,
+        &support,
+        config,
+        package.invocations,
+    )?;
+    Ok(EvaluatedCandidate {
+        program,
+        placement,
+        exchanges,
+        application,
+        support_memory: support.memory,
+        exchange_code_base: support.exchange_code_base,
+        cycles: final_cost.total,
+        cache,
+    })
+}
+
+/// Capture address-resolved ordinary transfers before scheduling or linking.
+/// Capture the canonical baseline; failed placements remain errors.
+pub fn capture_exchange_baseline(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
+    let planning = &config.pipeline;
+    validate_tile_count(u32::from(planning.tile_count))?;
+    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+    let mut mid = crate::planner::build_baseline(graph, planning, &costs)?;
+    if let Some(mapping) = &config.tile_mapping {
+        mid.remap_tiles(mapping)?;
+    }
+    let (low, placement, _) = screen::expand_and_place(&mid, planning)?;
+    Ok(crate::exchange::capture_exchange_schedule(
+        &low, &placement,
+    )?)
+}
+
 pub mod f143;
 pub mod runtime_layout;
-
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 mod estimate;
 pub use estimate::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
@@ -22,21 +602,14 @@ mod low;
 mod memory;
 mod mid;
 pub use planner::optimistic;
-mod compile;
 mod package;
 mod place;
 mod planner;
 mod storage;
 mod tensor;
 mod tile;
-pub use compile::{
-    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking,
-    GemmPlanConstraint, PipelineConfig,
-};
-pub use compile::{
-    ExpansionBenchmark, ExpansionTiming, PackageConfig, benchmark_mid_expansion,
-    build_diagnostic_package, build_package, capture_exchange_baseline,
-};
+pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
+pub use config::*;
 pub(crate) use exchange::*;
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
@@ -63,6 +636,7 @@ pub use package::{
 };
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
+pub use supervisor::*;
 // Compatibility name for planner choices; this is not an executable mid node.
 pub use planner::OperatorFamily as MidOperator;
 pub use planner::{GemmOrientation, LocalOperandStaging, OperatorCandidate};
@@ -75,1314 +649,6 @@ pub use tensor::{
 };
 pub(crate) use tile::*;
 
-// Recovered primitive PIC/XPIC plans arm A6 with one; their payload length is
-// encoded in the timed instructions rather than this external-stream counter.
-// Consolidated phases currently preserve that primitive-plan setting.
-const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
-const LAST_VALUE_REGISTER: u8 = 9;
-
-pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
-pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
-pub const COMPLETED_SYMBOL: &str = "ipu_stack_static_completed";
-pub const HOST_RUN_SYMBOL: &str = "ipu_stack_static_host_run";
-pub const REPEAT_CALL_SYMBOL: &str = "ipu_stack_static_repeat_call";
-pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
-pub const COPY_U16_SYMBOL: &str = "static_copy_u16";
-pub const COPY_U32_SYMBOL: &str = "static_copy_u32";
-pub const COPY_U64_SYMBOL: &str = "copy_u64";
-pub const COPY_STRIDED_U32_SYMBOL: &str = "copy_strided_u32";
-pub const COPY_STRIDED_U64_SYMBOL: &str = "copy_strided_u64";
-pub const FILL_ZERO_U64_SYMBOL: &str = "fill_zero_u64";
-pub const PATCH_REPEAT_TABLES_SYMBOL: &str = "static_patch_repeat_tables";
-pub const PATCH_REPEAT_ARITHMETIC_SYMBOL: &str = "static_patch_repeat_arithmetic";
-pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
-pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
-pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
-pub const WORKER_SYNC_CONTEXT_SYMBOL: &str = "ipu_stack_static_worker_sync_context";
-pub const WORKER_STACK_BASE_SYMBOL: &str = "ipu_stack_static_worker_stack_base";
-pub const PRNG_SEED_SYMBOL: &str = "ipu_stack_static_prng_seed";
-pub const HOST_STAGING_SYMBOL: &str = "ipu_stack_static_host_staging";
-pub const COMPLETION_ADDRESS_SYMBOL: &str = "ipu_stack_static_completion";
-const PATCHED_BREAKPOINT_TRAP_BASE: u32 = 0x4180_1000;
-
-#[derive(Debug, thiserror::Error)]
-pub enum CodegenError {
-    #[error(transparent)]
-    Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
-    #[error("exchange encoding failed: {0}")]
-    Exchange(#[from] ipu_exchange::ExchangeError),
-    #[error("invalid tile program: {0}")]
-    Invalid(String),
-}
-
-pub type Result<T> = std::result::Result<T, CodegenError>;
-
-/// A fully resolved program for one logical tile.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TileProgram {
-    pub tile: u16,
-    pub steps: Vec<TileStep>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TileStep {
-    Exchange(ExchangeStep),
-    Compute(ComputeStep),
-    Repeat(RepeatStep),
-    Checkpoint(CheckpointStep),
-}
-
-/// A debugger-visible operator boundary using alternating PBRK0/PBRK1 traps.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointStep {
-    pub operation: u32,
-    pub breakpoint: u8,
-    #[serde(default)]
-    pub profile: StepProfile,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepeatStep {
-    pub count: u32,
-    /// Mutable bases used by [`TileAddress::RepeatPointer`] in the body.
-    pub iterated_pointers: Vec<RepeatPointer>,
-    pub body: Vec<TileStep>,
-    #[serde(default)]
-    pub profile: StepProfile,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepeatPointer {
-    pub initial_address: u32,
-    pub stride_bytes: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TileAddress {
-    Absolute(u32),
-    /// The current base of an enclosing repeat plus a constant byte offset.
-    RepeatPointer {
-        index: u16,
-        offset: i32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangeStep {
-    /// Whether this tile executes a timed send/receive program after the boundary.
-    pub active: bool,
-    /// Base address used by point-to-point receive rows.
-    pub incoming_base: u32,
-    /// Source base for a row encoded relative to a current Repeat parameter.
-    #[serde(default)]
-    pub outgoing_base: Option<TileAddress>,
-    /// Preserve both exchange base registers on entry. Absolute-address paired
-    /// rows use the two PIC streams directly and must not reset their state.
-    #[serde(default)]
-    pub preserve_base_registers: bool,
-    /// Ordinary receive source selected outside the timed row when a paired
-    /// receive uses the neighbouring sender for its waiting half.
-    #[serde(default)]
-    pub incoming_mux: Option<u16>,
-    /// IPU21 incoming item format: 0 for 32-bit, 1 for the early half of a
-    /// paired 64-bit path, and 2 for the waiting half.
-    #[serde(default)]
-    pub incoming_format: u8,
-    /// Fixed source selection for the borrowed half of a paired 64-bit path.
-    #[serde(default)]
-    pub incoming_mux_pair: Option<u16>,
-    /// Override the ordinary internal-exchange down-count. Paired 64-bit
-    /// helper tiles execute mux timing while using zero to ignore the value.
-    #[serde(default)]
-    pub incoming_dcount: Option<u32>,
-    /// The exchange row owns its supervisor sync and does not require the
-    /// generic down-count setup. This is used by paired-width rows whose SDK
-    /// form treats the sync and the following timing program as one unit.
-    #[serde(default)]
-    pub sync_in_program: bool,
-    /// Synchronization-free timed exchange program.
-    pub program: PlacedExchangeRow,
-    /// Address words applied before invoking a structurally shared row.
-    #[serde(default)]
-    pub setup_patch: Option<ExchangeSetupPatch>,
-    /// Words rewritten before the timed program is invoked inside a structured repeat.
-    #[serde(default)]
-    pub repeat_patches: Vec<ExchangePatch>,
-    #[serde(default)]
-    pub profile: StepProfile,
-}
-
-impl ExchangeStep {
-    /// Ordinary timed exchange; specialized receive controls and patches are opt-in.
-    pub fn new(active: bool, incoming_base: u32, program: PlacedExchangeRow) -> Self {
-        Self {
-            active,
-            incoming_base,
-            program,
-            outgoing_base: None,
-            preserve_base_registers: false,
-            incoming_mux: None,
-            incoming_format: 0,
-            incoming_mux_pair: None,
-            incoming_dcount: None,
-            sync_in_program: false,
-            setup_patch: None,
-            repeat_patches: Vec::new(),
-            profile: StepProfile::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangeSetupPatch {
-    /// Byte offsets into the shared executable row, reused by its structural shape.
-    pub offsets: PlacedExchangeRow,
-    /// Replacement instruction words for this use of the row.
-    pub values: PlacedExchangeRow,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangePatch {
-    pub word_offset: u32,
-    pub values: ExchangePatchValues,
-}
-
-/// Replacement instruction words, represented exactly rather than approximately.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ExchangePatchValues {
-    Table(PlacedExchangeRow),
-    Arithmetic { initial: u32, step: u32 },
-}
-
-impl ExchangePatchValues {
-    fn valid_for_count(&self, count: u32) -> bool {
-        match self {
-            Self::Table(row) => row.words.len() == count as usize && row.address.is_multiple_of(4),
-            Self::Arithmetic { .. } => count != 0,
-        }
-    }
-}
-
-pub(crate) fn arithmetic_progression(words: &[u32]) -> Option<(u32, u32)> {
-    if words.len() < 3 {
-        return None;
-    }
-    let step = words[1].wrapping_sub(words[0]);
-    words
-        .windows(2)
-        .all(|pair| pair[1].wrapping_sub(pair[0]) == step)
-        .then_some((words[0], step))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComputeStep {
-    /// Exact linked kernel symbol; no naming convention is applied.
-    pub symbol: String,
-    pub output_address: TileAddress,
-    pub input_addresses: Vec<TileAddress>,
-    pub arguments: Vec<u32>,
-    #[serde(default)]
-    pub profile: StepProfile,
-}
-
-/// Optional explicit cycle-counter destinations around a step.
-///
-/// The addresses belong to caller-managed tile memory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StepProfile {
-    pub before: Option<u32>,
-    pub after: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostPhase {
-    pub address: u32,
-    pub active: bool,
-    pub run_table: Option<u32>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostProgram {
-    pub initialize: Vec<HostPhase>,
-    pub inputs: Vec<HostPhase>,
-    pub outputs: Vec<HostPhase>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodegenOptions {
-    /// Address where the first emitted byte will be placed.
-    pub code_address: u32,
-    pub invocations: u32,
-    pub initial_profile_address: Option<u32>,
-    pub final_profile_address: Option<u32>,
-}
-
-impl Default for CodegenOptions {
-    fn default() -> Self {
-        Self {
-            code_address: 0,
-            invocations: 1,
-            initial_profile_address: None,
-            final_profile_address: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GeneratedProgram {
-    pub bytes: Vec<u8>,
-    /// Exchange data retained verbatim for explicit package placement.
-    pub exchange_rows: Vec<PlacedExchangeRow>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlacedExchangeRow {
-    pub address: u32,
-    pub words: Vec<u32>,
-}
-
-pub fn emit(
-    program: &TileProgram,
-    symbols: &BTreeMap<String, u32>,
-    host: &HostProgram,
-    options: &CodegenOptions,
-) -> Result<GeneratedProgram> {
-    if options.invocations == 0 {
-        return Err(invalid("invocation count must be nonzero"));
-    }
-    validate(program)?;
-
-    let complete = symbol(symbols, COMPLETE_SYMBOL)?;
-    let mut code = TileCode::default();
-    emit_host_phases(&mut code, symbols, &host.initialize)?;
-
-    if options.invocations > 1 {
-        code.add_immediate(11, 11, -8)?;
-        code.setzi(0, options.invocations)?;
-        code.st32(0, 11, 15, 0)?;
-    }
-    let invocation_start = code.address(options.code_address)?;
-    emit_host_phases(&mut code, symbols, &host.inputs)?;
-
-    if let Some(address) = options.initial_profile_address {
-        emit_cycle_sample(&mut code, symbols, address)?;
-    }
-
-    let worker_barrier = program
-        .steps
-        .iter()
-        .any(active_exchange)
-        .then(|| symbol(symbols, WORKER_BARRIER_SYMBOL))
-        .transpose()?;
-    let mut exchange_rows = Vec::new();
-    emit_steps(
-        &mut code,
-        program.tile,
-        &program.steps,
-        symbols,
-        worker_barrier,
-        &mut exchange_rows,
-        None,
-        None,
-        None,
-        options.code_address,
-    )?;
-
-    if let Some(address) = options.final_profile_address {
-        emit_cycle_sample(&mut code, symbols, address)?;
-    }
-    emit_host_phases(&mut code, symbols, &host.outputs)?;
-    if options.invocations > 1 {
-        code.ld32(0, 11, 15, 0)?;
-        code.add_immediate(0, 0, -1)?;
-        code.st32(0, 11, 15, 0)?;
-        let done_branch = code.words.len();
-        code.brz(0, 0)?;
-        code.jump(invocation_start)?;
-        let done = code.address(options.code_address)?;
-        code.words[done_branch] = encode_brz_m_immediate(0, done)?;
-        code.add_immediate(11, 11, 8)?;
-    }
-    code.jump(complete)?;
-    // Read-only descriptors follow the non-returning completion branch. Keeping
-    // them with generated code avoids reserving writable exchange-row space.
-    for (position, register, words) in std::mem::take(&mut code.literals) {
-        code.words[position] = encode_setzi_m(register, code.address(options.code_address)?)?;
-        code.words.extend(words);
-    }
-
-    let mut unique_exchange_rows = BTreeMap::new();
-    for row in exchange_rows {
-        if unique_exchange_rows
-            .insert(row.address, row.words.clone())
-            .is_some_and(|existing| existing != row.words)
-        {
-            return Err(invalid("different exchange rows share an address"));
-        }
-    }
-    Ok(GeneratedProgram {
-        bytes: code.words.into_iter().flat_map(u32::to_le_bytes).collect(),
-        exchange_rows: unique_exchange_rows
-            .into_iter()
-            .map(|(address, words)| PlacedExchangeRow { address, words })
-            .collect(),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_steps(
-    code: &mut TileCode,
-    tile: u16,
-    steps: &[TileStep],
-    symbols: &BTreeMap<String, u32>,
-    worker_barrier: Option<u32>,
-    exchange_rows: &mut Vec<PlacedExchangeRow>,
-    repeat_pointer_count: Option<usize>,
-    repeat_count: Option<u32>,
-    profile_enabled_slot: Option<u16>,
-    code_address: u32,
-) -> Result<()> {
-    for step in steps {
-        match step {
-            TileStep::Exchange(exchange) => {
-                if let Some(address) = exchange.profile.before {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-                if let Some(patch) = &exchange.setup_patch {
-                    emit_exchange_setup_patch(code, exchange, patch, symbols)?;
-                }
-                if !exchange.repeat_patches.is_empty() {
-                    emit_exchange_patches(
-                        code,
-                        exchange,
-                        repeat_count.ok_or_else(|| invalid("exchange patches outside repeat"))?,
-                        symbols,
-                    )?;
-                }
-                if !exchange.preserve_base_registers {
-                    code.setzi(8, exchange.incoming_base)?;
-                    code.put_special(INCOMING_BASE, 8)?;
-                }
-                if let Some(source) = exchange.incoming_mux {
-                    code.setzi(8, u32::from(source))?;
-                    code.put_special(INCOMING_MUX, 8)?;
-                }
-                if exchange.incoming_format != 0 {
-                    code.setzi(8, u32::from(exchange.incoming_format))?;
-                    code.put_special(INCOMING_FORMAT, 8)?;
-                }
-                if let Some(source) = exchange.incoming_mux_pair {
-                    code.setzi(8, u32::from(source))?;
-                    code.put_special(INCOMING_MUXPAIR, 8)?;
-                }
-                if !exchange.preserve_base_registers {
-                    if let Some(base) = exchange.outgoing_base {
-                        // Keep the moving base available to timed row sections;
-                        // subsequent receive/down-count setup reuses m8.
-                        emit_address(code, 6, base, repeat_pointer_count)?;
-                        code.put_special(OUTGOING_BASE, 6)?;
-                    } else {
-                        code.put_special(OUTGOING_BASE, 15)?;
-                    }
-                }
-                if exchange.active {
-                    code.call(
-                        worker_barrier.expect("active exchange phase has worker barrier"),
-                        7,
-                    )?;
-                    if exchange.incoming_dcount.is_some() || !exchange.sync_in_program {
-                        code.setzi(
-                            8,
-                            exchange.incoming_dcount.unwrap_or(INTERNAL_EXCHANGE_DCOUNT),
-                        )?;
-                        code.put_special(INCOMING_DCOUNT, 8)?;
-                    }
-                }
-                if exchange.active && !exchange.sync_in_program {
-                    code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
-                } else {
-                    if !exchange.active {
-                        code.instruction(SANS_INACTIVE_INSTRUCTION);
-                        code.instruction(ipu_target::ipu21::instruction::SYNC_ANS_INSTRUCTION);
-                    }
-                }
-                code.call(exchange.program.address, 10)?;
-                if let Some(address) = exchange.profile.after {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-                exchange_rows.push(exchange.program.clone());
-                if let Some(patch) = &exchange.setup_patch {
-                    exchange_rows.push(patch.offsets.clone());
-                    exchange_rows.push(patch.values.clone());
-                }
-                exchange_rows.extend(exchange.repeat_patches.iter().filter_map(|patch| {
-                    match &patch.values {
-                        ExchangePatchValues::Table(row) => Some(row.clone()),
-                        ExchangePatchValues::Arithmetic { .. } => None,
-                    }
-                }));
-            }
-            TileStep::Compute(compute) => {
-                if let Some(address) = compute.profile.before {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-                emit_compute(code, tile, compute, symbols, repeat_pointer_count)?;
-                if let Some(address) = compute.profile.after {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-            }
-            TileStep::Repeat(repeat) => {
-                if let Some(address) = repeat.profile.before {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-                emit_repeat(
-                    code,
-                    tile,
-                    repeat,
-                    symbols,
-                    worker_barrier,
-                    exchange_rows,
-                    code_address,
-                )?;
-                if let Some(address) = repeat.profile.after {
-                    emit_cycle_sample_at(
-                        code,
-                        symbols,
-                        address,
-                        profile_enabled_slot,
-                        code_address,
-                    )?;
-                }
-            }
-            TileStep::Checkpoint(checkpoint) => {
-                code.instruction(PATCHED_BREAKPOINT_TRAP_BASE | u32::from(checkpoint.breakpoint))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate(program: &TileProgram) -> Result<()> {
-    validate_steps(&program.steps, None, None)
-}
-
-fn validate_steps(
-    steps: &[TileStep],
-    repeat_pointer_count: Option<usize>,
-    repeat_count: Option<u32>,
-) -> Result<()> {
-    for step in steps {
-        match step {
-            TileStep::Exchange(exchange) => {
-                validate_exchange_program(exchange)?;
-                if let Some(base) = exchange.outgoing_base {
-                    if exchange.preserve_base_registers {
-                        return Err(invalid(
-                            "exchange base relocation conflicts with preserved bases",
-                        ));
-                    }
-                    validate_address(base, repeat_pointer_count)?;
-                }
-                if exchange.setup_patch.as_ref().is_some_and(|patch| {
-                    patch.offsets.words.is_empty()
-                        || patch.offsets.words.len() != patch.values.words.len()
-                }) {
-                    return Err(invalid("exchange setup patch has an invalid shape"));
-                }
-                let mut patched_words = std::collections::BTreeSet::new();
-                for patch in &exchange.repeat_patches {
-                    if !patched_words.insert(patch.word_offset)
-                        || repeat_count.is_none_or(|count| !patch.values.valid_for_count(count))
-                        || patch.word_offset as usize >= exchange.program.words.len()
-                    {
-                        return Err(invalid("exchange patch has invalid shape or address"));
-                    }
-                }
-            }
-            TileStep::Compute(compute) => {
-                if compute.symbol.is_empty() {
-                    return Err(invalid("compute symbol is empty"));
-                }
-                let values = compute.input_addresses.len() + compute.arguments.len();
-                let available = usize::from(LAST_VALUE_REGISTER - FIRST_INPUT_REGISTER + 1);
-                if values == 0 || values > available {
-                    return Err(invalid(format!(
-                        "kernel {} needs {values} input/argument registers; 1..={available} are supported",
-                        compute.symbol
-                    )));
-                }
-                validate_address(compute.output_address, repeat_pointer_count)?;
-                for &address in &compute.input_addresses {
-                    validate_address(address, repeat_pointer_count)?;
-                }
-            }
-            TileStep::Repeat(repeat) => {
-                if repeat_pointer_count.is_some() {
-                    return Err(invalid("nested finalized repeats are not yet supported"));
-                }
-                if repeat.count == 0 {
-                    return Err(invalid("repeat count must be nonzero"));
-                }
-                validate_steps(
-                    &repeat.body,
-                    Some(repeat.iterated_pointers.len()),
-                    Some(repeat.count),
-                )?;
-            }
-            TileStep::Checkpoint(checkpoint) => {
-                if checkpoint.breakpoint > 1 {
-                    return Err(invalid("checkpoint breakpoint must be zero or one"));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_exchange_program(exchange: &ExchangeStep) -> Result<()> {
-    let embedded_sync = exchange
-        .program
-        .words
-        .first()
-        .is_some_and(|word| *word == SYNC_SUPERVISOR_INSTRUCTION);
-    if exchange.program.address & 0b11 != 0
-        || exchange.program.words.last()
-            != Some(&ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION)
-        || embedded_sync != exchange.sync_in_program
-        || exchange
-            .program
-            .words
-            .iter()
-            .skip(usize::from(embedded_sync))
-            .any(|word| {
-                matches!(
-                    *word,
-                    SANS_INACTIVE_INSTRUCTION | SYNC_SUPERVISOR_INSTRUCTION
-                )
-            })
-    {
-        return Err(invalid(
-            "exchange phase has an invalid boundary or timed program",
-        ));
-    }
-    if exchange.active != (exchange.program.words.len() > 1 + usize::from(embedded_sync)) {
-        return Err(invalid(
-            "exchange participation does not match timed program",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_address(address: TileAddress, repeat_pointer_count: Option<usize>) -> Result<()> {
-    if let TileAddress::RepeatPointer { index, .. } = address
-        && repeat_pointer_count.is_none_or(|count| usize::from(index) >= count)
-    {
-        return Err(invalid(
-            "compute address refers to an unavailable repeat pointer",
-        ));
-    }
-    Ok(())
-}
-
-fn active_exchange(step: &TileStep) -> bool {
-    match step {
-        TileStep::Exchange(exchange) => exchange.active,
-        TileStep::Repeat(repeat) => repeat.body.iter().any(active_exchange),
-        TileStep::Compute(_) | TileStep::Checkpoint(_) => false,
-    }
-}
-
-fn emit_exchange_patches(
-    code: &mut TileCode,
-    exchange: &ExchangeStep,
-    repeat_count: u32,
-    symbols: &BTreeMap<String, u32>,
-) -> Result<()> {
-    if exchange.repeat_patches.is_empty() {
-        return Ok(());
-    }
-    code.ld32(4, 11, 15, 0)?;
-    code.setzi(5, repeat_count)?;
-    let mut tables = Vec::new();
-    let mut arithmetic = Vec::new();
-    for patch in &exchange.repeat_patches {
-        let address = patch
-            .word_offset
-            .checked_mul(4)
-            .and_then(|offset| exchange.program.address.checked_add(offset))
-            .ok_or_else(|| invalid("exchange patch address overflow"))?;
-        match &patch.values {
-            ExchangePatchValues::Table(row) => tables.extend([address, row.address]),
-            ExchangePatchValues::Arithmetic { initial, step } => {
-                arithmetic.extend([address, *initial, *step]);
-            }
-        }
-    }
-    for (words, width, helper) in [
-        (tables, 2, PATCH_REPEAT_TABLES_SYMBOL),
-        (arithmetic, 3, PATCH_REPEAT_ARITHMETIC_SYMBOL),
-    ] {
-        if words.is_empty() {
-            continue;
-        }
-        let count =
-            u32::try_from(words.len() / width).map_err(|_| invalid("too many exchange patches"))?;
-        code.literals.push((code.words.len(), 2, words));
-        code.setzi(2, 0)?;
-        code.setzi(3, count)?;
-        code.call(symbol(symbols, helper)?, 9)?;
-    }
-    Ok(())
-}
-
-fn emit_exchange_setup_patch(
-    code: &mut TileCode,
-    exchange: &ExchangeStep,
-    patch: &ExchangeSetupPatch,
-    symbols: &BTreeMap<String, u32>,
-) -> Result<()> {
-    code.setzi(2, exchange.program.address)?;
-    code.setzi(3, patch.offsets.address)?;
-    code.setzi(4, patch.values.address)?;
-    code.setzi(
-        5,
-        u32::try_from(patch.values.words.len())
-            .map_err(|_| invalid("exchange setup patch is too large"))?,
-    )?;
-    code.call(symbol(symbols, PATCH_ROW_SYMBOL)?, 9)
-}
-
-fn emit_compute(
-    code: &mut TileCode,
-    tile: u16,
-    compute: &ComputeStep,
-    symbols: &BTreeMap<String, u32>,
-    repeat_pointer_count: Option<usize>,
-) -> Result<()> {
-    let argument_base = FIRST_INPUT_REGISTER
-        .checked_add(
-            u8::try_from(compute.input_addresses.len())
-                .map_err(|_| invalid("kernel input count exceeds u8"))?,
-        )
-        .ok_or_else(|| invalid("kernel input register overflow"))?;
-    emit_address(
-        code,
-        OUTPUT_REGISTER,
-        compute.output_address,
-        repeat_pointer_count,
-    )?;
-    for (index, &address) in compute.input_addresses.iter().enumerate() {
-        emit_address(
-            code,
-            FIRST_INPUT_REGISTER
-                + u8::try_from(index).map_err(|_| invalid("kernel input count exceeds u8"))?,
-            address,
-            repeat_pointer_count,
-        )?;
-    }
-    for (index, &argument) in compute.arguments.iter().enumerate() {
-        code.setzi(
-            argument_base
-                + u8::try_from(index).map_err(|_| invalid("kernel argument count exceeds u8"))?,
-            argument,
-        )?;
-    }
-    let kernel = symbols.get(&compute.symbol).copied().ok_or_else(|| {
-        invalid(format!(
-            "tile {tile} references missing kernel symbol {}",
-            compute.symbol
-        ))
-    })?;
-    code.call(kernel, RETURN_REGISTER)
-}
-
-fn emit_address(
-    code: &mut TileCode,
-    register: u8,
-    address: TileAddress,
-    repeat_pointer_count: Option<usize>,
-) -> Result<()> {
-    match address {
-        TileAddress::Absolute(address) => code.setzi(register, address),
-        TileAddress::RepeatPointer { index, offset } => {
-            let count = repeat_pointer_count
-                .ok_or_else(|| invalid("repeat pointer used outside repeat body"))?;
-            if usize::from(index) >= count {
-                return Err(invalid("repeat pointer index is out of range"));
-            }
-            code.ld32(register, 11, 15, index + 1)?;
-            code.add_offset(register, i64::from(offset))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_repeat(
-    code: &mut TileCode,
-    tile: u16,
-    repeat: &RepeatStep,
-    symbols: &BTreeMap<String, u32>,
-    worker_barrier: Option<u32>,
-    exchange_rows: &mut Vec<PlacedExchangeRow>,
-    code_address: u32,
-) -> Result<()> {
-    let has_profile = repeat.body.iter().any(|step| {
-        let profile = match step {
-            TileStep::Compute(step) => step.profile,
-            TileStep::Exchange(step) => step.profile,
-            TileStep::Repeat(step) => step.profile,
-            TileStep::Checkpoint(step) => step.profile,
-        };
-        profile.before.is_some() || profile.after.is_some()
-    });
-    let profile_slot = u16::try_from(repeat.iterated_pointers.len() + 1)
-        .map_err(|_| invalid("too many repeat pointers"))?;
-    let words = repeat
-        .iterated_pointers
-        .len()
-        .checked_add(1 + usize::from(has_profile))
-        .ok_or_else(|| invalid("repeat frame size overflow"))?;
-    let frame_bytes = i32::try_from((words * 4).next_multiple_of(8))
-        .map_err(|_| invalid("repeat frame is too large"))?;
-    code.add_immediate(11, 11, -frame_bytes)?;
-    code.setzi(0, repeat.count)?;
-    code.st32(0, 11, 15, 0)?;
-    for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
-        code.setzi(0, pointer.initial_address)?;
-        code.st32(
-            0,
-            11,
-            15,
-            u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?,
-        )?;
-    }
-    if has_profile {
-        code.setzi(0, 1)?;
-        code.st32(0, 11, 15, profile_slot)?;
-    }
-    let loop_start = code.address(code_address)?;
-    emit_steps(
-        code,
-        tile,
-        &repeat.body,
-        symbols,
-        worker_barrier,
-        exchange_rows,
-        Some(repeat.iterated_pointers.len()),
-        Some(repeat.count),
-        has_profile.then_some(profile_slot),
-        code_address,
-    )?;
-    for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
-        let slot = u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?;
-        code.ld32(0, 11, 15, slot)?;
-        code.add_offset(0, i64::from(pointer.stride_bytes))?;
-        code.st32(0, 11, 15, slot)?;
-    }
-    if has_profile {
-        // Preserve first-iteration samples; subsequent iterations skip sampling.
-        code.setzi(0, 0)?;
-        code.st32(0, 11, 15, profile_slot)?;
-    }
-    code.ld32(0, 11, 15, 0)?;
-    code.add_immediate(0, 0, -1)?;
-    code.st32(0, 11, 15, 0)?;
-    let done_branch = code.words.len();
-    code.brz(0, 0)?;
-    code.jump(loop_start)?;
-    let done = code.address(code_address)?;
-    code.words[done_branch] = encode_brz_m_immediate(0, done)?;
-    code.add_immediate(11, 11, frame_bytes)
-}
-
-fn emit_host_phases(
-    code: &mut TileCode,
-    symbols: &BTreeMap<String, u32>,
-    phases: &[HostPhase],
-) -> Result<()> {
-    if phases.is_empty() {
-        return Ok(());
-    }
-    let repeat_call = phases
-        .iter()
-        .any(|phase| !phase.active)
-        .then(|| symbol(symbols, REPEAT_CALL_SYMBOL))
-        .transpose()?;
-    let host_run = phases
-        .iter()
-        .any(|phase| phase.active)
-        .then(|| symbol(symbols, HOST_RUN_SYMBOL))
-        .transpose()?;
-    for run in phases.chunk_by(|a, b| a.active == b.active && (!a.active || a.address == b.address))
-    {
-        let first = &run[0];
-        code.setzi(
-            2,
-            u32::try_from(run.len()).map_err(|_| invalid("host run overflow"))?,
-        )?;
-        if first.active {
-            code.setzi(
-                3,
-                first
-                    .run_table
-                    .ok_or_else(|| invalid("active host phase has no run table"))?,
-            )?;
-            code.setzi(4, first.address)?;
-            code.call(host_run.expect("active host phase has host runner"), 9)?;
-        } else {
-            code.setzi(3, first.address)?;
-            code.call(
-                repeat_call.expect("inactive host phase has repeat helper"),
-                9,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn emit_cycle_sample(
-    code: &mut TileCode,
-    symbols: &BTreeMap<String, u32>,
-    address: u32,
-) -> Result<()> {
-    emit_cycle_sample_at(code, symbols, address, None, 0)
-}
-
-fn emit_cycle_sample_at(
-    code: &mut TileCode,
-    symbols: &BTreeMap<String, u32>,
-    address: u32,
-    profile_enabled_slot: Option<u16>,
-    code_address: u32,
-) -> Result<()> {
-    let skip = if let Some(slot) = profile_enabled_slot {
-        code.ld32(2, 11, 15, slot)?;
-        let branch = code.words.len();
-        code.brz(2, 0)?;
-        Some(branch)
-    } else {
-        None
-    };
-    code.setzi(2, address)?;
-    code.call(symbol(symbols, SAMPLE_CYCLE_SYMBOL)?, 10)?;
-    if let Some(branch) = skip {
-        code.words[branch] = encode_brz_m_immediate(2, code.address(code_address)?)?;
-    }
-    Ok(())
-}
-
-fn symbol(symbols: &BTreeMap<String, u32>, name: &str) -> Result<u32> {
-    symbols
-        .get(name)
-        .copied()
-        .ok_or_else(|| invalid(format!("missing runtime symbol {name}")))
-}
-
-fn invalid(message: impl Into<String>) -> CodegenError {
-    CodegenError::Invalid(message.into())
-}
-
-#[derive(Default)]
-struct TileCode {
-    words: Vec<u32>,
-    literals: Vec<(usize, u8, Vec<u32>)>,
-}
-
-impl TileCode {
-    fn address(&self, base: u32) -> Result<u32> {
-        base.checked_add(
-            u32::try_from(self.words.len())
-                .map_err(|_| invalid("generated code exceeds u32"))?
-                .checked_mul(4)
-                .ok_or_else(|| invalid("generated code size overflow"))?,
-        )
-        .ok_or_else(|| invalid("generated code address overflow"))
-    }
-
-    fn setzi(&mut self, register: u8, immediate: u32) -> Result<()> {
-        if immediate < 1 << 20 {
-            self.words.push(encode_setzi_m(register, immediate)?);
-        } else {
-            self.words.push(encode_setzi_m(register, immediate >> 12)?);
-            self.words
-                .push(encode_shl_m_immediate(register, register, 12)?);
-            self.words.push(encode_add_m_immediate(
-                register,
-                register,
-                i32::from((immediate & 0xfff) as u16),
-            )?);
-        }
-        Ok(())
-    }
-
-    fn instruction(&mut self, instruction: u32) {
-        self.words.push(instruction);
-    }
-
-    fn ld32(&mut self, destination: u8, base: u8, delta: u8, offset: u16) -> Result<()> {
-        self.words
-            .push(encode_ld32_m_immediate(destination, base, delta, offset)?);
-        Ok(())
-    }
-
-    fn st32(&mut self, source: u8, base: u8, delta: u8, offset: u16) -> Result<()> {
-        self.words
-            .push(encode_st32_m_immediate(source, base, delta, offset)?);
-        Ok(())
-    }
-
-    fn add_immediate(&mut self, destination: u8, source: u8, immediate: i32) -> Result<()> {
-        self.words
-            .push(encode_add_m_immediate(destination, source, immediate)?);
-        Ok(())
-    }
-
-    fn add_offset(&mut self, register: u8, mut immediate: i64) -> Result<()> {
-        while immediate != 0 {
-            let part = immediate.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
-            self.add_immediate(register, register, part as i32)?;
-            immediate -= part;
-        }
-        Ok(())
-    }
-
-    fn put_special(&mut self, special: u8, register: u8) -> Result<()> {
-        self.words.push(encode_put_special_m(special, register)?);
-        Ok(())
-    }
-
-    fn call(&mut self, target: u32, return_register: u8) -> Result<()> {
-        self.words
-            .push(encode_call_m_immediate(return_register, target)?);
-        Ok(())
-    }
-
-    fn brz(&mut self, register: u8, target: u32) -> Result<()> {
-        self.words.push(encode_brz_m_immediate(register, target)?);
-        Ok(())
-    }
-
-    fn jump(&mut self, target: u32) -> Result<()> {
-        self.setzi(0, target)?;
-        self.words.push(encode_br_m(0)?);
-        Ok(())
-    }
-}
-
+mod supervisor;
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn symbols() -> BTreeMap<String, u32> {
-        [
-            (WORKER_BARRIER_SYMBOL.into(), 0x50000),
-            (COMPLETE_SYMBOL.into(), 0x50004),
-            (HOST_RUN_SYMBOL.into(), 0x50008),
-            (REPEAT_CALL_SYMBOL.into(), 0x5000c),
-            (SAMPLE_CYCLE_SYMBOL.into(), 0x50010),
-            (PATCH_REPEAT_TABLES_SYMBOL.into(), 0x50014),
-            (PATCH_REPEAT_ARITHMETIC_SYMBOL.into(), 0x50018),
-            ("gemm".into(), 0x51000),
-        ]
-        .into_iter()
-        .collect()
-    }
-
-    #[test]
-    fn emits_resolved_exchange_and_compute_steps() {
-        let program = TileProgram {
-            tile: 7,
-            steps: vec![
-                TileStep::Exchange(ExchangeStep {
-                    active: false,
-                    incoming_base: 0,
-                    outgoing_base: None,
-                    preserve_base_registers: false,
-                    incoming_mux: None,
-                    incoming_format: 0,
-                    incoming_mux_pair: None,
-                    incoming_dcount: None,
-                    sync_in_program: false,
-                    program: PlacedExchangeRow {
-                        address: 0x60000,
-                        words: inactive_exchange_program(),
-                    },
-                    setup_patch: None,
-                    repeat_patches: Vec::new(),
-                    profile: StepProfile::default(),
-                }),
-                TileStep::Compute(ComputeStep {
-                    symbol: "gemm".into(),
-                    output_address: TileAddress::Absolute(0x70000),
-                    input_addresses: vec![
-                        TileAddress::Absolute(0x71000),
-                        TileAddress::Absolute(0x72000),
-                    ],
-                    arguments: vec![64],
-                    profile: StepProfile::default(),
-                }),
-            ],
-        };
-        let generated = emit(
-            &program,
-            &symbols(),
-            &HostProgram::default(),
-            &CodegenOptions {
-                code_address: 0x52000,
-                ..CodegenOptions::default()
-            },
-        )
-        .unwrap();
-        assert!(!generated.bytes.is_empty());
-        assert_eq!(generated.exchange_rows.len(), 1);
-        assert_eq!(generated.exchange_rows[0].address, 0x60000);
-    }
-
-    #[test]
-    fn rejects_unresolved_or_malformed_inputs() {
-        let program = TileProgram {
-            tile: 0,
-            steps: vec![TileStep::Exchange(ExchangeStep {
-                active: false,
-                incoming_base: 0,
-                outgoing_base: None,
-                preserve_base_registers: false,
-                incoming_mux: None,
-                incoming_format: 0,
-                incoming_mux_pair: None,
-                incoming_dcount: None,
-                sync_in_program: false,
-                program: PlacedExchangeRow {
-                    address: 3,
-                    words: Vec::new(),
-                },
-                setup_patch: None,
-                repeat_patches: Vec::new(),
-                profile: StepProfile::default(),
-            })],
-        };
-        assert!(matches!(
-            emit(
-                &program,
-                &symbols(),
-                &HostProgram::default(),
-                &CodegenOptions::default()
-            ),
-            Err(CodegenError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn arithmetic_patch_detection_is_exact_across_word_overflow() {
-        let mut random = fastrand::Rng::with_seed(0x61726974686d);
-        for _ in 0..256 {
-            let initial = random.u32(..);
-            let step = random.u32(..);
-            let count = random.u32(3..=128);
-            let mut words = (0..count)
-                .map(|i| initial.wrapping_add(step.wrapping_mul(i)))
-                .collect::<Vec<_>>();
-            assert_eq!(arithmetic_progression(&words), Some((initial, step)));
-            words[1] ^= 1;
-            assert_eq!(arithmetic_progression(&words), None);
-        }
-        assert_eq!(arithmetic_progression(&[1, 2]), None);
-        let legacy = serde_json::json!({"address": 0x60000, "words": [1, 4, 8]});
-        assert!(matches!(
-            serde_json::from_value::<ExchangePatchValues>(legacy).unwrap(),
-            ExchangePatchValues::Table(_)
-        ));
-    }
-
-    #[test]
-    fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
-        let mut random = fastrand::Rng::with_seed(0x7061_7463_685f_7265);
-        let mut code_bytes = None;
-        let mut arithmetic_code_bytes = None;
-        for _ in 0..64 {
-            let count = random.u32(2..=128);
-            let values = (0..count).map(|_| random.u32(..)).collect::<Vec<_>>();
-            let program = TileProgram {
-                tile: 0,
-                steps: vec![TileStep::Repeat(RepeatStep {
-                    count,
-                    iterated_pointers: vec![RepeatPointer {
-                        initial_address: 0x70000,
-                        stride_bytes: 64,
-                    }],
-                    body: vec![TileStep::Exchange(ExchangeStep {
-                        active: true,
-                        incoming_base: 0x70000,
-                        outgoing_base: None,
-                        preserve_base_registers: false,
-                        incoming_mux: None,
-                        incoming_format: 0,
-                        incoming_mux_pair: None,
-                        incoming_dcount: None,
-                        sync_in_program: false,
-                        program: PlacedExchangeRow {
-                            address: 0x60000,
-                            words: vec![0, ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION],
-                        },
-                        setup_patch: None,
-                        repeat_patches: vec![ExchangePatch {
-                            word_offset: 0,
-                            values: ExchangePatchValues::Table(PlacedExchangeRow {
-                                address: 0x61000,
-                                words: values.clone(),
-                            }),
-                        }],
-                        profile: StepProfile::default(),
-                    })],
-                    profile: StepProfile::default(),
-                })],
-            };
-            let generated = emit(
-                &program,
-                &symbols(),
-                &HostProgram::default(),
-                &CodegenOptions {
-                    code_address: 0x52000,
-                    ..CodegenOptions::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(generated.exchange_rows.len(), 2);
-            assert_eq!(generated.exchange_rows[1].words, values);
-            let emitted_words = generated
-                .bytes
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                emitted_words
-                    .iter()
-                    .filter(|word| **word == SYNC_SUPERVISOR_INSTRUCTION)
-                    .count(),
-                1
-            );
-            assert_eq!(
-                *code_bytes.get_or_insert(generated.bytes.len()),
-                generated.bytes.len()
-            );
-            let mut program = program;
-            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
-                unreachable!()
-            };
-            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
-                unreachable!()
-            };
-            exchange.repeat_patches[0].values = ExchangePatchValues::Arithmetic {
-                initial: 0xeffffff0,
-                step: 0xffffc000,
-            };
-            let generated = emit(
-                &program,
-                &symbols(),
-                &HostProgram::default(),
-                &CodegenOptions {
-                    code_address: 0x52000,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                generated.exchange_rows.len(),
-                1,
-                "arithmetic patches allocate no value table"
-            );
-            assert_eq!(
-                *arithmetic_code_bytes.get_or_insert(generated.bytes.len()),
-                generated.bytes.len()
-            );
-            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
-                unreachable!()
-            };
-            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
-                unreachable!()
-            };
-            // Mixed descriptors must survive code relocation without relocating
-            // their destinations or mutable value tables.
-            exchange.repeat_patches.push(ExchangePatch {
-                word_offset: 1,
-                values: ExchangePatchValues::Table(PlacedExchangeRow {
-                    address: 0x61000,
-                    words: values,
-                }),
-            });
-            for base in [0x52000, 0x80000] {
-                let mixed = emit(
-                    &program,
-                    &symbols(),
-                    &HostProgram::default(),
-                    &CodegenOptions {
-                        code_address: base,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-                let words = mixed
-                    .bytes
-                    .chunks_exact(4)
-                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
-                    .collect::<Vec<_>>();
-                let pool = words.len() - 5;
-                assert_eq!(
-                    &words[pool..],
-                    &[0x60004, 0x61000, 0x60000, 0xeffffff0, 0xffffc000]
-                );
-                for offset in [0, 2] {
-                    let pointer = encode_setzi_m(2, base + (pool + offset) as u32 * 4).unwrap();
-                    assert!(words[..pool].contains(&pointer));
-                }
-            }
-            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
-                unreachable!()
-            };
-            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
-                unreachable!()
-            };
-            exchange.repeat_patches[1].word_offset = 0;
-            assert!(
-                emit(
-                    &program,
-                    &symbols(),
-                    &HostProgram::default(),
-                    &CodegenOptions::default()
-                )
-                .is_err()
-            );
-        }
-    }
-}
+mod tests;

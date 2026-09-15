@@ -1,8 +1,8 @@
 //! Exercise the actual compiler driver, including support reservations and
 //! rejected packages. No fake finalization callback stands in for evaluation.
 use super::*;
+use crate::PipelineConfig;
 use crate::Precision;
-use crate::compile::PipelineConfig;
 use crate::package::PackageBuildError;
 use std::path::PathBuf;
 

@@ -1,6 +1,6 @@
 //! Choose default persistent parameter homes before mid binds operand movement.
 
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::mid::{MidValue, MidValueId};
 use crate::planner::error::LoweringResult;
 #[cfg(test)]

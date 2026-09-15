@@ -1,5 +1,5 @@
 //! Operator tests expose intermediate boundaries independently of package policy.
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::CostModel;
 use crate::graph::{ComputeGraph, GraphInputKind, Operation, OperationKind, ValueId};
 use crate::mid::MidProgram;

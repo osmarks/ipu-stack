@@ -1,7 +1,6 @@
 //! Candidate eligibility for one whole-device operation.
 //! This boundary accepts tensor facts, never mutable planner state.
 
-use crate::compile::{ConversionStreamingPolicy, PipelineConfig};
 use crate::estimate::CostModel;
 use crate::graph::{Operation, OperationKind, ValueId};
 use crate::planner::cache::FragmentCache;
@@ -16,6 +15,7 @@ use crate::planner::operator::{OperandMaterialization, OperatorPlan};
 use crate::tensor::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, TensorShape, TensorType,
 };
+use crate::{ConversionStreamingPolicy, PipelineConfig};
 use std::collections::{BTreeMap, BTreeSet};
 pub(in crate::planner) struct CandidateSearch<'a> {
     operation: &'a Operation,

@@ -1,6 +1,6 @@
 //! Enumerate explicit recipe changes without building or evaluating packages.
 
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::graph::ComputeGraph;
 use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeSet;

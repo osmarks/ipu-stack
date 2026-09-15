@@ -1,14 +1,14 @@
 //! Shape-dependent implementation choices and local candidate pruning.
 
-use crate::compile::{
-    AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,
-    PipelineConfig,
-};
 use crate::estimate::{CostModel, MemoryPeaks, MemoryUsage};
 use crate::graph::{Operation, OperationKind, ValueId};
 use crate::kernel::AccumulationPrecision;
 use crate::mid::ReductionStaging;
 use crate::tensor::Precision;
+use crate::{
+    AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,
+    PipelineConfig,
+};
 use rayon::prelude::*;
 
 use crate::planner::cache::FragmentCache;

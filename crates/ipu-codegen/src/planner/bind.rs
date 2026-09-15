@@ -1,6 +1,6 @@
 //! Apply whole-device selections and insert explicit format conversions.
 
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::CostModel;
 use crate::graph::{Operation, OperationId, OperationKind, ValueId};
 use crate::kernel::TileKernelSpec;

@@ -317,7 +317,7 @@ eliminate a few separate expressions.
 
 There are two algorithms to make visible: searching among whole-program
 candidates, and compiling one candidate with placement feedback. Put their two
-entry routines together in `compile.rs`. Requiring literally one function would
+entry routines together in `lib.rs`. Requiring literally one function would
 combine a search loop with hundreds of lines of image construction. Merely moving
 `local::optimize` and its finalization callback to that file would leave the
 current problem unchanged.
@@ -663,7 +663,7 @@ No performance gain from this change has been measured in this review.
 
 | Reader's question | Where the answer must be visible |
 | --- | --- |
-| Why was this candidate accepted or rejected? | Driver shortlist/evaluation/acceptance in `compile.rs`, with named failure stages |
+| Why was this candidate accepted or rejected? | Driver shortlist/evaluation/acceptance in `lib.rs`, with named failure stages |
 | What does this high GEMM become? | Its family constructor in `planner/gemm.rs`, showing copies, product and sum in order |
 | Why was this copy packed or staged? | The single movement selector, with facts and policy as explicit inputs |
 | Why does this operand broadcast and which coordinates are read? | Recorded indexing relation, followed by its restriction to a shard |

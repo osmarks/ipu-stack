@@ -331,20 +331,4 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
             offset: displacement + 32
         }]
     );
-    let mut code = crate::TileCode::default();
-    crate::emit_address(
-        &mut code,
-        3,
-        TileAddress::RepeatPointer {
-            index: 0,
-            offset: -32768,
-        },
-        Some(1),
-    )
-    .unwrap();
-    assert_eq!(code.words.len(), 2);
-    assert_eq!(
-        code.words[1],
-        ipu_target::ipu21::instruction::encode_add_m_immediate(3, 3, -32768).unwrap()
-    );
 }

@@ -1,7 +1,7 @@
 //! Select implementations and directly construct executable whole-device mid.
 //! Graph construction owns enumeration/ranking; family constructors receive a
 //! selected choice and actual tensor types. No package evaluation occurs here.
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::CostModel;
 use crate::graph::ComputeGraph;
 use crate::mid::MidProgram;

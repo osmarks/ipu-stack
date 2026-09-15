@@ -1,6 +1,6 @@
 //! Compiler timings which stop before placement and exchange scheduling.
 use crate::Compute;
-use crate::compile::PipelineConfig;
+use crate::PipelineConfig;
 use crate::estimate::Ipu21CostModel;
 use crate::graph::ComputeGraph;
 use crate::package::{PackageBuildResult, invalid};

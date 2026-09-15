@@ -8,10 +8,19 @@ Older experiment reports explain history, not the current pipeline.
 ## Start here
 
 The public entry point is `build_package` in
-[compile.rs](../crates/ipu-codegen/src/compile.rs). Its `compile_graph` routine
+[lib.rs](../crates/ipu-codegen/src/lib.rs). Its `compile_graph` routine
 compiles the runtime, loads search state and builds an executable baseline. It
 calls `evaluate_candidate` directly for the incumbent and shortlisted alternatives.
 Even with zero optimization steps, the baseline must produce a complete package.
+
+The driver ends at package assembly. [supervisor.rs](../crates/ipu-codegen/src/supervisor.rs)
+owns the address-resolved `TileProgram` and emits its supervisor instructions.
+Before emission, [supervisor/validate.rs](../crates/ipu-codegen/src/supervisor/validate.rs)
+checks structural constraints (including Repeat pointer scope and patch shapes)
+and collects unique exchange rows. Emission consumes those checked rows;
+package assembly serializes them without rebuilding or revalidating the table.
+Instruction encoding and symbol resolution remain emission errors, since they
+depend on the generated code and linked runtime rather than program structure.
 
 The compiler has three principal program representations, but the boundaries
 are less clean than their names suggest:
@@ -95,7 +104,7 @@ flowchart TD
 ```
 
 [planner::build_candidate](../crates/ipu-codegen/src/planner/build.rs) controls the mid
-rewrite order. [compile_graph](../crates/ipu-codegen/src/compile.rs)
+rewrite order. [compile_graph](../crates/ipu-codegen/src/lib.rs)
 keeps a fully evaluated incumbent. [planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs)
 generates recipes without evaluating packages; the driver rebuilds their mid
 programs, screens using compact estimated cycles, and evaluates promising
@@ -149,7 +158,7 @@ result subset therefore cannot accidentally restrict a larger workspace. The
 planner currently supplies the ordinary device embedding; this argument is a
 binding contract, not an additional mapping search.
 
-[screen::expand_and_screen](../crates/ipu-codegen/src/compile/screen.rs)
+[screen::expand_and_screen](../crates/ipu-codegen/src/screen.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
 `evaluate_candidate` keeps provisional addresses local while
 [package/support.rs](../crates/ipu-codegen/src/package/support.rs) measures and
@@ -168,7 +177,7 @@ callback are removed. Checkpoints store recipes/progress in
 now live under [planner](../crates/ipu-codegen/src/planner/mod.rs). Checkpoints
 require the current schema and matching graph/configuration; obsolete states
 are rejected and the search must be rerun. There is no migration path.
-[compile/config.rs](../crates/ipu-codegen/src/compile/config.rs) owns pipeline
+[config.rs](../crates/ipu-codegen/src/config.rs) owns pipeline
 configuration. Mid contains executable semantics, binding and rewrites. Mapping proposals use the global recipe permutation.
 
 The reported final cycles still combine modelled kernel work with scheduled

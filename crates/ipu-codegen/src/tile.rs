@@ -310,18 +310,6 @@ fn lower_repeat(
         &overrides,
         true,
     )?;
-    for step in &body {
-        let TileStep::Exchange(exchange) = step else {
-            continue;
-        };
-        if exchange
-            .repeat_patches
-            .iter()
-            .any(|patch| !patch.values.valid_for_count(repeat.count))
-        {
-            return Err(TileLoweringError::InvalidRepeat);
-        }
-    }
     Ok(RepeatStep {
         count: repeat.count,
         iterated_pointers: pointers,

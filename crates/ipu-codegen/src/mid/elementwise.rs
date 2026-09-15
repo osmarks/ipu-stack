@@ -214,7 +214,7 @@ pub(crate) fn compatible_fusion(
 
 #[cfg(test)]
 mod tests {
-    use crate::compile::PipelineConfig;
+    use crate::PipelineConfig;
     use crate::estimate::Ipu21CostModel;
     use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
     use crate::low::CopyPolicy;
