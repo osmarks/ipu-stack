@@ -9,7 +9,7 @@ use crate::mid::{
     CoordinateMapping, LocalSite, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion,
     MidRepeat, MidValueId,
 };
-use crate::planner::bind::{ValueBuilder, emit_selected, ensure_format, lookup};
+use crate::planner::bind::{ValueBuilder, canonical, emit_selected, ensure_format, flat, lookup};
 use crate::planner::cache::FragmentCache;
 use crate::planner::candidates::{CandidateSearch, OutputDemands};
 use crate::planner::catalogue::{
@@ -20,10 +20,7 @@ use crate::planner::error::{LoweringError, LoweringResult};
 use crate::planner::operator::{OperandMaterialization, OperatorDispatch, OperatorPlan};
 use crate::planner::parameter_homes;
 use crate::planner::recipe::{Candidate, Recipe};
-use crate::tensor::{
-    AxisTiling, Layout, Padding, Precision, TensorAxis, TensorFormat, TensorShape, TensorTiling,
-    TensorType,
-};
+use crate::tensor::{TensorFormat, TensorShape, TensorType};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn build_candidate(
@@ -172,7 +169,6 @@ pub(crate) fn select(
         state: ValueBuilder::default(),
         values: BTreeMap::new(),
         alternatives: BTreeMap::new(),
-        copies: BTreeMap::new(),
         optimizing: !recipe.plans.is_empty() || !recipe.open_boundaries.is_empty(),
     };
     let mut inputs = Vec::new();
@@ -251,46 +247,6 @@ pub(crate) fn select(
     })
 }
 
-fn canonical(shape: &TensorShape, precision: Precision, tiles: u16, capacity: bool) -> Layout {
-    if shape.0.len() < 2 {
-        return flat(shape, precision, tiles);
-    }
-    // Keep whole rows local, but use every available row owner. Coarse
-    // element-sized boundaries concentrate residuals and conversion buffers on
-    // the same small tile group, even when most of the device is free.
-    let rows = shape.0[shape.0.len() - 2];
-    let owners = if capacity {
-        rows.min(u32::from(tiles)) as u16
-    } else {
-        let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
-        let capacity =
-            (u64::from(ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
-        let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
-            .min(rows)
-            .max(rows.div_ceil(u32::from(tiles)));
-        rows.div_ceil(block) as u16
-    };
-    Layout::row_major(TensorTiling {
-        tile_count: owners,
-        replicas: 1,
-        axes: vec![AxisTiling::new(
-            TensorAxis::FromEnd(2),
-            owners,
-            1,
-            Padding::Reject,
-        )],
-    })
-}
-
-fn flat(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
-    let mut grain = (8 / precision.bytes()) as u32;
-    while !shape.elements().is_multiple_of(u64::from(grain)) {
-        grain /= 2;
-    }
-    let owners = (shape.elements() / u64::from(grain)).min(u64::from(tiles)) as u16;
-    Layout::logical_linear(owners, grain)
-}
-
 struct Builder<'a, C> {
     graph: &'a ComputeGraph,
     config: &'a PipelineConfig,
@@ -300,7 +256,6 @@ struct Builder<'a, C> {
     state: ValueBuilder,
     values: BTreeMap<ValueId, MidValueId>,
     alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
-    copies: BTreeMap<MidValueId, u32>,
     optimizing: bool,
 }
 
@@ -448,64 +403,38 @@ impl<C: CostModel> Builder<'_, C> {
                         // The operator alone omits live source buffers and cast/pack
                         // temporaries, which can be larger than its own scratch.
                         let mut state = ValueBuilder::default();
-                        let mut values = BTreeMap::new();
                         let mut initial = Vec::new();
                         for (index, (&origin, source)) in
                             operation.inputs.iter().zip(&types).enumerate()
                         {
-                            let mut source = source.clone();
-                            if automatic[index] && parameters[index] {
-                                source.format.layout.order = plan.inputs[index].format.layout.order;
-                                source.format.layout = parameter_homes::compact_parameter_layout(
-                                    &source,
-                                    self.copies.get(&ids[index]).copied().unwrap_or(1),
-                                    self.config,
-                                )?;
-                            }
-                            let id = state.value(origin, source);
-                            if automatic[index] && !parameters[index] {
+                            let id = state.value(origin, source.clone());
+                            if automatic[index] {
                                 state.automatic_inputs.insert(id);
                             }
+                            if parameters[index] {
+                                state.parameter_values.insert(id);
+                            }
+                            if let Some(&copies) = self.state.copies.get(&ids[index]) {
+                                state.copies.insert(id, copies);
+                            }
                             initial.push(id);
-                            values.insert(origin, id);
                         }
                         let mut sequence = Vec::new();
-                        emit_selected(
+                        let results = emit_selected(
                             operation,
+                            &initial,
                             shape.clone(),
                             plan,
+                            self.recipe.open_boundaries.contains(&operation.results[0]),
+                            self.config,
                             self.costs,
                             self.fragments,
-                            self.config.tile_count,
-                            &mut values,
                             &mut state,
                             &mut sequence,
                         )
                         .ok()?;
-                        let mut result = values[&operation.results[0]];
-                        if !self.recipe.open_boundaries.contains(&operation.results[0]) {
-                            let precision = state.get(result).tensor_type.format.precision;
-                            result = ensure_format(
-                                result,
-                                TensorFormat {
-                                    precision,
-                                    layout: canonical(
-                                        shape,
-                                        precision,
-                                        self.config.tile_count,
-                                        self.config.capacity_baseline,
-                                    ),
-                                },
-                                OperandMaterialization::Complete,
-                                operation.id,
-                                "boundary",
-                                self.costs,
-                                &mut state,
-                                &mut sequence,
-                            );
-                        }
                         // Inputs with later consumers remain live through conversion.
-                        let mut live = vec![result];
+                        let mut live = results;
                         live.extend(
                             initial
                                 .iter()
@@ -546,71 +475,20 @@ impl<C: CostModel> Builder<'_, C> {
                 self.alternatives.insert(operation.id, plans);
             }
             self.recipe.plans.insert(operation.id, selected.clone());
-            // Persistent storage is chosen independently of compute replication.
-            // Only automatic homes can change; explicitly bound inputs stay fixed.
-            for (&id, requirement) in ids.iter().zip(&selected.inputs) {
-                if self.state.automatic_inputs.contains(&id)
-                    && self.state.parameter_values.contains(&id)
-                {
-                    let mut tensor = self.state.get(id).tensor_type.clone();
-                    tensor.format.layout.order = requirement.format.layout.order;
-                    let copies = self.copies.get(&id).copied().unwrap_or(1);
-                    let layout =
-                        parameter_homes::compact_parameter_layout(&tensor, copies, self.config)
-                            .ok_or(LoweringError::NoCandidate(operation.id))?;
-                    self.state.retarget_automatic_input(id, layout);
-                }
-            }
-            let parameter_origins = ids
-                .iter()
-                .filter(|id| self.state.parameter_values.contains(id))
-                .map(|id| self.state.get(*id).origin)
-                .collect::<BTreeSet<_>>();
-            let previous_values = self.state.values.len();
-            emit_selected(
+            let results = emit_selected(
                 operation,
+                &ids,
                 shape.clone(),
                 &selected,
+                self.recipe.open_boundaries.contains(&operation.results[0]),
+                self.config,
                 self.costs,
                 self.fragments,
-                self.config.tile_count,
-                &mut self.values,
                 &mut self.state,
                 &mut operations,
             )?;
-            // Materialized parameter copies are ordinary temporaries, not members
-            // of the persistent sequence's ownership/replication group.
-            for value in &mut self.state.values[previous_values..] {
-                if parameter_origins.contains(&value.origin) {
-                    value.storage_group = value.id;
-                    value.owners = crate::tensor::OwnerMap::default();
-                }
-            }
-            let output = operation.results[0];
-            if !self.recipe.open_boundaries.contains(&output) {
-                let id = self.values[&output];
-                let value = self.state.get(id);
-                let target = TensorFormat {
-                    precision: value.tensor_type.format.precision,
-                    layout: canonical(
-                        shape,
-                        value.tensor_type.format.precision,
-                        self.config.tile_count,
-                        self.config.capacity_baseline,
-                    ),
-                };
-                let id = ensure_format(
-                    id,
-                    target,
-                    OperandMaterialization::Complete,
-                    operation.id,
-                    "boundary",
-                    self.costs,
-                    &mut self.state,
-                    &mut operations,
-                );
-                self.values.insert(output, id);
-            }
+            self.values
+                .extend(operation.results.iter().copied().zip(results));
         }
         Ok(operations)
     }
@@ -685,7 +563,7 @@ impl<C: CostModel> Builder<'_, C> {
                 self.state.automatic_inputs.insert(id);
             }
             if index >= inputs.len() {
-                self.copies.insert(id, repeat.count);
+                self.state.copies.insert(id, repeat.count);
             }
             self.values.insert(origin, id);
             arguments.push(id);
@@ -789,6 +667,7 @@ impl<C: CostModel> Builder<'_, C> {
 #[cfg(test)]
 mod tests {
     use crate::estimate::{Ipu21CostModel, MemoizedCostModel};
+    use crate::tensor::Precision;
 
     use super::*;
 

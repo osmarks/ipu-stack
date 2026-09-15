@@ -1,7 +1,7 @@
 //! Apply whole-device selections and insert explicit format conversions.
 
 use crate::compile::PipelineConfig;
-use crate::estimate::{CostModel, MemoryUsage};
+use crate::estimate::CostModel;
 use crate::graph::{Operation, OperationId, OperationKind, ValueId};
 use crate::kernel::TileKernelSpec;
 use crate::low::default_copy_policy;
@@ -15,7 +15,8 @@ use crate::planner::error::{LoweringError, LoweringResult};
 use crate::planner::operator::{OperandMaterialization, OperatorPlan};
 
 use crate::tensor::{
-    AmpOrder, ElementOrder, Layout, Precision, TensorFormat, TensorShape, TensorType,
+    AmpOrder, AxisTiling, ElementOrder, Layout, Padding, Precision, TensorAxis, TensorFormat,
+    TensorShape, TensorTiling, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +25,7 @@ pub(super) struct ValueBuilder {
     pub(super) values: Vec<MidValue>,
     pub(super) automatic_inputs: BTreeSet<MidValueId>,
     pub(super) parameter_values: BTreeSet<MidValueId>,
+    pub(super) copies: BTreeMap<MidValueId, u32>,
     pub(super) conversion_cycles: u64,
 }
 
@@ -40,17 +42,6 @@ impl ValueBuilder {
         id
     }
 
-    pub(super) fn value_in_storage_group(
-        &mut self,
-        origin: ValueId,
-        tensor_type: TensorType,
-        storage_group: MidValueId,
-    ) -> MidValueId {
-        let result = self.value(origin, tensor_type);
-        self.values[result.index() as usize].storage_group = storage_group;
-        result
-    }
-
     pub(super) fn get(&self, id: MidValueId) -> &MidValue {
         &self.values[id.index() as usize]
     }
@@ -63,7 +54,8 @@ impl ValueBuilder {
         let origin = self.get(source).origin;
         let storage_group = self.get(source).storage_group;
         let owners = self.get(source).owners.clone();
-        let result = self.value_in_storage_group(origin, tensor_type, storage_group);
+        let result = self.value(origin, tensor_type);
+        self.values[result.index() as usize].storage_group = storage_group;
         self.values[result.index() as usize].owners = owners;
         if self.parameter_values.contains(&source) {
             self.parameter_values.insert(result);
@@ -85,20 +77,37 @@ impl ValueBuilder {
 /// casts and complete operands are materialized before binding the fragment.
 pub(super) fn emit_selected(
     operation: &Operation,
+    inputs: &[MidValueId],
     output_shape: TensorShape,
     plan: &OperatorPlan,
+    open_boundary: bool,
+    config: &PipelineConfig,
     costs: &impl CostModel,
     fragments: &FragmentCache,
-    tile_count: u16,
-    values: &mut BTreeMap<ValueId, MidValueId>,
     state: &mut ValueBuilder,
     operations: &mut Vec<MidOperation>,
-) -> LoweringResult<()> {
-    let inputs = operation
-        .inputs
+) -> LoweringResult<Vec<MidValueId>> {
+    // Persistent homes do not inherit the compute operand's replication.
+    // Costing and insertion use this same choice, including Repeat multiplicity.
+    for (&id, requirement) in inputs.iter().zip(&plan.inputs) {
+        if state.automatic_inputs.contains(&id) && state.parameter_values.contains(&id) {
+            let mut tensor = state.get(id).tensor_type.clone();
+            tensor.format.layout.order = requirement.format.layout.order;
+            let layout = super::parameter_homes::compact_parameter_layout(
+                &tensor,
+                state.copies.get(&id).copied().unwrap_or(1),
+                config,
+            )
+            .ok_or(LoweringError::NoCandidate(operation.id))?;
+            state.retarget_automatic_input(id, layout);
+        }
+    }
+    let parameter_origins = inputs
         .iter()
-        .map(|value| values[value])
-        .collect::<Vec<_>>();
+        .filter(|id| state.parameter_values.contains(id))
+        .map(|id| state.get(*id).origin)
+        .collect::<BTreeSet<_>>();
+    let previous_values = state.values.len();
     let mut bound = Vec::with_capacity(inputs.len());
     for (index, (&input, requirement)) in inputs.iter().zip(&plan.inputs).enumerate() {
         bound.push(ensure_format(
@@ -123,13 +132,13 @@ pub(super) fn emit_selected(
     let fragment = fragments
         .get(plan, &input_types, &output)
         .ok_or(LoweringError::InvalidImplementation)?;
-    let results = crate::mid::append_fragment(
+    let mut results = crate::mid::append_fragment(
         &fragment,
         &bound,
         &crate::tensor::OwnerMap::default(),
         Some(operation.id),
         operation.results[0],
-        tile_count,
+        config.tile_count,
         &mut state.values,
         operations,
     )
@@ -141,34 +150,82 @@ pub(super) fn emit_selected(
     {
         state.parameter_values.extend(&results);
     }
-    values.extend(operation.results.iter().copied().zip(results));
-    Ok(())
+    // Parameter conversions are temporaries, not persistent sequence members.
+    for value in &mut state.values[previous_values..] {
+        if parameter_origins.contains(&value.origin) {
+            value.storage_group = value.id;
+            value.owners = crate::tensor::OwnerMap::default();
+        }
+    }
+    if !open_boundary {
+        for result in &mut results {
+            let tensor = &state.get(*result).tensor_type;
+            *result = ensure_format(
+                *result,
+                TensorFormat {
+                    precision: tensor.format.precision,
+                    layout: canonical(
+                        &tensor.shape,
+                        tensor.format.precision,
+                        config.tile_count,
+                        config.capacity_baseline,
+                    ),
+                },
+                OperandMaterialization::Complete,
+                operation.id,
+                "boundary",
+                costs,
+                state,
+                operations,
+            );
+        }
+    }
+    Ok(results)
 }
 
-// Cheap necessary memory check for individual operands. The executable
-// fragment's liveness analysis accounts for simultaneous operands and scratch.
-pub(super) fn plan_fits_operator_memory(
-    plan: &OperatorPlan,
-    inputs: &[TensorType],
-    output: &TensorShape,
-    config: &PipelineConfig,
-) -> bool {
-    let (planned_inputs, planned_output) = plan.tensor_types(inputs, output);
-    let peak = planned_inputs
-        .iter()
-        .chain(std::iter::once(&planned_output))
-        .map(crate::estimate::tensor_memory)
-        .fold(MemoryUsage::default(), |peak, tensor| MemoryUsage {
-            standard: peak.standard.max(tensor.standard),
-            interleaved: peak.interleaved.max(tensor.interleaved),
-        });
-    peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-        && peak
-            .total()
-            .saturating_add(config.standard_memory_reservation_bytes)
-            <= config
-                .tile_memory_budget_bytes
-                .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+pub(super) fn canonical(
+    shape: &TensorShape,
+    precision: Precision,
+    tiles: u16,
+    capacity: bool,
+) -> Layout {
+    if shape.0.len() < 2 {
+        return flat(shape, precision, tiles);
+    }
+    // Keep whole rows local, but use every available row owner. Coarse
+    // element-sized boundaries concentrate residuals and conversion buffers on
+    // the same small tile group, even when most of the device is free.
+    let rows = shape.0[shape.0.len() - 2];
+    let owners = if capacity {
+        rows.min(u32::from(tiles)) as u16
+    } else {
+        let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
+        let capacity =
+            (u64::from(ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
+        let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
+            .min(rows)
+            .max(rows.div_ceil(u32::from(tiles)));
+        rows.div_ceil(block) as u16
+    };
+    Layout::row_major(TensorTiling {
+        tile_count: owners,
+        replicas: 1,
+        axes: vec![AxisTiling::new(
+            TensorAxis::FromEnd(2),
+            owners,
+            1,
+            Padding::Reject,
+        )],
+    })
+}
+
+pub(super) fn flat(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
+    let mut grain = (8 / precision.bytes()) as u32;
+    while !shape.elements().is_multiple_of(u64::from(grain)) {
+        grain /= 2;
+    }
+    let owners = (shape.elements() / u64::from(grain)).min(u64::from(tiles)) as u16;
+    Layout::logical_linear(owners, grain)
 }
 
 fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValueId> {

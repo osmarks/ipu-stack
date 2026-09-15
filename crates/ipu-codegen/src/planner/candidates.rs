@@ -4,14 +4,13 @@ use crate::compile::{
     AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,
     PipelineConfig,
 };
-use crate::estimate::{CostModel, MemoryPeaks};
+use crate::estimate::{CostModel, MemoryPeaks, MemoryUsage};
 use crate::graph::{Operation, OperationKind, ValueId};
 use crate::kernel::AccumulationPrecision;
 use crate::mid::ReductionStaging;
 use crate::tensor::Precision;
 use rayon::prelude::*;
 
-use crate::planner::bind::plan_fits_operator_memory;
 use crate::planner::cache::FragmentCache;
 use crate::planner::catalogue::{
     ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy,
@@ -1796,4 +1795,30 @@ pub(super) fn operator_matches(operation: &OperationKind, operator: OperatorFami
         ) => *expected == options,
         _ => false,
     }
+}
+
+// Cheap necessary memory check for individual operands. The executable
+// fragment's liveness analysis accounts for simultaneous operands and scratch.
+pub(super) fn plan_fits_operator_memory(
+    plan: &OperatorPlan,
+    inputs: &[TensorType],
+    output: &TensorShape,
+    config: &PipelineConfig,
+) -> bool {
+    let (planned_inputs, planned_output) = plan.tensor_types(inputs, output);
+    let peak = planned_inputs
+        .iter()
+        .chain(std::iter::once(&planned_output))
+        .map(crate::estimate::tensor_memory)
+        .fold(MemoryUsage::default(), |peak, tensor| MemoryUsage {
+            standard: peak.standard.max(tensor.standard),
+            interleaved: peak.interleaved.max(tensor.interleaved),
+        });
+    peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+        && peak
+            .total()
+            .saturating_add(config.standard_memory_reservation_bytes)
+            <= config
+                .tile_memory_budget_bytes
+                .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
 }
