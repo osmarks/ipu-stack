@@ -538,7 +538,6 @@ pub use config::*;
 pub(crate) use exchange::*;
 pub use exchange::{
     ExchangeActivity, ExchangeActivityKind, ExchangeScheduleCache, PhysicalExchangePhase,
-    inactive_exchange_program,
 };
 pub use graph::{
     AttentionOptions, AttentionScale, AxisFactorView, AxisSlice, ComputeGraph, GemmOptions,

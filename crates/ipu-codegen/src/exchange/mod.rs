@@ -1668,10 +1668,6 @@ fn spans_share_effective_memory_element(
         })
 }
 
-pub fn inactive_exchange_program() -> Vec<u32> {
-    crate::exchange::EncodedRow::inactive().into_words()
-}
-
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

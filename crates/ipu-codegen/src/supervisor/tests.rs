@@ -1,5 +1,4 @@
 use super::*;
-use crate::inactive_exchange_program;
 
 fn symbols() -> BTreeMap<String, u32> {
     [
@@ -33,7 +32,7 @@ fn emits_resolved_exchange_and_compute_steps() {
                 sync_in_program: false,
                 program: PlacedExchangeRow {
                     address: 0x60000,
-                    words: inactive_exchange_program(),
+                    words: crate::exchange::EncodedRow::inactive().into_words(),
                 },
                 setup_patch: None,
                 repeat_patches: Vec::new(),

@@ -200,7 +200,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                 let mut body = phase.programs[usize::from(tile)]
                     .clone()
                     .map(ipu_codegen::exchange::EncodedRow::into_words)
-                    .unwrap_or_else(inactive_exchange_program);
+                    .unwrap_or_else(|| ipu_codegen::exchange::EncodedRow::inactive().into_words());
                 assert_eq!(
                     body.pop(),
                     Some(ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION)
@@ -288,7 +288,9 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                             words: phase.programs[usize::from(tile)]
                                 .clone()
                                 .map(ipu_codegen::exchange::EncodedRow::into_words)
-                                .unwrap_or_else(inactive_exchange_program),
+                                .unwrap_or_else(|| {
+                                    ipu_codegen::exchange::EncodedRow::inactive().into_words()
+                                }),
                         },
                     )
                 })];

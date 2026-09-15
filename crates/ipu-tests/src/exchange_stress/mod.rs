@@ -7,7 +7,7 @@ use ipu_codegen::exchange::{
 use ipu_codegen::{
     CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
     ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram, TileProgramData,
-    TileStep, build_tile_program_package, inactive_exchange_program,
+    TileStep, build_tile_program_package,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
@@ -322,7 +322,7 @@ pub(crate) fn build_wide(
         for tile in 0..execution_tiles {
             let row = rows[usize::from(tile)]
                 .clone()
-                .unwrap_or_else(inactive_exchange_program);
+                .unwrap_or_else(|| ipu_codegen::exchange::EncodedRow::inactive().into_words());
             let active = rows[usize::from(tile)].is_some();
             let receiving = destinations.contains(&tile) && active;
             programs[usize::from(tile)]
@@ -753,7 +753,7 @@ pub(crate) fn build(
         for tile in 0..execution_tiles {
             let row = rows[usize::from(tile)]
                 .clone()
-                .unwrap_or_else(inactive_exchange_program);
+                .unwrap_or_else(|| ipu_codegen::exchange::EncodedRow::inactive().into_words());
             let active = rows[usize::from(tile)].is_some();
             programs[usize::from(tile)]
                 .steps
@@ -864,7 +864,7 @@ fn build_physical_phase_replay(
             let words = if scheduled {
                 phase.programs[usize::from(tile)].words().to_vec()
             } else {
-                inactive_exchange_program()
+                ipu_codegen::exchange::EncodedRow::inactive().into_words()
             };
             let row_address = ROW_BASE;
             Ok(TileProgram {

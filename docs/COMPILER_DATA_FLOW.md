@@ -13,7 +13,7 @@ compiles the runtime and builds an executable baseline. It
 calls `evaluate_candidate` directly for the incumbent and shortlisted alternatives.
 Even with zero optimization steps, the baseline must produce a complete package.
 
-The driver ends at package assembly. [supervisor.rs](../crates/ipu-codegen/src/supervisor.rs)
+The driver ends at package assembly. [supervisor.rs](../crates/ipu-codegen/src/supervisor/mod.rs)
 owns the address-resolved `TileProgram` and emits its supervisor instructions.
 Before emission, [supervisor/validate.rs](../crates/ipu-codegen/src/supervisor/validate.rs)
 checks structural constraints (including Repeat pointer scope and patch shapes)
@@ -44,7 +44,7 @@ construction and rewrite boundaries. Numerical casts have one compute form;
 coordinate/layout movement has one Copy form with a selected movement policy.
 There is no `Convert` or outer `Primitive` wrapper.
 
-[tensor](../crates/ipu-codegen/src/tensor.rs) owns shapes, coordinate relations,
+[tensor](../crates/ipu-codegen/src/tensor/mod.rs) owns shapes, coordinate relations,
 formats, layouts and resolved ownership geometry. Graph construction, mid,
 storage traversal and kernel binding import these descriptions from that owner.
 Cast-motion layout preferences remain in [mid/cast_order.rs](../crates/ipu-codegen/src/mid/cast_order.rs),
@@ -62,7 +62,7 @@ inventory and emission observe the same live work.
 [ipu-target](../crates/ipu-target/src/lib.rs) is a dependency leaf. Its IPU21
 modules own SRAM geometry, register IDs, supervisor instruction encoding and
 physical routing/pairing. Its C600 module supplies the compute-tile inventory.
-`Topology` describes physical tile identities; [exchange construction](../crates/ipu-codegen/src/exchange/program.rs)
+`Topology` describes physical tile identities; [exchange construction](../crates/ipu-codegen/src/exchange/program/mod.rs)
 takes that topology to construct multicast and point-to-point programs. Timing
 selection, row encoding and measured scheduling margins remain in exchange.
 
@@ -204,7 +204,7 @@ flowchart LR
   S --> Y[Output with selected ownership and order]
 ```
 
-1. [Candidate generation](../crates/ipu-codegen/src/planner/candidates.rs) and
+1. [Candidate generation](../crates/ipu-codegen/src/planner/candidates/mod.rs) and
    [operator plans](../crates/ipu-codegen/src/planner/operator.rs) choose the grid,
    precision, orientation, kernel blocking, result layout and reduction staging.
    [ensure_format](../crates/ipu-codegen/src/planner/bind.rs) prepares outer
@@ -254,8 +254,8 @@ The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
 
 | Step | Current owner | Purpose |
 | --- | --- | --- |
-| Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`, using [tensor.rs](../crates/ipu-codegen/src/tensor.rs) | Define valid logical computation |
-| Select output layout and compatible kernel | [planner/candidates.rs](../crates/ipu-codegen/src/planner/candidates.rs) | Choose distributed implementation |
+| Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph/mod.rs), `infer_shape`, using [tensor.rs](../crates/ipu-codegen/src/tensor/mod.rs) | Define valid logical computation |
+| Select output layout and compatible kernel | [planner/candidates.rs](../crates/ipu-codegen/src/planner/candidates/mod.rs) | Choose distributed implementation |
 | Project output ownership onto non-broadcast input axes | [tensor/resolved.rs](../crates/ipu-codegen/src/tensor/resolved.rs), `broadcast_operand_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
 | Bind the declared operand relation to a resident fragment | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), `elementwise_view` | Supply the local kernel with the needed coordinates |
 | Validate supported broadcast shape and encode strides/counts | [kernel/pointwise.rs](../crates/ipu-codegen/src/kernel/pointwise.rs), `call` | Match the actual kernel's address arithmetic |
@@ -388,9 +388,9 @@ untouched source/destination bytes.
   uses the same derivation and adds placed or Repeat-relative base addresses.
 - `LogicalExchange` stores one source with multiple recipient views. Physical
   addresses, message lengths, pairing and hazard ordering are resolved in
-  [codegen/exchange.rs](../crates/ipu-codegen/src/exchange.rs). The encoding and
-  timed-program builder live in [exchange encoding](../crates/ipu-codegen/src/exchange/program.rs).
-- [place.rs](../crates/ipu-codegen/src/place.rs) derives lifetimes, aliases,
+  [codegen/exchange.rs](../crates/ipu-codegen/src/exchange/mod.rs). The encoding and
+  timed-program builder live in [exchange encoding](../crates/ipu-codegen/src/exchange/program/mod.rs).
+- [place.rs](../crates/ipu-codegen/src/place/mod.rs) derives lifetimes, aliases,
   access tails, element-separation constraints and addresses. Parameters remain
   resident across host invocations. `storage_group` in mid concerns ownership
   mapping; it does not itself mean two values alias the same allocation.
@@ -400,7 +400,7 @@ untouched source/destination bytes.
   It is not implemented by compiling 27 unrelated bodies.
 - [kernel::materialize_kernel_run](../crates/ipu-codegen/src/kernel/mod.rs)
   binds relative views to placed or Repeat-relative addresses.
-  [tile.rs](../crates/ipu-codegen/src/tile.rs) builds `TileProgram`s;
+  [tile.rs](../crates/ipu-codegen/src/tile/mod.rs) builds `TileProgram`s;
   [codegen/lib.rs](../crates/ipu-codegen/src/lib.rs) emits supervisor instructions.
   The package builder assembles executable images and host-visible metadata.
 
@@ -475,7 +475,7 @@ coverage for copies still needs to distinguish physical padding bytes.
 
 ## Trace 5: exchange encoding retains relocation sites
 
-[Exchange construction](../crates/ipu-codegen/src/exchange/program.rs) prepares each transfer
+[Exchange construction](../crates/ipu-codegen/src/exchange/program/mod.rs) prepares each transfer
 with its caller-assigned message identity. The phase encoder returns an
 [`EncodedRow`](../crates/ipu-codegen/src/exchange/program/row.rs): instruction words, send address
 sites with message-relative offsets and item widths, receive-pointer sites, and
@@ -493,7 +493,7 @@ identities directly to find the source sequence and price its patch count.
 `EncodedRow` changes address fields and base-register operands without another
 opcode walk; changing a base operand updates its retained site as well.
 [Schedule replay](../crates/ipu-codegen/src/exchange/reuse.rs) normalizes only the
-retained address fields. [Row sharing](../crates/ipu-codegen/src/tile.rs) uses those
+retained address fields. [Row sharing](../crates/ipu-codegen/src/tile/mod.rs) uses those
 same fields and unions the nonzero address sites across invocations. Each
 invocation restores that union, including zero addresses left by earlier rows.
 Metadata is discarded at final instruction/data emission.

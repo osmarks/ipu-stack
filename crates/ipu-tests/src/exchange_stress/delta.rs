@@ -28,7 +28,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         let mut row = phase.programs[usize::from(tile)]
             .clone()
             .map(ipu_codegen::exchange::EncodedRow::into_words)
-            .unwrap_or_else(inactive_exchange_program);
+            .unwrap_or_else(|| ipu_codegen::exchange::EncodedRow::inactive().into_words());
         // Four instructions preserve the row's eight-byte instruction alignment.
         let mut prefix = vec![
             encode_setzi_m(0, 8)?,

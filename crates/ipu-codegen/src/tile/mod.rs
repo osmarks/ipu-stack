@@ -5,7 +5,7 @@ use ipu_target::ipu21::fabric::Topology;
 #[cfg(test)]
 use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 #[cfg(test)]
-#[path = "tile/tests/iterated_aliases.rs"]
+#[path = "tests/iterated_aliases.rs"]
 mod iterated_aliases;
 
 use crate::{
