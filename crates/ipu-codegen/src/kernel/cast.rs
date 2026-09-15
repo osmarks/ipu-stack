@@ -1,6 +1,6 @@
 //! Cast format support, packed call geometry and shifted FP16-to-F143 access.
 //! The shifted output prefix and chunks separate input/output memory elements;
-//! whether the extra prefix saves storage belongs to the mid donation rewrite.
+//! Whether the extra prefix saves storage belongs to the low donation pass.
 
 use super::*;
 use crate::mid::MidOperationKind;

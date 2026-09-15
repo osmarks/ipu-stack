@@ -45,6 +45,7 @@ pub struct PipelineConfig {
     pub capacity_baseline: bool,
     /// Rewrite settings applied to the baseline.
     pub cast_before_copies: bool,
+    /// Donate dead FP16 scratch during low optimization, after copy elimination.
     pub reuse_cast_inputs: bool,
     /// Rows per distributed packing task; zero retains the original ownership.
     pub packing_rows: u16,

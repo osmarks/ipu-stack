@@ -8,7 +8,6 @@ use crate::kernel::{AccumulationPrecision, GemmKernelMode, GemmWeightLoad};
 use crate::tensor::{Layout, Precision};
 use crate::tensor::{OwnerMap, TensorType};
 use std::collections::BTreeMap;
-pub(crate) mod cast;
 pub(crate) mod cast_order;
 mod compute;
 mod copy;

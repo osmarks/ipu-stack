@@ -6,7 +6,6 @@ use crate::storage::GeometryCache;
 mod compute;
 
 mod buffers;
-mod cast;
 mod copies;
 mod mapping;
 mod movement;
@@ -66,12 +65,18 @@ pub(crate) fn expand_tiles(
     graph: &MidProgram,
     checkpoints: bool,
 ) -> ExpansionResult<Arc<TileGraph>> {
-    expand_tiles_cached(graph, checkpoints, Arc::new(GeometryCache::default()))
+    expand_tiles_cached(
+        graph,
+        checkpoints,
+        false,
+        Arc::new(GeometryCache::default()),
+    )
 }
 
 pub(crate) fn expand_tiles_cached(
     graph: &MidProgram,
     checkpoints: bool,
+    reuse_cast_inputs: bool,
     cache: Arc<GeometryCache>,
 ) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
@@ -116,7 +121,7 @@ pub(crate) fn expand_tiles_cached(
             })
             .collect(),
     };
-    crate::low::passes::run(&mut program, &cache)?;
+    crate::low::passes::run(&mut program, &cache, reuse_cast_inputs)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),

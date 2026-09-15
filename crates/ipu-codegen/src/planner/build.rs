@@ -51,9 +51,6 @@ pub(crate) fn baseline(
         if config.disjoint_copy_sources {
             program.distribute_preparation(config.diagnostic_checkpoints)?;
         }
-        if config.reuse_cast_inputs {
-            program.reuse_cast_inputs();
-        }
     }
     if let Some(mapping) = &config.tile_mapping {
         program.remap_tiles(mapping)?;

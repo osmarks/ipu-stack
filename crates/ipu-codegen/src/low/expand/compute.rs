@@ -16,13 +16,6 @@ impl TileGraphBuilder {
 
         let operands = &operation.operands;
         let output_aliases = &operation.output_aliases;
-        let donate_cast = matches!(
-            kernel,
-            MidOperationKind::Cast {
-                from: Precision::F16,
-                to: Precision::F8F143 { .. }
-            }
-        ) && output_aliases == &[(0, 0)];
         let output = *operation
             .results
             .first()
@@ -57,16 +50,7 @@ impl TileGraphBuilder {
                 .iter()
                 .map(|tiles| tiles[usize::from(tile)][ordinal].shard)
                 .collect::<Vec<_>>();
-            self.bind_compute_aliases(
-                &results,
-                output_aliases,
-                &inputs_by_tile,
-                if donate_cast {
-                    -(crate::kernel::cast::CAST_PREFIX_BYTES as i32)
-                } else {
-                    0
-                },
-            )?;
+            self.bind_compute_aliases(&results, output_aliases, &inputs_by_tile)?;
             let inputs = inputs_by_tile
                 .iter()
                 .zip(operands)
@@ -133,40 +117,22 @@ impl TileGraphBuilder {
             {
                 continue;
             }
-            if donate_cast {
-                let [input]: [ShardView; 1] = inputs
-                    .try_into()
-                    .map_err(|_| ExpansionError::InvalidOperatorPlan)?;
-                let [output]: [ShardView; 1] = results
-                    .try_into()
-                    .map_err(|_| ExpansionError::ResultArity)?;
-                self.build_shifted_cast(
-                    body,
-                    tile,
-                    operation_provenance(operation),
-                    kernel.clone(),
-                    input,
-                    output,
-                )?;
-            } else {
-                let mut kind = kernel.clone();
-                if let MidOperationKind::Gemm {
-                    axes,
-                    inner_block,
-                    output_columns,
-                    ..
-                } = &mut kind
-                {
-                    let li = axes.left_inner.resolve(inputs[0].extents.len())?;
-                    let oc = axes.output_column.resolve(results[0].extents.len())?;
-                    *inner_block = inputs[0].extents[li].physical_end - inputs[0].extents[li].start;
-                    *output_columns =
-                        results[0].extents[oc].physical_end - results[0].extents[oc].start;
-                }
-                let run =
-                    self.bind_kernel(operation_provenance(operation), kind, inputs, results)?;
-                self.append_kernel(body, tile, run)?;
+            let mut kind = kernel.clone();
+            if let MidOperationKind::Gemm {
+                axes,
+                inner_block,
+                output_columns,
+                ..
+            } = &mut kind
+            {
+                let li = axes.left_inner.resolve(inputs[0].extents.len())?;
+                let oc = axes.output_column.resolve(results[0].extents.len())?;
+                *inner_block = inputs[0].extents[li].physical_end - inputs[0].extents[li].start;
+                *output_columns =
+                    results[0].extents[oc].physical_end - results[0].extents[oc].start;
             }
+            let run = self.bind_kernel(operation_provenance(operation), kind, inputs, results)?;
+            self.append_kernel(body, tile, run)?;
         }
         Ok(())
     }
@@ -229,7 +195,6 @@ impl TileGraphBuilder {
         outputs: &[BlockValueId],
         aliases: &[(usize, usize)],
         inputs_by_tile: &[Vec<Vec<ShardView>>],
-        offset: i32,
     ) -> ExpansionResult<()> {
         for &(result, input) in aliases {
             let target = *outputs.get(result).ok_or(ExpansionError::ResultArity)?;
@@ -242,14 +207,8 @@ impl TileGraphBuilder {
                 })
                 .map(|source| source.shard)
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            self.shards[target.index() as usize].definition = if offset == 0 {
-                ShardDefinition::WritableAlias(previous)
-            } else {
-                ShardDefinition::ShiftedAlias {
-                    source: previous,
-                    offset,
-                }
-            };
+            self.shards[target.index() as usize].definition =
+                ShardDefinition::WritableAlias(previous);
         }
         Ok(())
     }

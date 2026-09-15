@@ -152,6 +152,7 @@ fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildR
     let expanded = crate::low::expand::expand_tiles_cached(
         &mid,
         config.diagnostic_checkpoints,
+        config.reuse_cast_inputs && !config.diagnostic_checkpoints,
         Arc::clone(&expansions),
     )?;
     let footprint = crate::estimate::program_footprint_analyzed(&expanded, &expansions)?;

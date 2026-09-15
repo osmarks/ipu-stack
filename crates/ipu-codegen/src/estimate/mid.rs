@@ -154,17 +154,6 @@ fn analyze_storage<const PER_TILE: bool>(
     } else {
         1
     };
-    let shifted_inputs = steps
-        .iter()
-        .filter_map(|(operation, _)| {
-            matches!(operation, MidOperation {
-kind: MidOperationKind::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
-output_aliases,
-..
-} if output_aliases == &[(0, 0)])
-            .then(|| operation.inputs[0])
-        })
-        .collect::<std::collections::BTreeSet<_>>();
     let mut bytes = vec![vec![0u64; tiles]; roots.len()];
     let mut classes = vec![MemoryClass::Ipu21Standard; roots.len()];
     for value in &program.values {
@@ -193,12 +182,6 @@ output_aliases,
         } else {
             1
         };
-        let mut prefixes = vec![0u64; usize::from(layout.tiling.tile_count)];
-        if shifted_inputs.contains(&value.id) {
-            for (owner, _) in resolved.shard_extents().ok()? {
-                prefixes[usize::from(owner)] += u64::from(crate::kernel::cast::CAST_PREFIX_BYTES);
-            }
-        }
         for owner in 0..owners {
             let elements = if PER_TILE {
                 resolved.tile_elements(owner)
@@ -214,13 +197,7 @@ output_aliases,
             } else {
                 0
             };
-            let prefix = if PER_TILE {
-                prefixes[usize::from(owner)]
-            } else {
-                prefixes.iter().copied().max().unwrap_or(0)
-            };
             let size = shard
-                .checked_add(prefix)?
                 .checked_add(tail[id])?
                 .div_ceil(alignment)
                 .checked_mul(alignment)?;
@@ -512,34 +489,12 @@ pub(crate) fn operation_cost(
         }
         MidOperationKind::Repeat(_) => unreachable!(),
         kernel => {
-            let output_aliases = &operation.output_aliases;
-            let mut inputs = operand_tensors(operation, values)?;
+            let inputs = operand_tensors(operation, values)?;
             price.total = super::primitive::kernel_cycles(
                 kernel,
                 |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
                 super::primitive::Geometry::Tensor(&out),
             );
-            if matches!(
-                kernel,
-                MidOperationKind::Cast {
-                    from: Precision::F16,
-                    to: Precision::F8F143 { .. }
-                }
-            ) && output_aliases == &[(0, 0)]
-            {
-                let chunks =
-                    crate::kernel::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
-                price.total = 0;
-                for (start, end) in chunks.ranges {
-                    out.shape.0[chunks.axis] = end - start;
-                    inputs[0].shape.0[chunks.axis] = end - start;
-                    price.total += super::primitive::kernel_cycles(
-                        kernel,
-                        |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
-                        super::primitive::Geometry::Tensor(&out),
-                    );
-                }
-            }
         }
     }
     Some((price, scratch, rows))
