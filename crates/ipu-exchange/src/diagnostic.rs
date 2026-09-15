@@ -9,6 +9,80 @@ use super::*;
 use ipu_target::ipu21::instruction::SETZI_M_OPCODE;
 use std::fmt::{self, Write};
 
+/// Address-bearing instructions for each outgoing message, in execution
+/// order. Each entry is `(word offset, byte offset from the message source)`.
+/// SENDPICP restarts the outgoing source stream explicitly after its inline
+/// control word, so repeat relocation must patch it as well as the first SEND.
+pub fn sender_address_instruction_groups(
+    row: &[u32],
+) -> Result<Vec<Vec<(usize, u32)>>, ExchangeError> {
+    let mut groups = Vec::<Vec<(usize, u32)>>::new();
+    let mut source_address = None;
+    let mut cursor = 0;
+    while cursor < row.len() {
+        let instruction = row[cursor];
+        let address =
+            || ((instruction & SEND_ADDRESS_MASK) >> 3) << if instruction & 4 != 0 { 3 } else { 2 };
+        if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
+            groups.push(vec![(cursor, 0)]);
+            source_address = Some(address());
+        } else if is_send_control_pair(instruction) && instruction & 7 != 0 {
+            let source = source_address.ok_or(ExchangeError::Schedule(
+                "SENDPICP precedes initial outgoing SEND",
+            ))?;
+            // The restart contains its absolute source address. Read it directly;
+            // recovering it from instruction durations duplicates stream logic.
+            let offset = address()
+                .checked_sub(source)
+                .ok_or(ExchangeError::Schedule("SENDPICP precedes outgoing source"))?;
+            groups
+                .last_mut()
+                .ok_or(ExchangeError::Schedule("SENDPICP outgoing group"))?
+                .push((cursor, offset));
+        }
+        cursor += if is_send_control_pair(instruction) {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(groups)
+}
+
+/// Removes tile-memory address fields while retaining exchange roles, routes,
+/// transfer sizes, and event timing. Rows with the same result can share one
+/// executable slot and restore their addresses before invocation.
+pub fn normalized_exchange_address_words(row: &[u32]) -> Vec<u32> {
+    let mut normalized = row.to_vec();
+    let mut cursor = 0;
+    while cursor < normalized.len() {
+        let instruction = normalized[cursor];
+        if is_send_control_pair(instruction) {
+            if instruction & 7 != 0 {
+                normalized[cursor] &= !SEND_ADDRESS_MASK;
+            }
+            if instruction & (1 << 27) == 0
+                && let Some(payload) = normalized.get_mut(cursor + 1)
+            {
+                *payload &= !PIC_RECEIVE_ADDRESS_MASK;
+            }
+            cursor += 2;
+            continue;
+        }
+        normalized[cursor] = if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
+            instruction & !SEND_ADDRESS_MASK
+        } else if (is_send_control(instruction) && (instruction >> 18) & 3 == 2)
+            || (instruction & OPCODE_MASK == DELAY_PIC_OPCODE && instruction & (1 << 18) == 0)
+        {
+            instruction & !PIC_RECEIVE_ADDRESS_MASK
+        } else {
+            instruction
+        };
+        cursor += 1;
+    }
+    normalized
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncomingControlStream {
     Pic,
@@ -352,7 +426,7 @@ pub(super) fn validate_tile_program(
     let expected_bases = schedule
         .receive_events
         .iter()
-        .filter(|e| e.kind == ReceiveEventKind::OutgoingBase)
+        .filter(|e| matches!(e.kind, ReceiveEventKind::OutgoingBase(_)))
         .map(|e| (e.cycles, e.instruction));
     if !actual_bases.eq(expected_bases) {
         return Err(ExchangeError::Schedule("encoded outgoing base mismatch"));
@@ -390,7 +464,7 @@ pub(super) fn validate_tile_program(
         .iter()
         .filter_map(|event| {
             let control = match event.kind {
-                ReceiveEventKind::OutgoingBase => return None,
+                ReceiveEventKind::OutgoingBase(_) => return None,
                 ReceiveEventKind::Pointer
                 | ReceiveEventKind::PairedPointer
                 | ReceiveEventKind::Format => IncomingControl {
@@ -474,6 +548,48 @@ fn control_key(control: IncomingControl) -> (u8, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_all_sender_address_fields() {
+        let row = [
+            SYNC_SUPERVISOR_INSTRUCTION,
+            encode_send(1, 3, 0x1a048).unwrap(),
+            SEND_PICP_OPCODE | (7 << 21) | (0x1a04a << 3) | 3,
+            0x1901_5000,
+            RETURN_M10_INSTRUCTION,
+        ];
+        let normalized = normalized_exchange_address_words(&row);
+        assert_eq!(normalized[1] ^ row[1], row[1] & SEND_ADDRESS_MASK);
+        assert_eq!(normalized[2] ^ row[2], row[2] & SEND_ADDRESS_MASK);
+        assert_eq!(normalized[0], row[0]);
+        assert_eq!(normalized[4], row[4]);
+    }
+
+    #[test]
+    fn restart_relocation_uses_encoded_addresses_for_both_send_widths() {
+        for mode in [3, 7] {
+            let shift = if mode & 4 != 0 { 3 } else { 2 };
+            let source = 0x50000;
+            let row = [
+                encode_send(1, mode, source >> shift).unwrap(),
+                SEND_PICP_OPCODE | (7 << 21) | (((source + 80) >> shift) << 3) | mode,
+                0x1901_5000,
+                RETURN_M10_INSTRUCTION,
+            ];
+            let groups = sender_address_instruction_groups(&row).unwrap();
+            assert_eq!(groups, vec![vec![(0, 0), (1, 80)]]);
+            for (word, offset) in &groups[0] {
+                let mut instruction = row[*word];
+                patch_sender_instruction(&mut instruction, source + offset).unwrap();
+                assert_eq!(instruction, row[*word]);
+                patch_sender_instruction(&mut instruction, source + 256 + offset).unwrap();
+                assert_eq!(
+                    ((instruction & SEND_ADDRESS_MASK) >> 3) << shift,
+                    source + 256 + offset
+                );
+            }
+        }
+    }
 
     #[test]
     fn diagnostic_windows_handle_unbounded_radius_and_unplaced_rows() {

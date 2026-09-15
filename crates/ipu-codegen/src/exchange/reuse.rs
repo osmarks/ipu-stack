@@ -46,9 +46,9 @@ pub(super) fn normalized_rows(
         .programs
         .into_iter()
         .map(|program| {
-            ipu_exchange::normalized_exchange_address_words(
-                &program.unwrap_or_else(inactive_exchange_program),
-            )
+            program
+                .unwrap_or_else(ipu_exchange::EncodedRow::inactive)
+                .normalized_words()
         })
         .collect())
 }

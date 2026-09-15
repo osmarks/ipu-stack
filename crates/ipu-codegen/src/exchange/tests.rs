@@ -3,7 +3,8 @@ use super::*;
 use crate::estimate::Ipu21CostModel;
 use crate::planner::test_support::lower;
 use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
-use ipu_exchange::{patch_sender_instruction, sender_address_instruction_groups};
+use ipu_exchange::diagnostic::sender_address_instruction_groups;
+use ipu_exchange::patch_sender_instruction;
 
 #[test]
 fn grouped_ready_queue_matches_eager_priority() {
@@ -916,6 +917,7 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
                 .zip(&phase.programs)
                 .zip(&phase.tile_event_cycles)
             {
+                let program = program.words();
                 assert_eq!(program.last(), Some(&RETURN_M10_INSTRUCTION));
                 assert_eq!(*active, program.len() > 1);
                 assert_eq!(*active, *local_cycles != 0);
@@ -980,7 +982,7 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
             };
             assert!(phase.repeat_patches[tile].is_empty());
             let base = placement.shard_addresses[shard] + offset;
-            let row = &phase.programs[tile];
+            let row = phase.programs[tile].words();
             let groups = sender_address_instruction_groups(row).unwrap();
             let sends = phase.activities[tile]
                 .iter()
@@ -1056,7 +1058,7 @@ fn repeat_sources_follow_execution_order_when_sends_fill_earlier_gaps() {
         vec![1, 0]
     );
     let programs = schedule.builder.finish().unwrap();
-    let row = programs.programs[0].as_ref().unwrap();
+    let row = programs.programs[0].as_ref().unwrap().words();
     let groups = sender_address_instruction_groups(row).unwrap();
     assert_eq!(groups.len(), sends.len());
     for (group, activity) in groups.iter().zip(sends) {

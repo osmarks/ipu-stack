@@ -27,7 +27,8 @@ pub fn diagnose_exchange_tile(
         .programs
         .get(usize::from(tile))
         .ok_or(ExchangeLoweringError::DiagnosticTile(tile))?;
-    let row_words = u32::try_from(program.len()).map_err(|_| ExchangeLoweringError::Overflow)?;
+    let row_words =
+        u32::try_from(program.words().len()).map_err(|_| ExchangeLoweringError::Overflow)?;
     let row_elements = effective_memory_elements(row_address, row_words);
     let activities = phase
         .activities
@@ -52,7 +53,10 @@ pub fn diagnose_exchange_tile(
         tile,
         row_address,
         row_elements,
-        program: ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row_address))?,
+        program: ipu_exchange::diagnostic::diagnose_plan_program(
+            program.words(),
+            Some(row_address),
+        )?,
         activities,
     })
 }

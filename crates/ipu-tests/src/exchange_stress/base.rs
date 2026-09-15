@@ -79,7 +79,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             for row in &mut plan.receivers {
                 patch_receiver_address(row, destination_address)?;
             }
-            let prepared = plan.prepare()?;
+            let prepared = plan.prepare(0)?;
             let helpers = if paired {
                 vec![topology.paired_logical(0)?]
             } else {
@@ -101,7 +101,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     .programs
                     .iter()
                     .flatten()
-                    .map(|row| row.len() as u32 * 4)
+                    .map(|row| row.words().len() as u32 * 4)
                     .max()
                     .unwrap();
             diagnostic_rows.push(StressRow {
@@ -112,7 +112,9 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     .programs
                     .iter()
                     .enumerate()
-                    .filter_map(|(tile, row)| row.clone().map(|row| (tile as u16, row)))
+                    .filter_map(|(tile, row)| {
+                        row.as_ref().map(|row| (tile as u16, row.words().to_vec()))
+                    })
                     .collect(),
             });
             exchanges.push((row_address, phase));
@@ -143,7 +145,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     patch_receiver_address(row, address)?;
                 }
             }
-            let prepared = plan.prepare()?;
+            let prepared = plan.prepare(0)?;
             let helpers = if paired {
                 vec![topology.paired_logical(0)?]
             } else {
@@ -211,6 +213,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                 }
                 let mut body = phase.programs[usize::from(tile)]
                     .clone()
+                    .map(ipu_exchange::EncodedRow::into_words)
                     .unwrap_or_else(inactive_exchange_program);
                 assert_eq!(
                     body.pop(),
@@ -298,6 +301,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                             address: *address,
                             words: phase.programs[usize::from(tile)]
                                 .clone()
+                                .map(ipu_exchange::EncodedRow::into_words)
                                 .unwrap_or_else(inactive_exchange_program),
                         },
                     )

@@ -14,7 +14,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
     for row in &mut plan.receivers {
         patch_receiver_address(row, DATA_BASE)?;
     }
-    let plan = plan.prepare()?;
+    let plan = plan.prepare(0)?;
     let mut builder = PhaseProgramBuilder::new(tiles);
     let offset = builder.earliest_transfer_offset(0, &[], &[1, 2], &plan, words, 0)?;
     builder.append_transfer_at(0, &[], &[1, 2], &plan, offset, words)?;
@@ -27,6 +27,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
     for tile in 0..tiles {
         let mut row = phase.programs[usize::from(tile)]
             .clone()
+            .map(ipu_exchange::EncodedRow::into_words)
             .unwrap_or_else(inactive_exchange_program);
         // Four instructions preserve the row's eight-byte instruction alignment.
         let mut prefix = vec![

@@ -465,21 +465,15 @@ fn layout_exchange_rows(
         };
         let has_repeat_patches = !phase.repeat_patches[usize::from(tile)].is_empty();
         let key = (
-            ipu_exchange::normalized_exchange_address_words(program),
+            program.normalized_words(),
             has_repeat_patches.then_some(phase.id.index()),
         );
-        let changed = key
-            .0
-            .iter()
-            .zip(program)
-            .enumerate()
-            .filter_map(|(offset, (normalized, target))| (normalized != target).then_some(offset))
-            .collect::<Vec<_>>();
         let (count, offsets) = key_counts.entry(key).or_default();
         *count += 1;
-        offsets.extend(changed);
+        offsets.extend(program.nonzero_address_word_offsets());
     }
     let mut shared = BTreeMap::<(Vec<u32>, Option<u32>), SharedRow>::new();
+    let inactive = ipu_exchange::EncodedRow::inactive();
     for phase in exchanges {
         let (active, base_program) = if tile < scheduled_tile_count {
             let index = usize::from(tile);
@@ -490,16 +484,15 @@ fn layout_exchange_rows(
             let program = phase
                 .programs
                 .get(index)
-                .cloned()
                 .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
             (active, program)
         } else {
-            (false, crate::inactive_exchange_program())
+            (false, &inactive)
         };
         let has_repeat_patches =
             tile < scheduled_tile_count && !phase.repeat_patches[usize::from(tile)].is_empty();
         let key = (
-            ipu_exchange::normalized_exchange_address_words(&base_program),
+            base_program.normalized_words(),
             has_repeat_patches.then_some(phase.id.index()),
         );
         let shared_count = key_counts.get(&key).map_or(1, |(count, _)| *count);
@@ -516,7 +509,7 @@ fn layout_exchange_rows(
                             .map_err(|_| TileLoweringError::Overflow)?
                             .checked_mul(4)
                             .ok_or(TileLoweringError::Overflow)?,
-                        base_program[offset],
+                        base_program.words()[offset],
                     ))
                 })
                 .collect::<Result<Vec<_>, TileLoweringError>>()?
@@ -531,7 +524,7 @@ fn layout_exchange_rows(
             let words = if shared_count > 1 {
                 key.0.clone()
             } else {
-                base_program.clone()
+                base_program.words().to_vec()
             };
             cursor = cursor
                 .checked_add(
@@ -665,10 +658,13 @@ mod tests {
     #[test]
     fn shared_rows_restore_zero_addresses_in_either_order() {
         let row = |address| {
-            vec![
-                ipu_exchange::encode_send(1, 3, address).unwrap(),
-                RETURN_M10_INSTRUCTION,
-            ]
+            let mut plan = ipu_exchange::multicast(&Topology::c600(), 0, &[1], 4, 0).unwrap();
+            ipu_exchange::patch_sender_address(&mut plan.sender, address).unwrap();
+            let mut builder = ipu_exchange::PhaseProgramBuilder::new(2);
+            builder
+                .append_transfer_at(0, &[], &[1], &plan.prepare(0).unwrap(), 0, 4)
+                .unwrap();
+            builder.finish().unwrap().programs.remove(0).unwrap()
         };
         for addresses in [[0, 0x100, 0], [0x100, 0, 0x100]] {
             let phases = addresses
@@ -696,7 +692,7 @@ mod tests {
                 for (&offset, &value) in patch.offsets.words.iter().zip(&patch.values.words) {
                     words[offset as usize / 4] = value;
                 }
-                assert_eq!(words, phase.programs[0]);
+                assert_eq!(words, phase.programs[0].words());
             }
         }
     }

@@ -39,7 +39,10 @@ pub(super) fn split_self_receive_conflicts(
                 ipu_exchange::paired_multicast(&topology, transfer.source, &tiles, count)?
             }
         };
-        if !plan.prepare()?.receiver_conflicts_with_send_start(receiver) {
+        if !plan
+            .prepare(0)?
+            .receiver_conflicts_with_send_start(receiver)
+        {
             result.push(transfer);
             continue;
         }

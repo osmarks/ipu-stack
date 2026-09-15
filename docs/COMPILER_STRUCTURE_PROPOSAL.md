@@ -89,6 +89,12 @@ share the secondary-loader ABI; codegen no longer depends on the driver. Runtime
 placement defaults live in codegen, and host packet encoding takes the configured
 window base. Rust and device assembly share register, opcode and runtime-layout
 definition inputs instead of separately maintained copies.
+Exchange encoding now retains send identities/relative offsets, receive-pointer
+sites and outgoing-base writes in an `EncodedRow`. Prefix reuse preserves those
+sites with the words. Repeat relocation, row sharing and schedule replay consume
+the retained sites; their address/group reconstruction walks are removed.
+The independent decoders live in exchange diagnostics and check emitted metadata
+in the randomized encoding tests. This does not change scheduling policy.
 The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

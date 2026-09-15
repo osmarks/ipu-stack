@@ -400,24 +400,37 @@ Other physical access contracts still have multiple owners:
   reuses that selection, but placement alignment and local-copy costing use
   separate rules instead of a common checked helper binding.
 
-## Trace 5: exchange words back to relocation sites
+## Trace 5: exchange encoding retains relocation sites
 
-The exchange builder emits instruction words. Later,
-[exchange/relocation.rs](../crates/ipu-codegen/src/exchange/relocation.rs) invokes
-`sender_address_instruction_groups` to scan those words for SEND and paired-send
-restarts and recover offsets relative to each outgoing message. It matches the
-groups back to scheduled send activities for Repeat relocation. Its base fallback
-also invokes the diagnostic decoder to locate OUTGOING_BASE writes.
+[Exchange construction](../crates/ipu-exchange/src/lib.rs) prepares each transfer
+with its caller-assigned message identity. The phase encoder returns an
+[`EncodedRow`](../crates/ipu-exchange/src/row.rs): instruction words, send address
+sites with message-relative offsets and item widths, receive-pointer sites, and
+outgoing-base writes. Sites are recorded when the encoder emits an instruction,
+including both fields of an inline SENDPICP. Incoming bases are invocation
+arguments; timed rows currently contain only outgoing-base writes.
 
-[ipu-exchange](../crates/ipu-exchange/src/lib.rs) separately implements
-`normalized_exchange_address_words`, recognizing send and receive address fields
-for cache replay and row sharing. `tile::layout_exchange_rows` normalizes each
-row in both its counting and placement passes, then compares normalized and
-original words to collect address-patch positions. These are production uses of
-instruction interpretation, beyond the independent validation/diagnostic decoder.
-The proposal retains relocation sites during encoding instead of discarding and
-recovering them. The independent decoder remains useful for verification and SDK
-captures.
+[Incremental encoding](../crates/ipu-exchange/src/encoding.rs) retains the words
+and sites together in shared chunks. Reusing a checkpoint truncates every site
+list at the same instruction boundary. A staged trial's identity is part of its
+input, so identical words cannot retain another transfer's relocation identity.
+
+[Repeat relocation](../crates/ipu-codegen/src/exchange/relocation.rs) uses send
+identities directly to find the source sequence and price its patch count.
+`EncodedRow` changes address fields and base-register operands without another
+opcode walk; changing a base operand updates its retained site as well.
+[Schedule replay](../crates/ipu-codegen/src/exchange/reuse.rs) normalizes only the
+retained address fields. [Row sharing](../crates/ipu-codegen/src/tile.rs) uses those
+same fields and unions the nonzero address sites across invocations. Each
+invocation restores that union, including zero addresses left by earlier rows.
+Metadata is discarded at final instruction/data emission.
+
+[Diagnostics](../crates/ipu-exchange/src/diagnostic.rs) independently decodes
+SDK/imported rows and validates generated instruction timing. Encoding tests
+compare every retained site against that decoder, including zero fields,
+paired restarts, inline receive controls, reordered messages and reused prefixes.
+The production relocation, normalization and sharing paths no longer reconstruct
+sites from encoded instructions.
 
 ## Costs and caches
 

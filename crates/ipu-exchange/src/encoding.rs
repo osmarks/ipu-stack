@@ -1,14 +1,31 @@
 //! Reuse an encoded prefix only while its sender, control, and lookahead inputs
 //! remain unchanged. Speculative transfers still run the ordinary row encoder.
-use super::*;
+use crate::chunked::Chunked;
+use crate::{
+    EncodedRow, ExchangeError, OutgoingBaseWrite, ReceiveEvent, ScheduledSenderRow, SendAddress,
+    append_receive_events_record, append_sender_message, plan_event_cycles,
+    validate_receive_events,
+};
+use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 
-/// The row encoder needs only append and absolute word parity. Primitive rows
-/// use a Vec; speculative phase rows share chunks through the same encoder.
-pub(super) trait RowWords: Extend<u32> {
+/// Primitive timing rows and executable rows share the same emission path.
+/// The executable sink additionally retains relocation sites in shared chunks.
+pub(super) trait RowSink: Extend<u32> {
     fn len(&self) -> usize;
     fn push(&mut self, word: u32);
+    // Primitive timing rows do not survive phase construction. Only the
+    // executable row retains relocation sites, at their final word positions.
+    fn send_address(&mut self, _: u32, _: u32, _: u8) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+    fn receive_pointer(&mut self, _: usize) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+    fn outgoing_base(&mut self, _: u8) -> Result<(), ExchangeError> {
+        Ok(())
+    }
 }
-impl RowWords for Vec<u32> {
+impl RowSink for Vec<u32> {
     fn len(&self) -> usize {
         Vec::len(self)
     }
@@ -16,30 +33,100 @@ impl RowWords for Vec<u32> {
         Vec::push(self, word);
     }
 }
-impl RowWords for Chunked<u32> {
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RowBuffer {
+    words: Chunked<u32>,
+    sends: Chunked<SendAddress>,
+    receive_pointers: Chunked<u32>,
+    outgoing_bases: Chunked<OutgoingBaseWrite>,
+}
+
+impl RowBuffer {
+    fn truncate(&mut self, words: usize) {
+        self.words.truncate(words);
+        self.sends.truncate(
+            self.sends
+                .partition_point(|site| (site.word_offset as usize) < words),
+        );
+        self.receive_pointers.truncate(
+            self.receive_pointers
+                .partition_point(|&offset| (offset as usize) < words),
+        );
+        self.outgoing_bases.truncate(
+            self.outgoing_bases
+                .partition_point(|site| (site.word_offset as usize) < words),
+        );
+    }
+
+    fn finish(&self) -> EncodedRow {
+        EncodedRow {
+            words: self.words.to_vec(),
+            sends: self.sends.to_vec(),
+            receive_pointers: self.receive_pointers.to_vec(),
+            outgoing_bases: self.outgoing_bases.to_vec(),
+        }
+    }
+}
+
+impl Extend<u32> for RowBuffer {
+    fn extend<T: IntoIterator<Item = u32>>(&mut self, words: T) {
+        self.words.extend(words);
+    }
+}
+
+fn word_offset(offset: usize) -> Result<u32, ExchangeError> {
+    u32::try_from(offset).map_err(|_| ExchangeError::Schedule("row word offset exceeds u32"))
+}
+
+impl RowSink for RowBuffer {
     fn len(&self) -> usize {
-        Chunked::len(self)
+        self.words.len()
     }
     fn push(&mut self, word: u32) {
-        Chunked::push(self, word);
+        self.words.push(word);
+    }
+    fn send_address(
+        &mut self,
+        message: u32,
+        byte_offset: u32,
+        item_shift: u8,
+    ) -> Result<(), ExchangeError> {
+        self.sends.push(SendAddress {
+            word_offset: word_offset(self.len())?,
+            message,
+            byte_offset,
+            item_shift,
+        });
+        Ok(())
+    }
+    fn receive_pointer(&mut self, offset: usize) -> Result<(), ExchangeError> {
+        self.receive_pointers.push(word_offset(offset)?);
+        Ok(())
+    }
+    fn outgoing_base(&mut self, register: u8) -> Result<(), ExchangeError> {
+        self.outgoing_bases.push(OutgoingBaseWrite {
+            word_offset: word_offset(self.len())?,
+            register,
+        });
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 pub(super) struct EncodedSchedule {
     checkpoints: Chunked<Checkpoint>,
-    words: Chunked<u32>,
+    row: RowBuffer,
     #[cfg(test)]
     resumed_words: usize,
 }
 
 impl EncodedSchedule {
-    pub(super) fn words(&self) -> Vec<u32> {
-        self.words.to_vec()
+    pub(super) fn finish(&self) -> EncodedRow {
+        self.row.finish()
     }
     #[cfg(test)]
-    pub(super) fn same_words(&self, other: &Self) -> bool {
-        self.words == other.words
+    pub(super) fn same_row(&self, other: &Self) -> bool {
+        self.row == other.row
     }
 }
 
@@ -100,7 +187,7 @@ pub(super) fn build_scheduled_program(
     }
     validate_receive_events(&events.slice(changed..events.len()))?;
 
-    let mut words = Chunked::default();
+    let mut words = RowBuffer::default();
     let mut checkpoints = Chunked::default();
     let mut resume = Checkpoint::default();
     if let Some((prefix, same_senders, same_events)) = prefix
@@ -114,7 +201,7 @@ pub(super) fn build_scheduled_program(
             })
     {
         resume = *checkpoint;
-        words = prefix.words.clone();
+        words = prefix.row.clone();
         words.truncate(resume.words);
         checkpoints = prefix.checkpoints.clone();
         checkpoints.truncate(index + 1);
@@ -163,10 +250,10 @@ pub(super) fn build_scheduled_program(
         });
     }
     words.push(RETURN_M10_INSTRUCTION);
-    debug_assert_eq!(plan_event_cycles(&words.to_vec())?, horizon_cycles);
+    debug_assert_eq!(plan_event_cycles(&words.words.to_vec())?, horizon_cycles);
     Ok(EncodedSchedule {
         checkpoints,
-        words,
+        row: words,
         #[cfg(test)]
         resumed_words: resume.words,
     })
@@ -175,6 +262,7 @@ pub(super) fn build_scheduled_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
 
     #[test]
     fn outgoing_base_uses_control_gaps_and_preserves_incremental_encoding() {
@@ -185,7 +273,7 @@ mod tests {
             let mut plan = multicast(&topology, source, &receivers, 64, 0).unwrap();
             patch_sender_address(&mut plan.sender, 0x10000 + round * 256).unwrap();
             patch_receiver_address(&mut plan.receivers[0], 0x50000 + round * 256).unwrap();
-            let prepared = plan.prepare().unwrap();
+            let prepared = plan.prepare(round).unwrap();
             let offset = builder
                 .earliest_transfer_offset(source, &[], &receivers, &prepared, 64, 0)
                 .unwrap();
@@ -207,13 +295,13 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                assert!(incremental.same_words(&full));
+                assert!(incremental.same_row(&full));
                 state.finish().unwrap();
             }
         }
         let mut builder = PhaseProgramBuilder::new(4);
         let plan = multicast(&topology, 1, &[0], 256, 0).unwrap();
-        let plan = plan.prepare().unwrap();
+        let plan = plan.prepare(0).unwrap();
         let offset = builder
             .earliest_transfer_offset(1, &[], &[0], &plan, 256, 0)
             .unwrap();
@@ -233,7 +321,7 @@ mod tests {
         let plan = multicast(&topology, 0, &[2], 64, 0).unwrap();
         let mut builder = PhaseProgramBuilder::new(4);
         let offset = builder
-            .earliest_transfer_offset(0, &[], &[2], &plan.prepare().unwrap(), 64, 0)
+            .earliest_transfer_offset(0, &[], &[2], &plan.prepare(0).unwrap(), 64, 0)
             .unwrap();
         let encoded = builder
             .staged
@@ -244,7 +332,7 @@ mod tests {
             .map(|(tile, schedule)| (*tile, schedule.encoded().unwrap().clone()))
             .collect::<Vec<_>>();
         builder
-            .append_transfer_at(0, &[], &[2], &plan.prepare().unwrap(), offset, 64)
+            .append_transfer_at(0, &[], &[2], &plan.prepare(0).unwrap(), offset, 64)
             .unwrap();
         assert!(builder.staged.is_none());
         for (tile, row) in encoded {
@@ -255,31 +343,55 @@ mod tests {
         }
         let before = builder.finish().unwrap();
         let offset = builder
-            .earliest_transfer_offset(0, &[], &[2], &plan.prepare().unwrap(), 64, 0)
+            .earliest_transfer_offset(0, &[], &[2], &plan.prepare(0).unwrap(), 64, 0)
             .unwrap();
         assert!(
             builder
-                .append_transfer_at(0, &[2, 2], &[2], &plan.prepare().unwrap(), offset, 64)
+                .append_transfer_at(0, &[2, 2], &[2], &plan.prepare(0).unwrap(), offset, 64)
                 .is_err()
         );
         assert_eq!(builder.finish().unwrap(), before);
         // A different transfer must not accidentally commit the cached rows.
         builder
-            .earliest_transfer_offset(0, &[], &[2], &plan.prepare().unwrap(), 64, 0)
+            .earliest_transfer_offset(0, &[], &[2], &plan.prepare(0).unwrap(), 64, 0)
             .unwrap();
         let other = multicast(&topology, 1, &[3], 32, 0).unwrap();
         let offset = builder
-            .earliest_transfer_offset_deferred(1, &[], &[3], &other.prepare().unwrap(), 32, 0)
+            .earliest_transfer_offset_deferred(1, &[], &[3], &other.prepare(0).unwrap(), 32, 0)
             .unwrap();
         let mut reference = builder.clone();
         reference.staged = None;
         reference
-            .append_transfer_at(1, &[], &[3], &other.prepare().unwrap(), offset, 32)
+            .append_transfer_at(1, &[], &[3], &other.prepare(0).unwrap(), offset, 32)
             .unwrap();
         builder
-            .append_transfer_at(1, &[], &[3], &other.prepare().unwrap(), offset, 32)
+            .append_transfer_at(1, &[], &[3], &other.prepare(0).unwrap(), offset, 32)
             .unwrap();
         assert_eq!(builder.finish().unwrap(), reference.finish().unwrap());
+    }
+
+    #[test]
+    fn message_identity_survives_trial_replacement_and_insertion_before_a_cached_send() {
+        let topology = Topology::c600();
+        let late = multicast(&topology, 0, &[1], 32, 0).unwrap();
+        let early = multicast(&topology, 0, &[2], 32, 0).unwrap();
+        let mut builder = PhaseProgramBuilder::new(3);
+        let offset = builder
+            .earliest_transfer_offset(0, &[], &[1], &late.prepare(41).unwrap(), 32, 512)
+            .unwrap();
+        // Same words and timing, different caller identity: the speculative
+        // row must not retain message 41 in its relocation metadata.
+        builder
+            .append_transfer_at(0, &[], &[1], &late.prepare(7).unwrap(), offset, 32)
+            .unwrap();
+        let row = builder.finish().unwrap().programs.remove(0).unwrap();
+        assert_eq!(row.send_addresses()[0].message, 7);
+
+        builder
+            .append_transfer_at(0, &[], &[2], &early.prepare(99).unwrap(), 0, 32)
+            .unwrap();
+        let row = builder.finish().unwrap().programs.remove(0).unwrap();
+        row.assert_relocation_sites([99, 7].into_iter());
     }
 
     #[test]
@@ -319,14 +431,14 @@ mod tests {
         let mut schedule = TileProgramSchedule::default();
         for offset in [3000, 1000, 2000] {
             schedule
-                .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
+                .append_sender_at(0, &row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                 .unwrap();
         }
         let before = schedule.finish().unwrap();
         for offset in [1999, 2000, 2001] {
             assert!(
                 schedule
-                    .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
+                    .append_sender_at(0, &row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                     .is_err()
             );
             assert_eq!(schedule.finish().unwrap(), before);
@@ -334,7 +446,7 @@ mod tests {
         let mut ordered = TileProgramSchedule::default();
         for offset in [1000, 2000, 3000] {
             ordered
-                .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
+                .append_sender_at(0, &row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                 .unwrap();
         }
         assert_eq!(ordered.finish().unwrap(), before);
@@ -347,20 +459,20 @@ mod tests {
         let plan = multicast(&topology, 0, &receivers, 64, 0).unwrap();
         let mut builder = PhaseProgramBuilder::new(4).with_validation_budget(2);
         let offset = builder
-            .earliest_transfer_offset(0, &[], &receivers, &plan.prepare().unwrap(), 64, 0)
+            .earliest_transfer_offset(0, &[], &receivers, &plan.prepare(0).unwrap(), 64, 0)
             .unwrap();
         builder
-            .append_transfer_at(0, &[], &receivers, &plan.prepare().unwrap(), offset, 64)
+            .append_transfer_at(0, &[], &receivers, &plan.prepare(0).unwrap(), offset, 64)
             .unwrap();
         assert_eq!(
-            builder.earliest_transfer_offset(0, &[], &receivers, &plan.prepare().unwrap(), 64, 0),
+            builder.earliest_transfer_offset(0, &[], &receivers, &plan.prepare(0).unwrap(), 64, 0),
             Err(ExchangeError::ValidationBudgetExceeded)
         );
         let offset = builder
-            .earliest_transfer_offset_deferred(0, &[], &receivers, &plan.prepare().unwrap(), 64, 0)
+            .earliest_transfer_offset_deferred(0, &[], &receivers, &plan.prepare(0).unwrap(), 64, 0)
             .unwrap();
         builder
-            .append_transfer_at(0, &[], &receivers, &plan.prepare().unwrap(), offset, 64)
+            .append_transfer_at(0, &[], &receivers, &plan.prepare(0).unwrap(), offset, 64)
             .unwrap();
         builder.finish().unwrap();
     }
@@ -391,13 +503,13 @@ mod tests {
                 prefix = Some(schedule.encoded().unwrap().clone());
             }
             let encoded = prefix.unwrap();
-            let checksum = encoded.words.iter().fold(0u64, |hash, &word| {
+            let checksum = encoded.row.words.iter().fold(0u64, |hash, &word| {
                 hash.wrapping_mul(31).wrapping_add(u64::from(word))
             });
             println!(
                 "{count},{},{},{checksum}",
                 started.elapsed().as_micros(),
-                encoded.words.len()
+                encoded.row.words.len()
             );
         }
     }
@@ -439,7 +551,7 @@ mod tests {
                 )
                 .unwrap()
             };
-            assert_eq!(encode(false).words, encode(true).words);
+            assert_eq!(encode(false).row, encode(true).row);
             let mut times = [Vec::new(), Vec::new()];
             for round in 0..5 {
                 for choice in [round % 2, 1 - round % 2] {
@@ -479,7 +591,7 @@ mod tests {
             schedule.finish().unwrap();
         }
         let encoded = schedule.encoded().unwrap();
-        assert!(encoded.resumed_words > encoded.words.len() / 2);
+        assert!(encoded.resumed_words > encoded.row.words.len() / 2);
     }
 
     #[test]
@@ -490,7 +602,7 @@ mod tests {
             let mut builder = PhaseProgramBuilder::new(8);
             for index in 0..256 {
                 let words = random.u32(64..=128);
-                let (source, receivers, reserved, plan) = if index % 4 == 0 {
+                let (source, receivers, reserved, mut plan) = if index % 4 == 0 {
                     let source = random.u16(0..4) * 2;
                     let destination = (source + 2) % 8;
                     let receivers = vec![destination, destination + 1];
@@ -507,12 +619,16 @@ mod tests {
                     let plan = multicast(&topology, source, &receivers, words, 0).unwrap();
                     (source, receivers, vec![], plan)
                 };
+                patch_sender_address(&mut plan.sender, random.u32(0..0x10000) * 8).unwrap();
+                for receiver in &mut plan.receivers {
+                    patch_receiver_address(receiver, random.u32(0..0x10000) * 8).unwrap();
+                }
                 let offset = builder
                     .earliest_transfer_offset(
                         source,
                         &reserved,
                         &receivers,
-                        &plan.prepare().unwrap(),
+                        &plan.prepare(index).unwrap(),
                         words,
                         0,
                     )
@@ -522,7 +638,7 @@ mod tests {
                         source,
                         &reserved,
                         &receivers,
-                        &plan.prepare().unwrap(),
+                        &plan.prepare(index).unwrap(),
                         offset,
                         words,
                     )
@@ -539,6 +655,7 @@ mod tests {
         // earlier, so it belongs to the preceding receive-only interval.
         let mut schedule = TileProgramSchedule::default();
         schedule.senders.push(ScheduledSenderRow {
+            message: 0,
             row: [
                 1098907651, 1084227612, 2070642691, 1134559232, 0, 0, 0, 0, 0,
             ],
@@ -551,7 +668,7 @@ mod tests {
             kind: ReceiveEventKind::OrdinaryNeutral,
         });
         schedule.event_cycles = 5382;
-        let words = schedule.finish().unwrap();
+        let words = schedule.finish().unwrap().into_words();
         assert_eq!(plan_event_cycles(&words).unwrap(), 5382);
         diagnostic::validate_tile_program(0, &schedule, &words).unwrap();
     }

@@ -27,7 +27,9 @@ use std::sync::{Arc, OnceLock};
 mod chunked;
 use chunked::Chunked;
 mod encoding;
-use encoding::{EncodedSchedule, RowWords, build_scheduled_program};
+use encoding::{EncodedSchedule, RowSink, build_scheduled_program};
+mod row;
+pub use row::{EncodedRow, OutgoingBaseWrite, SendAddress};
 use tracing::debug;
 
 pub mod diagnostic;
@@ -128,6 +130,7 @@ struct ReceiveStream {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScheduledSenderRow {
+    message: u32,
     row: PlanRow,
     start_cycles: u32,
     end_cycles: u32,
@@ -136,6 +139,7 @@ struct ScheduledSenderRow {
 /// A primitive transfer decoded once for offset search, hazard checks and insertion.
 /// Borrowing the rows prevents address patches from invalidating the timing.
 pub struct PreparedTransfer<'a> {
+    message: u32,
     rows: &'a MulticastPlan,
     sender: ScheduledPayloadTiming,
     receivers: Vec<ReceiveRowTiming>,
@@ -154,8 +158,11 @@ impl PreparedTransfer<'_> {
 }
 
 impl MulticastPlan {
-    pub fn prepare(&self) -> Result<PreparedTransfer<'_>, ExchangeError> {
+    /// Retain the caller's transfer identity through speculative insertion,
+    /// chronological reordering and final source-address relocation.
+    pub fn prepare(&self, message: u32) -> Result<PreparedTransfer<'_>, ExchangeError> {
         Ok(PreparedTransfer {
+            message,
             rows: self,
             sender: scheduled_sender_timing(&self.sender, 0)?,
             receivers: self
@@ -176,6 +183,7 @@ pub struct PhaseProgramBuilder {
 
 #[derive(Clone, Debug)]
 struct StagedTransfer {
+    message: u32,
     source: u16,
     receivers: Vec<u16>,
     plan: MulticastPlan,
@@ -187,13 +195,15 @@ struct StagedTransfer {
 impl StagedTransfer {
     fn matches(
         &self,
+        message: u32,
         source: u16,
         receivers: &[u16],
         plan: &MulticastPlan,
         offset: u32,
         words: u32,
     ) -> bool {
-        self.source == source
+        self.message == message
+            && self.source == source
             && self.receivers == receivers
             && self.plan == *plan
             && self.offset == offset
@@ -212,7 +222,7 @@ pub struct PhaseTransferTiming {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhasePrograms {
-    pub programs: Vec<Option<Vec<u32>>>,
+    pub programs: Vec<Option<EncodedRow>>,
     pub tile_event_cycles: Vec<u32>,
     pub event_cycles: u32,
 }
@@ -275,7 +285,7 @@ impl PhaseProgramBuilder {
                 ReceiveEvent {
                     cycles: end,
                     instruction,
-                    kind: ReceiveEventKind::OutgoingBase,
+                    kind: ReceiveEventKind::OutgoingBase(register),
                 },
             );
             candidate.event_cycles = candidate.event_cycles.max(end);
@@ -437,7 +447,14 @@ impl PhaseProgramBuilder {
         words: u32,
     ) -> Result<(), ExchangeError> {
         if self.staged.as_ref().is_some_and(|trial| {
-            trial.matches(source, receivers, plan.rows, schedule_offset, words)
+            trial.matches(
+                plan.message,
+                source,
+                receivers,
+                plan.rows,
+                schedule_offset,
+                words,
+            )
         }) {
             return Ok(());
         }
@@ -464,6 +481,7 @@ impl PhaseProgramBuilder {
         let updates =
             self.prepare_transfer_at(source, receivers, plan, schedule_offset, words, true)?;
         self.staged = Some(StagedTransfer {
+            message: plan.message,
             source,
             receivers: receivers.to_vec(),
             plan: plan.rows.clone(),
@@ -496,7 +514,7 @@ impl PhaseProgramBuilder {
             let _ = source_state.encoded();
         }
         let mut source_schedule = source_state.clone();
-        source_schedule.append_sender_at(&plan.rows.sender, &plan.sender, offset)?;
+        source_schedule.append_sender_at(plan.message, &plan.rows.sender, &plan.sender, offset)?;
         if validate {
             source_schedule.encoded()?;
         }
@@ -545,7 +563,14 @@ impl PhaseProgramBuilder {
             self.transfer_timing_at(source, receivers, plan, schedule_offset, words)?;
         let mut updates = match self.staged.take() {
             Some(staged)
-                if staged.matches(source, receivers, plan.rows, schedule_offset, words) =>
+                if staged.matches(
+                    plan.message,
+                    source,
+                    receivers,
+                    plan.rows,
+                    schedule_offset,
+                    words,
+                ) =>
             {
                 staged.updates
             }
@@ -660,7 +685,7 @@ impl PhaseProgramBuilder {
                     return Ok(None);
                 }
                 let program = schedule.finish()?;
-                diagnostic::validate_tile_program(tile, schedule, &program)?;
+                diagnostic::validate_tile_program(tile, schedule, program.words())?;
                 Ok(Some(program))
             })
             .collect::<Result<Vec<_>, ExchangeError>>()?;
@@ -695,7 +720,7 @@ impl TileProgramSchedule {
         self.receive_events
             .range(index..self.receive_events.len())
             .take_while(|event| event.cycles <= start.saturating_add(1))
-            .any(|event| event.kind != ReceiveEventKind::OutgoingBase)
+            .any(|event| !matches!(event.kind, ReceiveEventKind::OutgoingBase(_)))
     }
 
     /// Advances a requested transfer offset until its outgoing message does
@@ -844,6 +869,7 @@ impl TileProgramSchedule {
     /// requiring that offset to fit in the primitive row's spare words.
     fn append_sender_at(
         &mut self,
+        message: u32,
         row: &PlanRow,
         base: &ScheduledPayloadTiming,
         schedule_offset: u32,
@@ -882,6 +908,7 @@ impl TileProgramSchedule {
         self.senders.insert(
             index,
             ScheduledSenderRow {
+                message,
                 row: *row,
                 start_cycles: timing.payload_start,
                 end_cycles: timing.payload_end,
@@ -994,7 +1021,7 @@ impl TileProgramSchedule {
                 None,
             );
             match (&result, &full) {
-                (Ok(incremental), Ok(full)) => assert!(incremental.same_words(full)),
+                (Ok(incremental), Ok(full)) => assert!(incremental.same_row(full)),
                 _ => assert_eq!(result.as_ref().err(), full.as_ref().err()),
             }
         }
@@ -1002,8 +1029,11 @@ impl TileProgramSchedule {
         Ok(self.encoded.get().expect("successful encoding was cached"))
     }
 
-    pub fn finish(&self) -> Result<Vec<u32>, ExchangeError> {
-        Ok(self.encoded()?.words())
+    pub fn finish(&self) -> Result<EncodedRow, ExchangeError> {
+        let row = self.encoded()?.finish();
+        #[cfg(test)]
+        row.assert_relocation_sites(self.senders.iter().map(|sender| sender.message));
+        Ok(row)
     }
 }
 
@@ -1016,7 +1046,7 @@ enum ReceiveEventKind {
     PairedPointer,
     Pointer,
     Format,
-    OutgoingBase,
+    OutgoingBase(u8),
 }
 
 impl ReceiveEventKind {
@@ -1029,6 +1059,10 @@ impl ReceiveEventKind {
 
     fn is_pic(self) -> bool {
         matches!(self, Self::Pointer | Self::PairedPointer | Self::Format)
+    }
+
+    fn is_pointer(self) -> bool {
+        matches!(self, Self::Pointer | Self::PairedPointer)
     }
 }
 
@@ -1050,7 +1084,7 @@ impl ReceiveEvent {
     // absorb earlier idle cycles; an ordinary CSR write has fixed duration.
     fn issue_start(&self) -> u32 {
         self.cycles
-            .saturating_sub(if self.kind == ReceiveEventKind::OutgoingBase {
+            .saturating_sub(if matches!(self.kind, ReceiveEventKind::OutgoingBase(_)) {
                 EXCHANGE_BASE_WRITE_CYCLES
             } else {
                 1
@@ -1227,7 +1261,7 @@ fn scheduled_receive_window(
             ReceiveEventKind::PairedSource
             | ReceiveEventKind::PairedNeutral
             | ReceiveEventKind::Format => Some(event),
-            ReceiveEventKind::OutgoingBase => {
+            ReceiveEventKind::OutgoingBase(_) => {
                 unreachable!("base writes are not primitive receive events")
             }
         })
@@ -1367,7 +1401,7 @@ fn receive_row_timing(
                     return Err(ExchangeError::Schedule("multiple receive pointers"));
                 }
             }
-            ReceiveEventKind::OutgoingBase => {
+            ReceiveEventKind::OutgoingBase(_) => {
                 unreachable!("base writes are not primitive receive events")
             }
             ReceiveEventKind::Format => {
@@ -1537,7 +1571,7 @@ fn receive_row_timing_from_base(
 }
 
 fn append_sender_message(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
     sender: &ScheduledSenderRow,
     controls: &[ReceiveEvent],
@@ -1545,6 +1579,7 @@ fn append_sender_message(
     append_plain_delay(words, event_cycles, sender.start_cycles)?;
     let (initial_instruction, payload_words) = sender_payload(&sender.row)?;
     let direction = initial_instruction & 7;
+    let item_shift = if direction & 4 != 0 { 3 } else { 2 };
     let initial_source = (initial_instruction & SEND_ADDRESS_MASK) >> 3;
     let mut remaining = payload_words;
     let mut sent = 0u32;
@@ -1571,6 +1606,7 @@ fn append_sender_message(
         emit_sender_words(
             words,
             event_cycles,
+            sender.message,
             initial_instruction,
             direction,
             &mut remaining,
@@ -1609,8 +1645,15 @@ fn append_sender_message(
                 .ok_or(ExchangeError::Schedule("SENDPICP source overflow"))?;
             let (instruction, payload) =
                 encode_send_control_pair(chunk - 1, source, direction, group)?;
+            words.send_address(sender.message, sent << item_shift, item_shift)?;
+            if group.iter().any(|event| event.kind.is_pointer()) {
+                words.receive_pointer(words.len() + 1)?;
+            }
             words.extend([instruction, payload]);
         } else {
+            if group[0].kind.is_pointer() {
+                words.receive_pointer(words.len())?;
+            }
             words.push(encode_send_control(chunk - 1, group[0])?);
         }
         *event_cycles += chunk;
@@ -1621,6 +1664,7 @@ fn append_sender_message(
 
     if !started {
         let first = remaining.min(64);
+        words.send_address(sender.message, 0, item_shift)?;
         words.push(resize_send(initial_instruction, first)?);
         *event_cycles += first;
         remaining -= first;
@@ -1639,8 +1683,9 @@ fn append_sender_message(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_sender_words(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
+    message: u32,
     initial_instruction: u32,
     direction: u32,
     remaining: &mut u32,
@@ -1682,6 +1727,7 @@ fn emit_sender_words(
 
     for chunk in chunks {
         if !*started {
+            words.send_address(message, 0, if direction & 4 != 0 { 3 } else { 2 })?;
             words.push(resize_send(initial_instruction, chunk)?);
             *started = true;
         } else {
@@ -1732,7 +1778,7 @@ fn encode_send_control(count_minus_one: u32, event: ReceiveEvent) -> Result<u32,
         return Err(ExchangeError::Schedule("SENDPIC count"));
     }
     let (selector, operand) = match event.kind {
-        ReceiveEventKind::OutgoingBase => {
+        ReceiveEventKind::OutgoingBase(_) => {
             return Err(ExchangeError::Schedule("base switch inside send"));
         }
         ReceiveEventKind::OrdinarySource
@@ -1750,7 +1796,7 @@ fn encode_send_control(count_minus_one: u32, event: ReceiveEvent) -> Result<u32,
 }
 
 fn append_receive_events(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
     events: &[ReceiveEvent],
     horizon_cycles: u32,
@@ -1767,7 +1813,7 @@ fn append_receive_events(
 }
 
 fn append_receive_events_record(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
     events: &[ReceiveEvent],
     horizon_cycles: u32,
@@ -1785,7 +1831,7 @@ fn append_receive_events_record(
         let next_start = events
             .get(end)
             .map_or(horizon_cycles, |next| next.issue_start());
-        if group[0].kind == ReceiveEventKind::OutgoingBase {
+        if let ReceiveEventKind::OutgoingBase(register) = group[0].kind {
             if group.len() != 1 {
                 return Err(ExchangeError::Schedule(
                     "base write overlaps receive control",
@@ -1797,6 +1843,7 @@ fn append_receive_events_record(
                 event_cycles,
                 event.cycles - EXCHANGE_BASE_WRITE_CYCLES,
             )?;
+            words.outgoing_base(register)?;
             words.push(event.instruction);
             *event_cycles = event.cycles;
         } else if group.len() == 2 {
@@ -1821,6 +1868,9 @@ fn append_receive_events_record(
                 return Err(ExchangeError::Schedule("empty SENDPICP interval"));
             }
             let (instruction, payload) = encode_send_control_pair(advance - 1, 0, 0, group)?;
+            if group.iter().any(|event| event.kind.is_pointer()) {
+                words.receive_pointer(words.len() + 1)?;
+            }
             words.extend([instruction, payload]);
             *event_cycles += advance;
         } else {
@@ -1839,6 +1889,9 @@ fn append_receive_events_record(
                 append_plain_delay(words, event_cycles, event.cycles - maximum_advance)?;
             }
             set_instruction_advance(&mut instruction, event.cycles - *event_cycles)?;
+            if event.kind.is_pointer() {
+                words.receive_pointer(words.len())?;
+            }
             words.push(instruction);
             *event_cycles = event.cycles;
         }
@@ -1893,7 +1946,7 @@ fn encode_send_control_pair(
 }
 
 fn append_plain_delay(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
     target_cycles: u32,
 ) -> Result<(), ExchangeError> {
@@ -1913,7 +1966,7 @@ fn append_plain_delay(
 /// two-word-instruction alignment. Exchange rows are placed at eight-byte
 /// boundaries, so `word_parity == 0` aligns a following SENDPICP and payload.
 fn append_plain_delay_aligned(
-    words: &mut impl RowWords,
+    words: &mut impl RowSink,
     event_cycles: &mut u32,
     target_cycles: u32,
     word_parity: usize,
@@ -2898,80 +2951,6 @@ pub fn patch_sender_instruction(
     Ok(())
 }
 
-/// Address-bearing instructions for each outgoing message, in execution
-/// order. Each entry is `(word offset, byte offset from the message source)`.
-/// SENDPICP restarts the outgoing source stream explicitly after its inline
-/// control word, so repeat relocation must patch it as well as the first SEND.
-pub fn sender_address_instruction_groups(
-    row: &[u32],
-) -> Result<Vec<Vec<(usize, u32)>>, ExchangeError> {
-    let mut groups = Vec::<Vec<(usize, u32)>>::new();
-    let mut source_address = None;
-    let mut cursor = 0;
-    while cursor < row.len() {
-        let instruction = row[cursor];
-        let address =
-            || ((instruction & SEND_ADDRESS_MASK) >> 3) << if instruction & 4 != 0 { 3 } else { 2 };
-        if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
-            groups.push(vec![(cursor, 0)]);
-            source_address = Some(address());
-        } else if is_send_control_pair(instruction) && instruction & 7 != 0 {
-            let source = source_address.ok_or(ExchangeError::Schedule(
-                "SENDPICP precedes initial outgoing SEND",
-            ))?;
-            // The restart contains its absolute source address. Read it directly;
-            // recovering it from instruction durations duplicates stream logic.
-            let offset = address()
-                .checked_sub(source)
-                .ok_or(ExchangeError::Schedule("SENDPICP precedes outgoing source"))?;
-            groups
-                .last_mut()
-                .ok_or(ExchangeError::Schedule("SENDPICP outgoing group"))?
-                .push((cursor, offset));
-        }
-        cursor += if is_send_control_pair(instruction) {
-            2
-        } else {
-            1
-        };
-    }
-    Ok(groups)
-}
-
-/// Removes tile-memory address fields while retaining exchange roles, routes,
-/// transfer sizes, and event timing. Rows with the same result can share one
-/// executable slot and restore their addresses before invocation.
-pub fn normalized_exchange_address_words(row: &[u32]) -> Vec<u32> {
-    let mut normalized = row.to_vec();
-    let mut cursor = 0;
-    while cursor < normalized.len() {
-        let instruction = normalized[cursor];
-        if is_send_control_pair(instruction) {
-            if instruction & 7 != 0 {
-                normalized[cursor] &= !SEND_ADDRESS_MASK;
-            }
-            if instruction & (1 << 27) == 0
-                && let Some(payload) = normalized.get_mut(cursor + 1)
-            {
-                *payload &= !PIC_RECEIVE_ADDRESS_MASK;
-            }
-            cursor += 2;
-            continue;
-        }
-        normalized[cursor] = if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
-            instruction & !SEND_ADDRESS_MASK
-        } else if (is_send_control(instruction) && (instruction >> 18) & 3 == 2)
-            || (instruction & OPCODE_MASK == DELAY_PIC_OPCODE && instruction & (1 << 18) == 0)
-        {
-            instruction & !PIC_RECEIVE_ADDRESS_MASK
-        } else {
-            instruction
-        };
-        cursor += 1;
-    }
-    normalized
-}
-
 pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
     if byte_address & 3 != 0 || byte_address >> 2 > PIC_RECEIVE_ADDRESS_MASK {
         return Err(ExchangeError::Address(byte_address));
@@ -3133,6 +3112,7 @@ mod tests {
                 let start = end + rng.u32(0..12);
                 end = start + rng.u32(1..32);
                 schedule.senders.push(ScheduledSenderRow {
+                    message: 0,
                     row,
                     start_cycles: start,
                     end_cycles: end,
@@ -3174,48 +3154,6 @@ mod tests {
                 assert_eq!(
                     schedule.earliest_sender_offset(&base, requested).unwrap(),
                     expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn normalizes_all_sender_address_fields() {
-        let row = [
-            SYNC_SUPERVISOR_INSTRUCTION,
-            encode_send(1, 3, 0x1a048).unwrap(),
-            SEND_PICP_OPCODE | (7 << 21) | (0x1a04a << 3) | 3,
-            0x1901_5000,
-            RETURN_M10_INSTRUCTION,
-        ];
-        let normalized = normalized_exchange_address_words(&row);
-        assert_eq!(normalized[1] ^ row[1], row[1] & SEND_ADDRESS_MASK);
-        assert_eq!(normalized[2] ^ row[2], row[2] & SEND_ADDRESS_MASK);
-        assert_eq!(normalized[0], row[0]);
-        assert_eq!(normalized[4], row[4]);
-    }
-
-    #[test]
-    fn restart_relocation_uses_encoded_addresses_for_both_send_widths() {
-        for mode in [3, 7] {
-            let shift = if mode & 4 != 0 { 3 } else { 2 };
-            let source = 0x50000;
-            let row = [
-                encode_send(1, mode, source >> shift).unwrap(),
-                SEND_PICP_OPCODE | (7 << 21) | (((source + 80) >> shift) << 3) | mode,
-                0x1901_5000,
-                RETURN_M10_INSTRUCTION,
-            ];
-            let groups = sender_address_instruction_groups(&row).unwrap();
-            assert_eq!(groups, vec![vec![(0, 0), (1, 80)]]);
-            for (word, offset) in &groups[0] {
-                let mut instruction = row[*word];
-                patch_sender_instruction(&mut instruction, source + offset).unwrap();
-                assert_eq!(instruction, row[*word]);
-                patch_sender_instruction(&mut instruction, source + 256 + offset).unwrap();
-                assert_eq!(
-                    ((instruction & SEND_ADDRESS_MASK) >> 3) << shift,
-                    source + 256 + offset
                 );
             }
         }
@@ -3309,7 +3247,7 @@ mod tests {
                     source,
                     &[source_pair],
                     &receivers,
-                    &plan.prepare().unwrap(),
+                    &plan.prepare(0).unwrap(),
                     64,
                     0,
                 )
@@ -3319,7 +3257,7 @@ mod tests {
                     source,
                     &[source_pair],
                     &receivers,
-                    &plan.prepare().unwrap(),
+                    &plan.prepare(0).unwrap(),
                     offset,
                     64,
                 )
@@ -3544,15 +3482,16 @@ mod tests {
             }
             let mut builder = PhaseProgramBuilder::new(1472);
             let offset = builder
-                .earliest_transfer_offset(0, &[], &receivers, &plan.prepare().unwrap(), words, 0)
+                .earliest_transfer_offset(0, &[], &receivers, &plan.prepare(0).unwrap(), words, 0)
                 .unwrap();
             builder
-                .append_transfer_at(0, &[], &receivers, &plan.prepare().unwrap(), offset, words)
+                .append_transfer_at(0, &[], &receivers, &plan.prepare(0).unwrap(), offset, words)
                 .unwrap();
             let programs = builder.finish().unwrap();
             let mut combined = TileProgramSchedule::default();
             combined
                 .append_sender_at(
+                    0,
                     &plan.sender,
                     &scheduled_sender_timing(&plan.sender, 0).unwrap(),
                     offset,
@@ -3569,7 +3508,10 @@ mod tests {
                 programs.programs[0].as_ref().unwrap(),
                 &combined.finish().unwrap()
             );
-            assert_ne!(combined.finish().unwrap(), plan.sender.to_vec());
+            assert_ne!(
+                combined.finish().unwrap().into_words(),
+                plan.sender.to_vec()
+            );
             assert!(programs.programs[274].is_some());
             assert!(programs.programs[1286].is_some());
         }
@@ -3849,7 +3791,7 @@ mod tests {
                 address += words * 4;
             }
             let expected_cycles = builder.event_cycles();
-            let program = builder.finish().unwrap();
+            let program = builder.finish().unwrap().into_words();
             assert_eq!(plan_event_cycles(&program).unwrap(), expected_cycles);
             assert_eq!(
                 program
@@ -3913,13 +3855,14 @@ mod tests {
                 .unwrap();
             builder
                 .append_sender_at(
+                    0,
                     &outgoing,
                     &scheduled_sender_timing(&outgoing, 0).unwrap(),
                     sender_offset,
                 )
                 .unwrap();
             let expected_horizon = builder.event_cycles();
-            let program = builder.finish().unwrap();
+            let program = builder.finish().unwrap().into_words();
             assert_eq!(plan_event_cycles(&program).unwrap(), expected_horizon);
             let outgoing_timing = scheduled_sender_timing(&outgoing, sender_offset).unwrap();
 
@@ -4076,13 +4019,14 @@ mod tests {
             .unwrap();
         relay
             .append_sender_at(
+                0,
                 &second.sender,
                 &scheduled_sender_timing(&second.sender, 0).unwrap(),
                 offset,
             )
             .unwrap();
         let relay_horizon = relay.event_cycles();
-        let relay = relay.finish().unwrap();
+        let relay = relay.finish().unwrap().into_words();
 
         assert_eq!(relay.last(), Some(&RETURN_M10_INSTRUCTION));
         assert_eq!(

@@ -249,7 +249,7 @@ pub(crate) fn build_wide(
         }
         let mut builder = PhaseProgramBuilder::new(execution_tiles);
         let paired_source = topology.paired_logical(source)?;
-        let prepared = plan.prepare()?;
+        let prepared = plan.prepare(0)?;
         let schedule_offset = builder.earliest_transfer_offset(
             source,
             &[paired_source],
@@ -267,7 +267,11 @@ pub(crate) fn build_wide(
             items,
         )?;
         let phase = builder.finish()?;
-        let mut rows = phase.programs;
+        let mut rows = phase
+            .programs
+            .into_iter()
+            .map(|row| row.map(ipu_exchange::EncodedRow::into_words))
+            .collect::<Vec<_>>();
         for row in rows.iter_mut().flatten() {
             row.insert(
                 0,
@@ -660,7 +664,7 @@ pub(crate) fn build(
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
                 patch_receiver_address(row, address)?;
             }
-            let prepared = plan.prepare()?;
+            let prepared = plan.prepare(0)?;
             let requested_schedule_offset = schedule_offset.unwrap_or(0);
             let schedule_offset = builder.earliest_transfer_offset(
                 source,
@@ -707,7 +711,12 @@ pub(crate) fn build(
                 timing,
             });
         }
-        let rows = builder.finish()?.programs;
+        let rows = builder
+            .finish()?
+            .programs
+            .into_iter()
+            .map(|row| row.map(ipu_exchange::EncodedRow::into_words))
+            .collect::<Vec<_>>();
         let maximum_row_words = rows
             .iter()
             .filter_map(|row| row.as_ref().map(Vec::len))
@@ -891,7 +900,7 @@ fn build_physical_phase_replay(
         .map(|tile| {
             let scheduled = tile < scheduled_tiles;
             let words = if scheduled {
-                phase.programs[usize::from(tile)].clone()
+                phase.programs[usize::from(tile)].words().to_vec()
             } else {
                 inactive_exchange_program()
             };
@@ -1648,11 +1657,11 @@ fn overlap_specs(
     let outgoing = point_plan(topology, pivot, outgoing_destination, words)?;
     let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
     let incoming_base =
-        empty.transfer_timing_at(incoming_source, &[pivot], &incoming.prepare()?, 0, words)?;
+        empty.transfer_timing_at(incoming_source, &[pivot], &incoming.prepare(0)?, 0, words)?;
     let outgoing_base = empty.transfer_timing_at(
         pivot,
         &[outgoing_destination],
-        &outgoing.prepare()?,
+        &outgoing.prepare(0)?,
         0,
         words,
     )?;

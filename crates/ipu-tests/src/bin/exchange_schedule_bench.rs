@@ -274,7 +274,7 @@ fn main() -> Result<()> {
                     "phase={} logicalTile={}\n{}",
                     problem.phase,
                     tile,
-                    diagnose_plan_program(words, None)?.render()
+                    diagnose_plan_program(words.words(), None)?.render()
                 );
             }
             let destination_count = problem
@@ -282,7 +282,12 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|transfer| transfer.destinations.len())
                 .sum::<usize>();
-            let row_words = run.phase.programs.iter().map(Vec::len).sum::<usize>();
+            let row_words = run
+                .phase
+                .programs
+                .iter()
+                .map(|row| row.words().len())
+                .sum::<usize>();
             let first_activities = run
                 .phase
                 .activities
@@ -291,7 +296,13 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>();
             let first_activity_span = first_activities.iter().max().unwrap_or(&0)
                 - first_activities.iter().min().unwrap_or(&0);
-            let maximum_row_words = run.phase.programs.iter().map(Vec::len).max().unwrap_or(0);
+            let maximum_row_words = run
+                .phase
+                .programs
+                .iter()
+                .map(|row| row.words().len())
+                .max()
+                .unwrap_or(0);
             if durations.len() == arguments.iterations {
                 durations.sort_unstable();
                 validation_durations.sort_unstable();
@@ -319,7 +330,10 @@ fn main() -> Result<()> {
                     {
                         use std::hash::{Hash, Hasher};
                         let mut hash = std::hash::DefaultHasher::new();
-                        run.phase.programs.hash(&mut hash);
+                        run.phase.programs.len().hash(&mut hash);
+                        for row in &run.phase.programs {
+                            row.words().hash(&mut hash);
+                        }
                         hash.finish()
                     },
                 );

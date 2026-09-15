@@ -1,6 +1,7 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 use ipu_target::ipu21::fabric::Topology;
+#[cfg(test)]
 use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::ipu21::memory::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
@@ -46,7 +47,7 @@ pub struct PhysicalExchangePhase {
     /// Whether each logical tile participates in this phase's timed program.
     pub active: Vec<bool>,
     /// Synchronization-free timed supervisor program indexed by logical tile.
-    pub programs: Vec<Vec<u32>>,
+    pub programs: Vec<ipu_exchange::EncodedRow>,
     /// Per-tile base used by point-to-point receive rows in this phase.
     pub incoming_bases: Vec<u32>,
     /// Final local exchange event indexed by logical tile. Inactive tiles use zero.
@@ -577,7 +578,7 @@ pub(crate) fn lower_exchanges_cached(
                     .programs
                     .iter()
                     .enumerate()
-                    .map(|(tile, row)| (tile, row.len()))
+                    .map(|(tile, row)| (tile, row.words().len()))
                     .max_by_key(|entry| entry.1)
                     .unwrap_or((0, 0));
                 tracing::info!(
@@ -1486,7 +1487,8 @@ pub fn validate_exchange_schedule(
         .map(|transfer| Topology::c600().paired_logical(transfer.source))
         .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
-        let decoded = ipu_exchange::diagnostic::diagnose_plan_program(&phase.programs[tile], None)?;
+        let decoded =
+            ipu_exchange::diagnostic::diagnose_plan_program(phase.programs[tile].words(), None)?;
         if decoded.event_cycles != phase.tile_event_cycles[tile] {
             return Err(fail(format!(
                 "phase {} tile {tile} decoded horizon {} differs from {}",
@@ -2102,6 +2104,7 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
 }
 
 struct ScheduledTransfer<'a> {
+    message: u32,
     source: u16,
     destinations: &'a [(u16, u32)],
     source_address: u32,
@@ -2241,6 +2244,7 @@ impl MaterializedSchedule {
             incoming_bases,
             receive_counts,
             ScheduledTransfer {
+                message: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 source: transfer.source,
                 destinations: &transfer.destinations,
                 source_address: transfer.source_address(),
@@ -2338,7 +2342,7 @@ impl MaterializedSchedule {
             programs: encoded
                 .programs
                 .into_iter()
-                .map(|program| program.unwrap_or_else(inactive_exchange_program))
+                .map(|program| program.unwrap_or_else(ipu_exchange::EncodedRow::inactive))
                 .collect(),
             incoming_bases,
             tile_event_cycles: encoded.tile_event_cycles,
@@ -2351,8 +2355,8 @@ impl MaterializedSchedule {
 
     fn finish_horizon(&mut self) {
         self.horizon = self.builder.event_cycles();
-        // The row builder can fill earlier gaps. Relocation and profiling must
-        // follow execution order, not the order in which transfers were chosen.
+        // The row builder can fill earlier gaps. Profiles follow execution
+        // order; relocation uses the transfer identity retained by encoding.
         for activities in &mut self.activities {
             activities.sort_by_key(|activity| activity.start_cycle);
         }
@@ -2546,7 +2550,7 @@ fn encoded_row_storage(
         .programs
         .iter()
         .fold((0, 0), |(maximum, total), row| {
-            let words = row.as_ref().map_or(0, |row| row.len());
+            let words = row.as_ref().map_or(0, |row| row.words().len());
             (maximum.max(words), total + words)
         }))
 }
@@ -2587,6 +2591,7 @@ fn append_transfer(
     validate_encoding: bool,
 ) -> Result<PhaseTransferTiming, ExchangeLoweringError> {
     let ScheduledTransfer {
+        message,
         source,
         destinations,
         source_address,
@@ -2642,7 +2647,7 @@ fn append_transfer(
             patch_receiver_address(row, *address)?;
         }
     }
-    let plan = plan.prepare()?;
+    let plan = plan.prepare(message)?;
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;
@@ -2770,7 +2775,7 @@ pub(crate) fn effective_memory_elements(address: u32, words: u32) -> Vec<Exchang
 }
 
 pub fn inactive_exchange_program() -> Vec<u32> {
-    vec![RETURN_M10_INSTRUCTION]
+    ipu_exchange::EncodedRow::inactive().into_words()
 }
 
 #[cfg(test)]
