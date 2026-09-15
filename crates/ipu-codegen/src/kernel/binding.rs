@@ -169,6 +169,15 @@ impl KernelRun {
             if view.bind(shards)?.shard.tile != tile {
                 return Err(KernelAbiError::RequirementMismatch.into());
             }
+            if matches!(kernel, MidOperationKind::ReductionSum { .. })
+                && view
+                    .bind(shards)?
+                    .traversal(crate::CopyOrder::Physical)?
+                    .contiguous_span()
+                    .is_none()
+            {
+                return Err(KernelAbiError::RequirementMismatch.into());
+            }
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;
         let shared = metadata.iter().find(|metadata| {
@@ -197,13 +206,57 @@ impl KernelRun {
             metadata.push(Arc::clone(&shared));
             shared
         };
-        let run = Self {
+        let mut run = Self {
             product_flops: None,
             metadata: shared,
             inputs,
             outputs,
         };
         run.call()?;
+        if let MidOperationKind::Gemm {
+            axes, inner_block, ..
+        } = run.kernel
+        {
+            let axis = |a: crate::TensorAxis, rank| {
+                a.resolve(rank)
+                    .map_err(|_| KernelAbiError::RequirementMismatch)
+            };
+            let li = axis(axes.left_inner, run.inputs[0].extents.len())?;
+            let ri = axis(axes.right_inner, run.inputs[1].extents.len())?;
+            let oc = axis(axes.output_column, run.outputs[0].extents.len())?;
+            let rc = if ri + 1 == run.inputs[1].extents.len() {
+                ri - 1
+            } else {
+                ri + 1
+            };
+            let size = |e: crate::ShardExtent, bound: Option<u32>| {
+                u64::from(
+                    e.logical_end
+                        .min(bound.unwrap_or(u32::MAX))
+                        .saturating_sub(e.start),
+                )
+            };
+            let rows: u64 = run.outputs[0]
+                .extents
+                .iter()
+                .enumerate()
+                .filter(|(a, _)| *a != oc)
+                .map(|(_, &e)| size(e, None))
+                .product();
+            let cols = size(run.outputs[0].extents[oc], axes.valid_columns)
+                .min(size(run.inputs[1].extents[rc], axes.valid_columns));
+            let inner = size(run.inputs[0].extents[li], axes.valid_inner)
+                .min(size(run.inputs[1].extents[ri], axes.valid_inner));
+            let physical: u64 = run.outputs[0]
+                .extents
+                .iter()
+                .map(|e| u64::from(e.physical_end - e.start))
+                .product();
+            run.product_flops = Some([
+                2 * rows * cols * inner,
+                2 * physical * u64::from(inner_block),
+            ]);
+        }
         for operand in (0..run.inputs.len())
             .map(|i| MemoryOperand::Input(i as u16))
             .chain((0..run.outputs.len()).map(|i| MemoryOperand::Output(i as u16)))

@@ -1,22 +1,19 @@
 //! Fusion rewrites selected mid operations before tile binding. Pass ordering
 //! and Repeat traversal live here; individual passes only transform one region.
-use super::{MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, rewrite};
+use crate::mid::{MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, rewrite};
 
 mod elementwise;
 mod output;
 mod residual;
 
-impl MidProgram {
-    pub(crate) fn with_fusions(&self) -> Option<Self> {
-        let mut result = self.clone();
-        if !run(&mut result.operations, &mut result.values, &result.outputs) {
-            return None;
-        }
-        result.refresh_estimates()?;
-        Some(result)
+pub(crate) fn fuse(program: &MidProgram) -> Option<MidProgram> {
+    let mut result = program.clone();
+    if !run(&mut result.operations, &mut result.values, &result.outputs) {
+        return None;
     }
+    result.refresh_estimates()?;
+    Some(result)
 }
-
 fn run(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,

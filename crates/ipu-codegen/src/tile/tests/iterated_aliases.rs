@@ -30,7 +30,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
             }
         })
         .collect();
-    let mid = MidProgram {
+    let mut mid = MidProgram {
         tile_count: partials,
         values,
         outputs: vec![id(6)],
@@ -57,24 +57,28 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                 body: MidRegion {
                     arguments: vec![id(3), id(4)],
                     yields: vec![id(5)],
-                    operations: vec![MidOperation {
-                        source: None,
-                        inputs: vec![id(4)],
-                        results: vec![id(5)],
-                        kind: MidOperationKind::Sum {
-                            axis: 0,
-                            staging: ReductionStaging::Complete,
-                        },
-                        operands: Vec::new(),
-                        output_aliases: Vec::new(),
-                    }],
+                    operations: vec![],
                 },
             }),
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         }],
         ..MidProgram::default()
     };
+    let outer = std::mem::take(&mut mid.operations);
+    let output = mid.values[5].tensor_type.clone();
+    let mut builder = crate::planner::fragments::FragmentBuilder { program: mid };
+    let result = builder
+        .sum(id(4), &output, 0, ReductionStaging::Complete)
+        .unwrap();
+    let mut mid = builder.program;
+    let operations = std::mem::replace(&mut mid.operations, outer);
+    let MidOperationKind::Repeat(repeat) = &mut mid.operations[0].kind else {
+        unreachable!()
+    };
+    repeat.body.operations = operations;
+    repeat.body.yields = vec![result];
     let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
     let placement = place(&low).unwrap();

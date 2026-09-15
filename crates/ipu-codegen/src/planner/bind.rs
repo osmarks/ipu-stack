@@ -393,6 +393,7 @@ pub(super) fn ensure_format(
                 vec![]
             },
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         });
         value = result;
     }

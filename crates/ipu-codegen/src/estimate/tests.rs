@@ -332,6 +332,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         }],
         outputs: vec![id(1), id(2)],
         ..MidProgram::default()
@@ -411,6 +412,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
         },
         operands: Vec::new(),
         output_aliases: Vec::new(),
+        output_windows: Vec::new(),
     };
     let mut program = MidProgram {
         tile_count: 1,
@@ -451,6 +453,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
             }),
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         }];
         let (_, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
         // Both carried buffers, the earlier yield, and the final copy's input
@@ -504,6 +507,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         };
         let (cost, _, rows) = operation_cost(&op, &values).unwrap();
         (cost.total, cost.exchange, rows)

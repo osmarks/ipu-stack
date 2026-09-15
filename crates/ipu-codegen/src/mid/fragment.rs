@@ -174,6 +174,7 @@ mod tests {
             kind: MidOperationKind::Add,
             operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
             output_aliases: vec![(0, 0)],
+            output_windows: Vec::new(),
         };
         let mut program = MidProgram {
             tile_count: 4,
@@ -197,6 +198,7 @@ mod tests {
                 }),
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             }],
             ..MidProgram::default()
         };
@@ -335,6 +337,7 @@ mod tests {
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             });
         }
         let mut bound = MidProgram {
@@ -441,7 +444,7 @@ mod tests {
             assert_eq!(weight.storage_group, id(3));
             assert_eq!(weight.owners, bound.values[3].owners);
             let compute = repeat.body.operations.last().unwrap();
-            assert_eq!(compute.output_aliases(), &[(0, 0)]);
+            assert_eq!(compute.output_aliases.as_slice(), &[(0, 0)]);
         }
     }
 

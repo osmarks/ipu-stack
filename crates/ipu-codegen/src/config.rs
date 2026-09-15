@@ -1,7 +1,7 @@
 //! Compiler/planner configuration and explicit user overrides.
 use crate::graph::{OperationId, ValueId};
-use crate::mid::ReductionStaging;
 use crate::planner::OperatorCandidate;
+use crate::planner::ReductionStaging;
 use crate::planner::catalogue::{default_operator_candidates, operator_candidates_for_tile_count};
 use crate::planner::operator::{GemmOrientation, LocalOperandStaging};
 use crate::tensor::{MemoryClass, Precision, TensorFormat};

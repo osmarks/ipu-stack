@@ -143,6 +143,7 @@ fn distribute_region(
                     },
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 };
                 let transfer = MidOperation {
                     inputs: vec![packed],
@@ -156,6 +157,7 @@ fn distribute_region(
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 };
                 operation.results = vec![logical];
                 result.extend([operation, pack, transfer]);
@@ -250,6 +252,7 @@ mod tests {
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 }],
                 ..MidProgram::default()
             };

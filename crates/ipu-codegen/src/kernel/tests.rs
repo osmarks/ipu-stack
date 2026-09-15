@@ -197,6 +197,13 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                 weights: GemmWeightLoad::Standard,
                 inner_block: 64,
                 output_columns: 16,
+                axes: crate::GemmAxes {
+                    left_inner: crate::TensorAxis::FromEnd(1),
+                    right_inner: crate::TensorAxis::FromEnd(2),
+                    output_column: crate::TensorAxis::FromEnd(1),
+                    valid_inner: None,
+                    valid_columns: None,
+                },
             },
             Vec::new(),
             vec![ShardView {

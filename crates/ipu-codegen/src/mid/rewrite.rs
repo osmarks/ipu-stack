@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Producers whose results have exactly one consuming operation and do not
 /// escape the region. Repeated operands within that consumer count once.
-pub(super) fn single_use_producers(
+pub(crate) fn single_use_producers(
     operations: &[MidOperation],
     required: &[MidValueId],
 ) -> BTreeMap<MidValueId, usize> {
@@ -40,7 +40,7 @@ pub(super) fn single_use_producers(
 
 /// Query the current graph when a rewrite is changing readers as it proceeds.
 /// Like `single_use_producers`, count consuming operations, not operand slots.
-pub(super) fn is_single_use(
+pub(crate) fn is_single_use(
     operations: &[MidOperation],
     required: &[MidValueId],
     value: MidValueId,
@@ -86,7 +86,7 @@ pub(crate) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidVal
 }
 
 /// Apply index-based edits only after matching is complete.
-pub(super) fn apply_edits(
+pub(crate) fn apply_edits(
     operations: &mut Vec<MidOperation>,
     removed: &BTreeSet<usize>,
     mut before: BTreeMap<usize, Vec<MidOperation>>,
@@ -113,7 +113,7 @@ pub(super) fn apply_edits(
         .collect();
 }
 
-pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
+pub(crate) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
     a.owners == b.owners
         && a.tensor_type.format.precision == b.tensor_type.format.precision
         && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
@@ -137,7 +137,7 @@ pub(super) fn coordinate_copy_source(op: &MidOperation) -> Option<MidValueId> {
 
 /// Walk coordinate-preserving copies, optionally requiring identical storage.
 /// Callers check extra readers and intervening writes before rewriting them.
-pub(super) fn producer_through_copies(
+pub(crate) fn producer_through_copies(
     mut value: MidValueId,
     operations: &[MidOperation],
     values: &[MidValue],
@@ -167,7 +167,7 @@ pub(super) fn producer_through_copies(
     }
 }
 
-pub(super) fn fusion_pays<'a>(
+pub(crate) fn fusion_pays<'a>(
     fusion: &'static str,
     source: Option<OperationId>,
     before: impl IntoIterator<Item = &'a MidOperation>,

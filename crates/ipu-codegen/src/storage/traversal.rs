@@ -192,6 +192,58 @@ fn digits(shard: TensorStorage<'_>) -> StorageResult<Vec<Digit>> {
     Ok(dimensions)
 }
 
+/// Partition into rectangles where `axis` is the outermost physical dimension:
+/// successive coordinates select consecutive, equally sized blocks. Dimensions
+/// physically outside that axis are visited separately. The axis is not split.
+pub(crate) fn contiguous_axis_blocks(
+    shard: TensorStorage<'_>,
+    axis: usize,
+) -> StorageResult<Vec<Vec<ShardExtent>>> {
+    let dimensions = digits(shard)?;
+    let mut shape = shard
+        .extents
+        .iter()
+        .map(|e| e.physical_end - e.start)
+        .collect::<Vec<_>>();
+    let position = dimensions
+        .iter()
+        .position(|d| d.axis == axis)
+        .ok_or(StorageError::InvalidView)?;
+    if dimensions[position].divisor != 1
+        || dimensions[position + 1..].iter().any(|d| d.axis == axis)
+    {
+        return Err(StorageError::InvalidView);
+    }
+    for digit in &dimensions[..position] {
+        shape[digit.axis] = shape[digit.axis].min(digit.divisor);
+    }
+    let mut blocks = vec![shard.extents.to_vec()];
+    for (a, &width) in shape.iter().enumerate() {
+        if width == 0 {
+            return Err(StorageError::InvalidView);
+        }
+        if width == shard.extents[a].physical_end - shard.extents[a].start {
+            continue;
+        }
+        blocks = blocks
+            .into_iter()
+            .flat_map(|block| {
+                (block[a].start..block[a].physical_end)
+                    .step_by(width as usize)
+                    .map(move |start| {
+                        let mut piece = block.clone();
+                        piece[a].start = start;
+                        piece[a].physical_end = (start + width).min(block[a].physical_end);
+                        piece[a].logical_end =
+                            block[a].logical_end.min(piece[a].physical_end).max(start);
+                        piece
+                    })
+            })
+            .collect();
+    }
+    Ok(blocks)
+}
+
 fn axis_tree(digits: &[Digit], start: u32, end: u32, suffix: &Node) -> Node {
     let Some((digit, rest)) = digits.split_first() else {
         return suffix.clone();
@@ -757,6 +809,81 @@ impl ByteTraversal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn axis_blocks_reduce_physical_stacks_without_mixing_coordinates() {
+        for order in [
+            ElementOrder::RowMajor,
+            ElementOrder::Amp(AmpOrder::Left),
+            ElementOrder::Amp(AmpOrder::Output),
+            ElementOrder::Amp(AmpOrder::TransposedLeft),
+            ElementOrder::Amp(AmpOrder::TransposedOutput),
+            ElementOrder::Amp(AmpOrder::TransposedRight),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block: 32,
+                column_block: 16,
+            }),
+        ] {
+            for axis in [0, 1] {
+                let mut shard =
+                    super::super::tests::shard(crate::Layout::row_sharded(1), &[2, 3, 32, 64]);
+                shard.tensor_type.format.precision = Precision::F16;
+                shard.tensor_type.format.layout.order = order;
+                let widths = [2, 3, 32, 64];
+                let mut memory = vec![0u32; widths.iter().product::<u32>() as usize];
+                for b in 0..2 {
+                    for p in 0..3 {
+                        for r in 0..32 {
+                            for c in 0..64 {
+                                let point = [b, p, r, c];
+                                let address = physical_index(shard.storage(), &widths, &point)
+                                    .unwrap()
+                                    as usize;
+                                memory[address] = 1 + b * 10000 + p * 1000 + r * 64 + c;
+                            }
+                        }
+                    }
+                }
+                let mut covered = vec![false; memory.len() / widths[axis] as usize];
+                let mut output_widths = widths.to_vec();
+                output_widths.remove(axis);
+                for block in contiguous_axis_blocks(shard.storage(), axis).unwrap() {
+                    let mut seed = block.clone();
+                    seed[axis].physical_end = 1;
+                    seed[axis].logical_end = 1;
+                    let span = byte_traversal(shard.storage(), &seed, true)
+                        .unwrap()
+                        .contiguous_span()
+                        .unwrap();
+                    let count = span.bytes as usize / 2;
+                    let mut output_start = None;
+                    for i in 0..count {
+                        let start = span.offset as usize / 2 + i;
+                        let actual = (0..widths[axis] as usize)
+                            .map(|p| memory[start + p * count])
+                            .sum::<u32>();
+                        let point =
+                            physical_coordinates(shard.storage(), &widths, start as u64).unwrap();
+                        let expected = (0..widths[axis])
+                            .map(|p| {
+                                let mut point = point.clone();
+                                point[axis] = p;
+                                1 + point[0] * 10000 + point[1] * 1000 + point[2] * 64 + point[3]
+                            })
+                            .sum::<u32>();
+                        assert_eq!(actual, expected, "{order:?}, axis {axis}, {point:?}");
+                        let mut point = point;
+                        point.remove(axis);
+                        let output = physical_index(shard.storage(), &output_widths, &point)
+                            .unwrap() as usize;
+                        assert_eq!(output, *output_start.get_or_insert(output) + i);
+                        assert!(!covered[output]);
+                        covered[output] = true;
+                    }
+                }
+                assert!(covered.iter().all(|&v| v));
+            }
+        }
+    }
     #[test]
     fn regular_copy_counts_a_million_fragmented_rows_symbolically() {
         let traversal = |stride| ByteTraversal {

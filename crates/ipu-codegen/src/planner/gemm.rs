@@ -3,7 +3,7 @@
 use super::fragments::{FragmentBuilder, project_grid};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode};
 use crate::mid::MidOperationKind;
-use crate::mid::{MidValueId, Product, ProductAxes, ReductionStaging};
+use crate::mid::{MidValueId, OperandIndexing, OperandWindow};
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperatorFamily, OperatorPlan,
     ProductGrid,
@@ -12,8 +12,174 @@ use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, MemoryClass, Padding, Precision,
     TensorAxis, TensorTiling, TensorType, axis_tiling, same_distribution,
 };
+use crate::{GemmAxes, ReductionStaging};
+
+/// Construction parameters, consumed immediately to emit executable mid work.
+#[derive(Clone, Debug)]
+pub(super) struct Product {
+    pub multiply: Precision,
+    pub accumulate: AccumulationPrecision,
+    pub mode: GemmKernelMode,
+    pub inner_block: u32,
+    pub output_columns: u32,
+    pub axes: crate::GemmAxes,
+}
 
 impl FragmentBuilder {
+    pub(super) fn product(
+        &mut self,
+        inputs: Vec<MidValueId>,
+        (output, reuse): (TensorType, Option<MidValueId>),
+        product: Product,
+        operands: Vec<OperandIndexing>,
+    ) -> Option<MidValueId> {
+        let [left, right] = inputs.as_slice() else {
+            return None;
+        };
+        let tensors = [
+            self.tensor(*left).clone(),
+            self.tensor(*right).clone(),
+            output.clone(),
+        ];
+        let mut shapes = Vec::new();
+        for tensor in &tensors {
+            let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
+            shapes.push(
+                resolved
+                    .axes()?
+                    .iter()
+                    .map(|a| a.maximum_extent())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let axes = product.axes;
+        let li = axes.left_inner.resolve(shapes[0].len()).ok()?;
+        let ri = axes.right_inner.resolve(shapes[1].len()).ok()?;
+        let oc = axes.output_column.resolve(shapes[2].len()).ok()?;
+        let rc = if ri + 1 == shapes[1].len() {
+            ri - 1
+        } else {
+            ri + 1
+        };
+        let mut windows = [OperandWindow::default(), OperandWindow::default()];
+        for (i, operand) in operands.iter().enumerate() {
+            let OperandIndexing::Local(window) = operand else {
+                return None;
+            };
+            windows[i] = window.clone();
+            for &(axis, start, end) in &window.0 {
+                shapes[i][axis as usize] = shapes[i][axis as usize].min(end.checked_sub(start)?);
+            }
+        }
+        let inner = shapes[0][li];
+        if product.inner_block == 0 || product.output_columns == 0 || inner != shapes[1][ri] {
+            return None;
+        }
+        let columns = output
+            .format
+            .layout
+            .order
+            .gemm_output_group()
+            .map_or(product.output_columns, |g| g.min(product.output_columns));
+        let flatten = matches!(
+            output.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+        );
+        let batch_axes = if flatten { 0 } else { shapes[2].len() - 2 };
+        let batches = shapes[2][..batch_axes]
+            .iter()
+            .try_fold(1u32, |n, &d| n.checked_mul(d))?;
+        let indexing = if batch_axes == 0 {
+            Vec::new()
+        } else {
+            tensors
+                .iter()
+                .map(|t| {
+                    crate::tensor::Broadcast::new(
+                        &t.shape.0[..t.shape.0.len() - 2],
+                        &output.shape.0[..batch_axes],
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        let mut result = reuse;
+        for column in (0..shapes[2][oc]).step_by(columns as usize) {
+            for k in (0..inner).step_by(product.inner_block as usize) {
+                let width = product.inner_block.min(inner - k);
+                let column_end = (column + columns).min(shapes[2][oc]);
+                for batch in 0..batches {
+                    let mut ranges = [
+                        windows[0].clone(),
+                        windows[1].clone(),
+                        OperandWindow::default(),
+                    ];
+                    for (operand, axis, start, end) in [
+                        (0, li, k, k + width),
+                        (1, ri, k, k + width),
+                        (1, rc, column, column_end),
+                        (2, oc, column, column_end),
+                    ] {
+                        let base = ranges[operand]
+                            .0
+                            .iter()
+                            .find(|r| r.0 as usize == axis)
+                            .map_or(0, |r| r.1);
+                        ranges[operand].0.retain(|r| r.0 as usize != axis);
+                        ranges[operand]
+                            .0
+                            .push((axis as u16, base + start, base + end));
+                    }
+                    let mut coordinates = vec![0; batch_axes];
+                    let mut remainder = batch;
+                    for axis in (0..batch_axes).rev() {
+                        coordinates[axis] = remainder % shapes[2][axis];
+                        remainder /= shapes[2][axis];
+                    }
+                    for (i, indexing) in indexing.iter().enumerate() {
+                        for axis in 0..shapes[i].len() - 2 {
+                            let coordinate = if indexing.is_broadcast(axis) {
+                                0
+                            } else {
+                                coordinates[indexing.output_axis(axis)]
+                            };
+                            ranges[i].0.push((axis as u16, coordinate, coordinate + 1));
+                        }
+                    }
+                    result = Some(
+                        self.compute(
+                            inputs.clone(),
+                            [(output.clone(), result, ranges[2].clone())],
+                            MidOperationKind::Gemm {
+                                axes,
+                                multiply: product.multiply,
+                                accumulate: product.accumulate,
+                                mode: if k == 0 {
+                                    product.mode
+                                } else {
+                                    GemmKernelMode::Accumulate
+                                },
+                                weights: if tensors[1].format.layout.memory_class
+                                    == MemoryClass::Ipu21Interleaved
+                                {
+                                    crate::GemmWeightLoad::Interleaved
+                                } else {
+                                    crate::GemmWeightLoad::Standard
+                                },
+                                inner_block: width,
+                                output_columns: column_end - column,
+                            },
+                            vec![
+                                OperandIndexing::Fragment(ranges[0].clone()),
+                                OperandIndexing::Fragment(ranges[1].clone()),
+                            ],
+                        )[0],
+                    );
+                }
+            }
+        }
+        result
+    }
+
     pub(super) fn gemm(
         &mut self,
         plan: &OperatorPlan,
@@ -43,7 +209,7 @@ impl FragmentBuilder {
         let (left_row, left_inner) = orientation.matrix_axes(left_type.shape.0.len());
         let (right_inner, right_column) = orientation.matrix_axes(right_type.shape.0.len());
         let (output_row, output_column) = orientation.matrix_axes(output.shape.0.len());
-        let axes = ProductAxes {
+        let axes = GemmAxes {
             valid_inner: None,
             valid_columns: None,
             left_inner: TensorAxis::FromStart(left_inner as u16),
@@ -61,8 +227,6 @@ impl FragmentBuilder {
             inner_block,
             output_columns: column_block,
             axes,
-            operands: Default::default(),
-            output_aliases: Vec::new(),
         };
         match distribution {
             GemmDistribution::ParallelReduction {
@@ -134,22 +298,13 @@ impl FragmentBuilder {
                 partials.format.layout.tiling.tile_count = row_partitions
                     .checked_mul(column_partitions)?
                     .checked_mul(inner_partitions)?;
-                let products = self.compute(
+                let products = self.product(
                     vec![left, weights],
-                    [(partials, None)],
-                    MidOperationKind::Product(product(GemmKernelMode::Initialize)),
-                    Vec::new(),
-                )[0];
-                Some(
-                    self.emit(
-                        vec![products],
-                        [output.clone()],
-                        MidOperationKind::Sum {
-                            axis: 0,
-                            staging: reduction_staging,
-                        },
-                    )[0],
-                )
+                    (partials, None),
+                    product(GemmKernelMode::Initialize),
+                    vec![crate::OperandIndexing::local(); 2],
+                )?;
+                Some(self.sum(products, &output.clone(), 0, reduction_staging)?)
             }
             GemmDistribution::OutputStationary => {
                 // Bounded K panels are separate tensor values in mid. Their
@@ -176,14 +331,12 @@ impl FragmentBuilder {
                     && left_panel.format.layout.order == left_source_type.format.layout.order
                     && right_panel.format.layout.order == right_source_type.format.layout.order
                 {
-                    return Some(
-                        self.compute(
-                            vec![left, right],
-                            [(output.clone(), None)],
-                            MidOperationKind::Product(product(GemmKernelMode::Initialize)),
-                            Vec::new(),
-                        )[0],
-                    );
+                    return Some(self.product(
+                        vec![left, right],
+                        (output.clone(), None),
+                        product(GemmKernelMode::Initialize),
+                        vec![crate::OperandIndexing::local(); 2],
+                    )?);
                 }
                 for (tensor, axis) in [
                     (&mut left_panel, left_inner),
@@ -219,18 +372,16 @@ impl FragmentBuilder {
                     ro[right_inner] = start;
                     let l = self.copy(left, l, lo);
                     let r = self.copy(right, r, ro);
-                    result = Some(
-                        self.compute(
-                            vec![l, r],
-                            [(output.clone(), result)],
-                            MidOperationKind::Product(product(if result.is_none() {
-                                GemmKernelMode::Initialize
-                            } else {
-                                GemmKernelMode::Accumulate
-                            })),
-                            Vec::new(),
-                        )[0],
-                    );
+                    result = Some(self.product(
+                        vec![l, r],
+                        (output.clone(), result),
+                        product(if result.is_none() {
+                            GemmKernelMode::Initialize
+                        } else {
+                            GemmKernelMode::Accumulate
+                        }),
+                        vec![crate::OperandIndexing::local(); 2],
+                    )?);
                 }
                 result
             }
@@ -247,7 +398,7 @@ impl FragmentBuilder {
         left: MidValueId,
         right: MidValueId,
         output: &TensorType,
-        axes: ProductAxes,
+        axes: GemmAxes,
         grid: ProductGrid,
         fp8_scale: Option<i8>,
     ) -> Option<MidValueId> {
@@ -361,10 +512,10 @@ impl FragmentBuilder {
                 .axes
                 .push(dim(0, grid.inner, 1, inner_stride));
         }
-        let result = self.compute(
+        let result = self.product(
             vec![l, r],
-            [(product, None)],
-            MidOperationKind::Product(Product {
+            (product, None),
+            Product {
                 multiply,
                 accumulate: if fp8_scale.is_some() {
                     AccumulationPrecision::F16
@@ -372,26 +523,16 @@ impl FragmentBuilder {
                     AccumulationPrecision::F32
                 },
                 mode: GemmKernelMode::Initialize,
-
                 inner_block: inner_width,
                 output_columns: column_width,
                 axes,
-                operands: Default::default(),
-                output_aliases: Vec::new(),
-            }),
-            Vec::new(),
-        )[0];
+            },
+            vec![crate::OperandIndexing::local(); 2],
+        )?;
         if grid.inner > 1 {
             let mut reduced = output.clone();
             reduced.shape.0[2] = columns;
-            let sum = self.emit(
-                vec![result],
-                [reduced],
-                MidOperationKind::Sum {
-                    axis: 0,
-                    staging: ReductionStaging::Complete,
-                },
-            )[0];
+            let sum = self.sum(result, &reduced, 0, ReductionStaging::Complete)?;
             Some(self.copy(sum, output.clone(), vec![]))
         } else {
             Some(self.copy(result, output.clone(), vec![]))

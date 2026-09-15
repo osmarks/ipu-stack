@@ -46,6 +46,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     },
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![],
+                    output_windows: Vec::new(),
                 }],
                 ..MidProgram::default()
             };
@@ -96,8 +97,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
 
 #[test]
 fn reduction_can_place_its_result_outside_the_partial_owners() {
-    use crate::graph::{GraphInputKind, ValueId};
-    use crate::mid::{MidInput, MidOperation, MidProgram, MidValue, MidValueId, ReductionStaging};
+    use crate::ReductionStaging;
     use crate::tensor::{AxisTiling, Layout, OwnerMap, Padding, Precision, TensorAxis, TensorType};
     let mut layout = Layout::row_sharded(3);
     layout.tiling.axes = vec![AxisTiling::new(
@@ -108,48 +108,26 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
     )];
     let input = TensorType::new([3, 4, 16], Precision::F16, layout);
     let output = TensorType::new([4, 16], Precision::F16, Layout::row_sharded(1));
-    let id = MidValueId::from_index;
-    let mid = MidProgram {
-        tile_count: 8,
-        inputs: vec![MidInput {
-            name: "partials".into(),
-            kind: GraphInputKind::Host,
-            value: id(0),
-        }],
-        outputs: vec![id(1)],
-        values: vec![
-            MidValue {
-                id: id(0),
-                storage_group: id(0),
-                origin: ValueId::from_index(0),
-                tensor_type: input,
-                owners: OwnerMap::embedded(vec![0, 2, 4]),
-            },
-            MidValue {
-                id: id(1),
-                storage_group: id(1),
-                origin: ValueId::from_index(1),
-                tensor_type: output,
-                owners: OwnerMap::embedded(vec![5]),
-            },
-        ],
-        operations: vec![MidOperation {
-            source: None,
-            inputs: vec![id(0)],
-            results: vec![id(1)],
-            kind: MidOperationKind::Sum {
-                axis: 0,
-                staging: ReductionStaging::Complete,
-            },
-            operands: Vec::new(),
-            output_aliases: Vec::new(),
-        }],
-        ..MidProgram::default()
-    };
+    let mut builder = crate::planner::fragments::FragmentBuilder::new(&[input]);
+    let result = builder
+        .sum(
+            crate::MidValueId::from_index(0),
+            &output,
+            0,
+            ReductionStaging::Complete,
+        )
+        .unwrap();
+    let mut mid = builder.program;
+    mid.tile_count = 8;
+    mid.outputs = vec![result];
+    mid.values[0].owners = OwnerMap::embedded(vec![0, 2, 4]);
+    for value in &mut mid.values[1..] {
+        value.owners = OwnerMap::embedded(vec![5]);
+    }
     mid.validate().unwrap();
     let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
     assert!(
-        low.value_views[1]
+        low.value_views[result.index() as usize]
             .iter()
             .all(|id| low.shards[id.shard.index() as usize].tile == 5)
     );

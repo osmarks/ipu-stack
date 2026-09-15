@@ -35,7 +35,7 @@ fn donate(
                 reuse_local: true, ..
             } => bound.extend(op.inputs.iter().copied()),
             _ => {
-                let output_aliases = op.output_aliases();
+                let output_aliases = op.output_aliases.as_slice();
                 for &(output, input) in output_aliases {
                     if bound.contains(&op.results[output]) {
                         bound.insert(op.inputs[input]);
@@ -83,9 +83,9 @@ fn donate(
         }
         let fresh = match &operations[producer].kind {
             MidOperationKind::Copy { .. } => true,
-            MidOperationKind::Sum { .. } | MidOperationKind::Repeat(_) => false,
+            MidOperationKind::Repeat(_) => false,
             _ => {
-                let output_aliases = operations[producer].output_aliases();
+                let output_aliases = operations[producer].output_aliases.as_slice();
                 output_aliases.is_empty()
             }
         };
@@ -187,6 +187,7 @@ mod tests {
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 },
                 MidOperation {
                     source: None,
@@ -198,6 +199,7 @@ mod tests {
                     },
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![],
+                    output_windows: Vec::new(),
                 },
             ],
             ..MidProgram::default()
@@ -328,6 +330,7 @@ mod tests {
             }),
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         });
         mid.reuse_cast_inputs();
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
@@ -361,6 +364,7 @@ mod tests {
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         });
         let old = mid.clone();
         donate(&mut mid.operations, &mut mid.values, &[MidValueId(3)], true);

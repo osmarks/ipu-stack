@@ -1,4 +1,4 @@
-//! Fuse compatible whole-device primitives before physical expansion.
+//! Fuse compatible executable primitives before physical expansion.
 use super::rewrite::{apply_edits, single_use_producers};
 use crate::mid::MidOperationKind;
 
@@ -179,11 +179,11 @@ fn compatible_fusion(
 
 #[cfg(test)]
 mod tests {
-    use crate::mid::MidProgram;
     use crate::PipelineConfig;
     use crate::estimate::Ipu21CostModel;
     use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
     use crate::low::CopyPolicy;
+    use crate::mid::MidProgram;
     use crate::mid::{CoordinateMapping, MidInput};
     use crate::planner::catalogue::OperatorFormatPolicy;
     use crate::planner::operator::OperatorFamily;
@@ -209,7 +209,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, tensor_type)| {
-            let id = MidValueId(index as u32);
+            let id = MidValueId::from_index(index as u32);
             MidValue {
                 id,
                 owners: crate::tensor::OwnerMap::default(),
@@ -221,8 +221,8 @@ mod tests {
         .collect();
         let operation = |input, result, kind| MidOperation {
             source: None,
-            inputs: vec![MidValueId(input)],
-            results: vec![MidValueId(result)],
+            inputs: vec![MidValueId::from_index(input)],
+            results: vec![MidValueId::from_index(result)],
             operands: if matches!(kind, MidOperationKind::Copy { .. }) {
                 vec![]
             } else {
@@ -230,13 +230,14 @@ mod tests {
             },
             kind,
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         };
         let mut program = MidProgram {
             tile_count: 12,
             inputs: vec![MidInput {
                 name: "x".into(),
                 kind: GraphInputKind::Host,
-                value: MidValueId(0),
+                value: MidValueId::from_index(0),
             }],
             values,
             operations: vec![
@@ -260,13 +261,13 @@ mod tests {
                     },
                 ),
             ],
-            outputs: vec![MidValueId(3)],
+            outputs: vec![MidValueId::from_index(3)],
             ..MidProgram::default()
         };
-        let fused = program.with_fusions().unwrap();
+        let fused = crate::planner::fusion::fuse(&program).unwrap();
         assert_eq!(fused.operations.len(), 2);
-        assert_eq!(fused.operations[0].inputs, [MidValueId(0)]);
-        assert_eq!(fused.operations[1].inputs, [MidValueId(2)]);
+        assert_eq!(fused.operations[0].inputs, [MidValueId::from_index(0)]);
+        assert_eq!(fused.operations[1].inputs, [MidValueId::from_index(2)]);
         assert!(matches!(fused.operations[1].kind, MidOperationKind::Gelu));
         let graph = crate::expand_tiles(&fused).unwrap();
         for run in &graph.kernel_runs {
@@ -275,20 +276,20 @@ mod tests {
         // Independent arithmetic may intervene; an aliased write may not.
         let mut independent = program.clone();
         let mut extra = independent.values[0].clone();
-        extra.id = MidValueId(independent.values.len() as u32);
+        extra.id = MidValueId::from_index(independent.values.len() as u32);
         extra.storage_group = extra.id;
         let mut work = independent.operations[0].clone();
         work.results = vec![extra.id];
         independent.outputs.push(extra.id);
         independent.values.push(extra);
         independent.operations.insert(2, work);
-        assert!(independent.with_fusions().is_some());
-        independent.values.last_mut().unwrap().storage_group = MidValueId(0);
-        assert!(independent.with_fusions().is_none());
+        assert!(crate::planner::fusion::fuse(&independent).is_some());
+        independent.values.last_mut().unwrap().storage_group = MidValueId::from_index(0);
+        assert!(crate::planner::fusion::fuse(&independent).is_none());
 
         let mut norm = program.clone();
         for _ in 0..2 {
-            let id = MidValueId(norm.values.len() as u32);
+            let id = MidValueId::from_index(norm.values.len() as u32);
             norm.values.push(MidValue {
                 id,
                 storage_group: id,
@@ -310,7 +311,7 @@ mod tests {
         norm.operations[0].kind = MidOperationKind::LayerNorm;
         norm.operations[0].operands = vec![OperandIndexing::Elementwise { result: 0 }; 3];
         norm.operations[0].output_aliases = vec![];
-        let fused_norm = norm.with_fusions().unwrap();
+        let fused_norm = crate::planner::fusion::fuse(&norm).unwrap();
         assert_eq!(fused_norm.operations.len(), 4); // activation, gamma, beta copies + LN
         let last = fused_norm.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 3);
@@ -324,7 +325,7 @@ mod tests {
         bias.operations[0].kind = MidOperationKind::BiasGelu;
         bias.operations[0].operands = vec![OperandIndexing::Elementwise { result: 0 }; 2];
         bias.operations[0].output_aliases = vec![];
-        let fused_bias = bias.with_fusions().unwrap();
+        let fused_bias = crate::planner::fusion::fuse(&bias).unwrap();
         assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
         let last = fused_bias.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 2);
@@ -333,8 +334,8 @@ mod tests {
         for run in &graph.kernel_runs {
             run.call().unwrap();
         }
-        program.outputs.push(MidValueId(1));
-        assert!(program.with_fusions().is_none());
+        program.outputs.push(MidValueId::from_index(1));
+        assert!(crate::planner::fusion::fuse(&program).is_none());
     }
 
     #[test]
@@ -353,7 +354,7 @@ mod tests {
                     source.clone(),
                     output.clone(),
                 ] {
-                    let id = MidValueId(values.len() as u32);
+                    let id = MidValueId::from_index(values.len() as u32);
                     values.push(MidValue {
                         id,
                         owners: crate::tensor::OwnerMap::default(),
@@ -363,13 +364,17 @@ mod tests {
                     });
                 }
                 let inputs = if norm {
-                    vec![MidValueId(0), MidValueId(1), MidValueId(2)]
+                    vec![
+                        MidValueId::from_index(0),
+                        MidValueId::from_index(1),
+                        MidValueId::from_index(2),
+                    ]
                 } else {
-                    vec![MidValueId(0)]
+                    vec![MidValueId::from_index(0)]
                 };
                 let producer = MidOperation {
                     source: None,
-                    results: vec![MidValueId(3)],
+                    results: vec![MidValueId::from_index(3)],
                     kind: if norm {
                         MidOperationKind::LayerNorm
                     } else {
@@ -378,9 +383,10 @@ mod tests {
                     operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                     inputs,
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 };
                 let mut identity = values[3].clone();
-                identity.id = MidValueId(5);
+                identity.id = MidValueId::from_index(5);
                 identity
                     .tensor_type
                     .format
@@ -396,8 +402,8 @@ mod tests {
                 values.push(identity);
                 let copy = MidOperation {
                     source: None,
-                    inputs: vec![MidValueId(3)],
-                    results: vec![MidValueId(5)],
+                    inputs: vec![MidValueId::from_index(3)],
+                    results: vec![MidValueId::from_index(5)],
                     kind: MidOperationKind::Copy {
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
@@ -406,17 +412,19 @@ mod tests {
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 };
                 let cast = MidOperation {
                     source: None,
-                    inputs: vec![MidValueId(5)],
-                    results: vec![MidValueId(4)],
+                    inputs: vec![MidValueId::from_index(5)],
+                    results: vec![MidValueId::from_index(4)],
                     kind: MidOperationKind::Cast {
                         from: Precision::F16,
                         to: output.format.precision,
                     },
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 };
                 let mut program = MidProgram {
                     tile_count: 1,
@@ -424,15 +432,15 @@ mod tests {
                         .map(|index| MidInput {
                             name: format!("input.{index}"),
                             kind: GraphInputKind::Host,
-                            value: MidValueId(index),
+                            value: MidValueId::from_index(index),
                         })
                         .collect(),
                     values,
                     operations: vec![producer, copy, cast],
-                    outputs: vec![MidValueId(4)],
+                    outputs: vec![MidValueId::from_index(4)],
                     ..MidProgram::default()
                 };
-                let fused = program.with_fusions();
+                let fused = crate::planner::fusion::fuse(&program);
                 // The faster FP16 affine path makes separate LN + cast
                 // cheaper at this width, even for one row.
                 assert_eq!(fused.is_some(), !norm);
@@ -448,8 +456,8 @@ mod tests {
                     }
                     assert_eq!(call.arguments, expected);
                 }
-                program.outputs.push(MidValueId(3));
-                assert!(program.with_fusions().is_none());
+                program.outputs.push(MidValueId::from_index(3));
+                assert!(crate::planner::fusion::fuse(&program).is_none());
             }
         }
     }
@@ -510,7 +518,7 @@ mod tests {
                     config = config.with_input(x, format.clone()).with_input(rhs, format);
                 }
                 let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                let fused = mid.with_fusions();
+                let fused = crate::planner::fusion::fuse(&mid);
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {
                     if !norm {
@@ -535,7 +543,7 @@ mod tests {
                         }
                         let (_, memory) =
                             crate::estimate::analyze_mid(&fresh, &BTreeMap::new()).unwrap();
-                        let unconstrained = fresh.with_fusions().unwrap();
+                        let unconstrained = crate::planner::fusion::fuse(&fresh).unwrap();
                         assert!(unconstrained.peak_memory.total > memory.total);
                         // Feasibility is the planner's decision, not a fusion constraint.
                         assert!(memory.fits_ipu21_with_budget(0, memory.total));

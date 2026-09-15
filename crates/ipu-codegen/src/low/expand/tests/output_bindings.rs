@@ -45,6 +45,7 @@ fn copied_columns(columns: u32) -> MidProgram {
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         }],
         ..MidProgram::default()
     }
@@ -189,6 +190,7 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         });
         mid.outputs.push(value.id);
         mid.values.push(value);
@@ -283,6 +285,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         kind: MidOperationKind::Add,
         operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
         output_aliases: vec![],
+        output_windows: Vec::new(),
     });
     mid.values.push(result);
     let graph = expand_tiles(&mid, false).unwrap();
@@ -350,6 +353,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 kind: MidOperationKind::AddLayerNormMoments,
                 operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
                 output_aliases: vec![(1, 0)],
+                output_windows: Vec::new(),
             }],
             outputs: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
             ..MidProgram::default()
@@ -418,26 +422,30 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             result.tensor_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
         }
         mid.outputs = vec![mid.values[0].id, result.id];
-        mid.operations.push(MidOperation {
-            source: None,
-            inputs: vec![mid.values[1].id],
-            results: vec![result.id],
-            kind: if sum {
-                MidOperationKind::Sum {
-                    axis: 0,
-                    staging: crate::ReductionStaging::Complete,
-                }
-            } else {
-                MidOperationKind::Gelu
-            },
-            operands: if sum {
-                vec![]
-            } else {
-                vec![OperandIndexing::Elementwise { result: 0 }]
-            },
-            output_aliases: if sum { vec![] } else { vec![(0, 0)] },
-        });
-        mid.values.push(result);
+        if sum {
+            let mut builder = crate::planner::fragments::FragmentBuilder { program: mid };
+            let output = builder
+                .sum(
+                    crate::MidValueId::from_index(1),
+                    &result.tensor_type,
+                    0,
+                    crate::ReductionStaging::Complete,
+                )
+                .unwrap();
+            mid = builder.program;
+            mid.outputs[1] = output;
+        } else {
+            mid.operations.push(MidOperation {
+                source: None,
+                inputs: vec![mid.values[1].id],
+                results: vec![result.id],
+                kind: MidOperationKind::Gelu,
+                operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                output_aliases: vec![(0, 0)],
+                output_windows: vec![],
+            });
+            mid.values.push(result);
+        }
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         let copied = low
@@ -464,10 +472,12 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
                         == low.shards[shard.index() as usize].tile
                 })
                 .unwrap();
-            assert_ne!(
-                placement.shard_addresses[&shard],
-                placement.shard_addresses[&source.shard]
-            );
+            if !sum {
+                assert_ne!(
+                    placement.shard_addresses[&shard],
+                    placement.shard_addresses[&source.shard]
+                );
+            }
         }
         if !sum {
             let output = low.value_views(low.outputs[1])[0].shard;

@@ -1,34 +1,4 @@
-//! Distributed arithmetic and its operand windows. Tile calls are enumerated in low.
-
-use crate::kernel::{AccumulationPrecision, GemmKernelMode};
-use crate::tensor::{Precision, TensorAxis};
-use serde::{Deserialize, Serialize};
-
-/// Lifetime policy for partials reduced across a GEMM's K partitions.
-#[derive(
-    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub enum ReductionStaging {
-    /// Receive every remote partial into one packed buffer, then reduce once.
-    #[default]
-    Complete,
-    /// Receive and accumulate one remote partial at a time. This minimizes
-    /// temporary SRAM at the expense of additional exchange epochs and kernel
-    /// launches.
-    Streamed,
-    /// Receive at most this many remote partials per exchange epoch.
-    Batched(std::num::NonZeroU16),
-}
-
-impl ReductionStaging {
-    pub(crate) fn remote_partials_per_stage(self, remote: u64) -> u64 {
-        match self {
-            Self::Complete => remote.max(1),
-            Self::Streamed => 1,
-            Self::Batched(limit) => u64::from(limit.get()).min(remote.max(1)),
-        }
-    }
-}
+//! Distributed arithmetic and operand indexing shared by mid operations.
 
 /// A rectangular operand window in global tensor coordinates. Omitted axes
 /// retain their full extent. Windows do not allocate temporary tensors.
@@ -47,6 +17,8 @@ pub enum OperandIndexing {
     /// restricted by a global window. One resident fragment can serve every
     /// invocation on its owner; multiple fragments follow the result's order.
     Local(OperandWindow),
+    /// Bounds relative to each resident fragment, clipped at its physical tail.
+    Fragment(OperandWindow),
 }
 
 impl OperandIndexing {
@@ -55,56 +27,11 @@ impl OperandIndexing {
     }
 }
 
-/// Matrix axes used by a local product after the distributed operands have
-/// been materialized. Product records the selected local blocking separately.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProductAxes {
-    pub left_inner: TensorAxis,
-    pub right_inner: TensorAxis,
-    pub output_column: TensorAxis,
-    /// Valid contraction/output-column bounds when scratch shapes include padding.
-    /// These describe useful arithmetic; they do not change physical execution.
-    pub valid_inner: Option<u32>,
-    pub valid_columns: Option<u32>,
-}
-
-/// A selected contraction over resident distributed operands. The block sizes
-/// bound local calls; low clips them to each shard and binds the callable GEMM.
-/// Weight load instructions depend on that binding, not this mathematical work.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Product {
-    pub multiply: Precision,
-    pub accumulate: AccumulationPrecision,
-    pub mode: GemmKernelMode,
-    pub inner_block: u32,
-    pub output_columns: u32,
-    pub axes: ProductAxes,
-    pub operands: [OperandWindow; 2],
-    pub output_aliases: Vec<(usize, usize)>,
-}
-
 impl super::MidOperation {
     pub(crate) fn operand_window(&self, index: usize) -> Option<&OperandWindow> {
-        if let super::MidOperationKind::Product(product) = &self.kind {
-            return product.operands.get(index);
-        }
         match self.operands.get(index)? {
-            OperandIndexing::Local(window) => Some(window),
+            OperandIndexing::Local(window) | OperandIndexing::Fragment(window) => Some(window),
             OperandIndexing::Elementwise { .. } => None,
-        }
-    }
-
-    pub(crate) fn input_count(&self) -> usize {
-        match &self.kind {
-            super::MidOperationKind::Product(product) => product.operands.len(),
-            _ => self.operands.len(),
-        }
-    }
-
-    pub(crate) fn output_aliases(&self) -> &[(usize, usize)] {
-        match &self.kind {
-            super::MidOperationKind::Product(product) => &product.output_aliases,
-            _ => &self.output_aliases,
         }
     }
 }

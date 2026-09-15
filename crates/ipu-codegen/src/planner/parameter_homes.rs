@@ -276,6 +276,7 @@ mod tests {
                         },
                         operands: Vec::new(),
                         output_aliases: Vec::new(),
+                        output_windows: Vec::new(),
                     }],
                     outputs: vec![MidValueId::from_index(1)],
                     ..Default::default()

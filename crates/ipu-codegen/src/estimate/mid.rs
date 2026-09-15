@@ -115,7 +115,7 @@ fn analyze_storage<const PER_TILE: bool>(
         parent[a.max(b)] = a.min(b);
     };
     for (operation, _) in &steps {
-        for &(output, input) in operation.output_aliases() {
+        for &(output, input) in operation.output_aliases.as_slice() {
             alias(operation.results[output], operation.inputs[input]);
         }
         if let MidOperationKind::Repeat(repeat) = &operation.kind {
@@ -143,10 +143,10 @@ fn analyze_storage<const PER_TILE: bool>(
     let mut element = vec![false; roots.len()];
     let mut tail = vec![0; roots.len()];
     for (operation, _) in &steps {
-        if let MidOperationKind::Product(product) = &operation.kind {
+        if let MidOperationKind::Gemm { multiply, .. } = &operation.kind {
             element[roots[operation.inputs[0].index() as usize]] = true;
             element[roots[operation.results[0].index() as usize]] = true;
-            tail[roots[operation.inputs[0].index() as usize]] = 8 * product.multiply.bytes();
+            tail[roots[operation.inputs[0].index() as usize]] = 8 * multiply.bytes();
         }
     }
     let tiles = if PER_TILE {
@@ -407,7 +407,7 @@ fn operand_tensors(operation: &MidOperation, values: &[MidValue]) -> Option<Vec<
     operation
         .inputs
         .iter()
-        .take(operation.input_count())
+        .take(operation.operands.len())
         .enumerate()
         .map(|(index, &id)| {
             let mut local = local_tensor(&values[id.index() as usize].tensor_type)?;
@@ -416,8 +416,14 @@ fn operand_tensors(operation: &MidOperation, values: &[MidValue]) -> Option<Vec<
                 .into_iter()
                 .flat_map(|window| &window.0)
             {
-                local.shape.0[usize::from(axis)] =
-                    local.shape.0[usize::from(axis)].min(end.checked_sub(start)?);
+                let width = &mut local.shape.0[usize::from(axis)];
+                if matches!(
+                    operation.operands[index],
+                    crate::OperandIndexing::Fragment(_)
+                ) {
+                    *width = width.saturating_sub(start);
+                }
+                *width = (*width).min(end.checked_sub(start)?);
             }
             Some(local)
         })
@@ -434,67 +440,20 @@ pub(crate) fn operation_cost(
     }
     let output = tensor(*operation.results.first()?);
     let mut out = local_tensor(output)?;
+    for &(axis, start, end) in operation
+        .output_windows
+        .first()
+        .into_iter()
+        .flat_map(|w| &w.0)
+    {
+        out.shape.0[axis as usize] = out.shape.0[axis as usize]
+            .saturating_sub(start)
+            .min(end.checked_sub(start)?);
+    }
     let mut scratch = MemoryUsage::default();
     let mut rows = 0;
     let mut price = ProgramCycles::default();
     match &operation.kind {
-        MidOperationKind::Product(product) => {
-            let mut inputs = operand_tensors(operation, values)?;
-            let axes = product.axes;
-            let left_axis = axes.left_inner.resolve(inputs[0].shape.0.len()).ok()?;
-            let right_axis = axes.right_inner.resolve(inputs[1].shape.0.len()).ok()?;
-            let column_axis = axes.output_column.resolve(out.shape.0.len()).ok()?;
-            let mut columns = product.output_columns;
-            if product.inner_block == 0 || columns == 0 {
-                return None;
-            }
-            if let Some(group) = out.format.layout.order.gemm_output_group() {
-                columns = columns.min(group);
-            }
-            let calls = u64::from(inputs[0].shape.0[left_axis].div_ceil(product.inner_block))
-                .checked_mul(u64::from(out.shape.0[column_axis].div_ceil(columns)))?;
-            let inner = product.inner_block.min(inputs[0].shape.0[left_axis]);
-            columns = columns.min(out.shape.0[column_axis]);
-            inputs[0].shape.0[left_axis] = inner;
-            inputs[1].shape.0[right_axis] = inner;
-            out.shape.0[column_axis] = columns;
-            price.total = super::primitive::kernel_cycles(
-                &MidOperationKind::Gemm {
-                    multiply: product.multiply,
-                    accumulate: product.accumulate,
-                    mode: product.mode,
-                    weights: crate::GemmWeightLoad::Standard,
-                    inner_block: inner,
-                    output_columns: columns,
-                },
-                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
-                super::primitive::Geometry::Tensor(&out),
-            )
-            .saturating_mul(calls);
-        }
-        MidOperationKind::Sum { axis, staging } => {
-            let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);
-            let remote = contributors.saturating_sub(1);
-            let bytes = maximum_shard_bytes(output);
-            let per_stage = staging.remote_partials_per_stage(remote);
-            let stages = remote.div_ceil(per_stage);
-            scratch.standard = bytes.saturating_mul(per_stage.saturating_add(2));
-            let (exchange, footprint) = exchange_price(bytes.saturating_mul(remote), stages, 256);
-            price.exchange = exchange;
-            rows = footprint;
-            let elements = bytes.div_ceil(output.format.precision.bytes());
-            let full_stages = remote / per_stage;
-            let tail = remote % per_stage;
-            price.total = exchange
-                .saturating_add(full_stages.saturating_mul(
-                    crate::kernel::cost::f16_reduction_cycles(elements, per_stage + 1),
-                ))
-                .saturating_add(if tail == 0 {
-                    0
-                } else {
-                    crate::kernel::cost::f16_reduction_cycles(elements, tail + 1)
-                });
-        }
         MidOperationKind::Copy { policy, .. } => {
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
@@ -613,10 +572,6 @@ fn movement_fragment_bytes(input: &TensorType, output: &TensorType) -> u64 {
             .min(256);
     }
     256
-}
-
-fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
-    exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
 }
 
 pub(crate) fn region_program(

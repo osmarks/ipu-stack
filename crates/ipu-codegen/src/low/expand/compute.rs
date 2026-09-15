@@ -1,21 +1,19 @@
-//! Dispatch distributed compute to its family. Elementwise/local kernels bind
-//! resident operands here; products and sums own their local construction.
+//! Bind executable mid computations to resident tensor regions. Algorithm
+//! construction and iteration are complete before this stage.
 
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::tensor::Broadcast;
 use crate::{OperandIndexing, OperandWindow};
 
-/// Accesses that need a canonical allocation before family construction.
-/// Sum erases a contributor axis by reinterpreting whole allocations; an
-/// in-place result likewise cannot inherit a borrowed slice's backing stride.
+/// Writable aliases need complete allocations, rather than borrowed slices.
 pub(super) fn allocation_inputs<'a>(
     operation: &'a MidOperation,
 ) -> impl Iterator<Item = &'a MidValueId> {
-    let sum_input = matches!(operation.kind, MidOperationKind::Sum { .. }).then_some(0);
-    sum_input
-        .into_iter()
-        .chain(operation.output_aliases().iter().map(|&(_, input)| input))
+    operation
+        .output_aliases
+        .iter()
+        .map(|&(_, input)| input)
         .filter_map(|index| operation.inputs.get(index))
 }
 
@@ -25,138 +23,159 @@ impl TileGraphBuilder {
         operation: &MidOperation,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        match &operation.kind {
-            MidOperationKind::Product(product) => self.build_product(operation, product, body),
-            MidOperationKind::Sum { axis, staging } => {
-                let mut batch = reduce::SumBatch::default();
-                self.prepare_sum(operation, usize::from(*axis), *staging, &mut batch)?;
-                self.append_sum_batch(batch, operation_provenance(operation), body)
+        let kernel = &operation.kind;
+
+        let operands = &operation.operands;
+        let output_aliases = &operation.output_aliases;
+        let donate_cast = matches!(
+            kernel,
+            MidOperationKind::Cast {
+                from: Precision::F16,
+                to: Precision::F8F143 { .. }
             }
-            kernel => {
-                let operands = &operation.operands;
-                let output_aliases = &operation.output_aliases;
-                let donate_cast = matches!(
-                    kernel,
-                    MidOperationKind::Cast {
-                        from: Precision::F16,
-                        to: Precision::F8F143 { .. }
-                    }
-                ) && output_aliases == &[(0, 0)];
-                let output = *operation
-                    .results
-                    .first()
-                    .ok_or(ExpansionError::ResultArity)?;
-                let outputs = self.allocation_shards(output)?;
-                let inputs_by_tile = self.views_by_tile(&operation.inputs)?;
-                let results_by_tile = self.views_by_tile(&operation.results)?;
-                // Results share the invocation distribution, even when their
-                // tensor ranks differ (for example residuals and row statistics).
-                if results_by_tile.iter().any(|result| {
-                    result
-                        .iter()
-                        .zip(&results_by_tile[0])
-                        .any(|(a, b)| a.len() != b.len())
-                }) {
-                    return Err(ExpansionError::ResultArity);
-                }
-                let mut next_fragment = vec![0; usize::from(self.tile_count)];
-                for output in outputs {
-                    let block = &self.shards[output.index() as usize];
-                    let tile = block.tile;
-                    let ordinal = next_fragment[usize::from(tile)];
-                    next_fragment[usize::from(tile)] += 1;
-                    if block
-                        .extents
-                        .iter()
-                        .any(|axis| axis.physical_end == axis.start)
-                    {
-                        continue;
-                    }
-                    let results = results_by_tile
-                        .iter()
-                        .map(|tiles| tiles[usize::from(tile)][ordinal].shard)
-                        .collect::<Vec<_>>();
-                    self.bind_compute_aliases(
-                        &results,
-                        output_aliases,
-                        &inputs_by_tile,
-                        if donate_cast {
-                            -(crate::kernel::cast::CAST_PREFIX_BYTES as i32)
-                        } else {
-                            0
-                        },
-                    )?;
-                    let inputs = inputs_by_tile
-                        .iter()
-                        .zip(operands)
-                        .zip(&operation.inputs)
-                        .map(|((tiles, indexing), value)| {
-                            let resident = &tiles[usize::from(tile)];
-                            match indexing {
-                                OperandIndexing::Elementwise { result } => {
-                                    let output =
-                                        *results.get(*result).ok_or(ExpansionError::ResultArity)?;
-                                    resident
-                                        .iter()
-                                        .find_map(|source| {
-                                            self.elementwise_view(
-                                                source,
-                                                &self.logical_values[value.index() as usize]
-                                                    .tensor_type
-                                                    .shape,
-                                                output,
-                                            )
-                                        })
-                                        .ok_or(ExpansionError::InvalidOperatorPlan)
-                                }
-                                OperandIndexing::Local(window) => {
-                                    let index = if resident.len() == 1 { 0 } else { ordinal };
-                                    if resident.len() != 1
-                                        && resident.len()
-                                            != results_by_tile[0][usize::from(tile)].len()
-                                    {
-                                        return Err(ExpansionError::InvalidOperatorPlan);
-                                    }
-                                    let source = resident
-                                        .get(index)
-                                        .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                                    self.window(source, window)
-                                }
+        ) && output_aliases == &[(0, 0)];
+        let output = *operation
+            .results
+            .first()
+            .ok_or(ExpansionError::ResultArity)?;
+        let outputs = self.allocation_shards(output)?;
+        let inputs_by_tile = self.views_by_tile(&operation.inputs)?;
+        let results_by_tile = self.views_by_tile(&operation.results)?;
+        // Results share the invocation distribution, even when their
+        // tensor ranks differ (for example residuals and row statistics).
+        if results_by_tile.iter().any(|result| {
+            result
+                .iter()
+                .zip(&results_by_tile[0])
+                .any(|(a, b)| a.len() != b.len())
+        }) {
+            return Err(ExpansionError::ResultArity);
+        }
+        let mut next_fragment = vec![0; usize::from(self.tile_count)];
+        for output in outputs {
+            let block = &self.shards[output.index() as usize];
+            let tile = block.tile;
+            let ordinal = next_fragment[usize::from(tile)];
+            next_fragment[usize::from(tile)] += 1;
+            if block
+                .extents
+                .iter()
+                .any(|axis| axis.physical_end == axis.start)
+            {
+                continue;
+            }
+            let results = results_by_tile
+                .iter()
+                .map(|tiles| tiles[usize::from(tile)][ordinal].shard)
+                .collect::<Vec<_>>();
+            self.bind_compute_aliases(
+                &results,
+                output_aliases,
+                &inputs_by_tile,
+                if donate_cast {
+                    -(crate::kernel::cast::CAST_PREFIX_BYTES as i32)
+                } else {
+                    0
+                },
+            )?;
+            let inputs = inputs_by_tile
+                .iter()
+                .zip(operands)
+                .zip(&operation.inputs)
+                .map(|((tiles, indexing), value)| {
+                    let resident = &tiles[usize::from(tile)];
+                    match indexing {
+                        OperandIndexing::Elementwise { result } => {
+                            let output =
+                                *results.get(*result).ok_or(ExpansionError::ResultArity)?;
+                            resident
+                                .iter()
+                                .find_map(|source| {
+                                    self.elementwise_view(
+                                        source,
+                                        &self.logical_values[value.index() as usize]
+                                            .tensor_type
+                                            .shape,
+                                        output,
+                                    )
+                                })
+                                .ok_or(ExpansionError::InvalidOperatorPlan)
+                        }
+                        OperandIndexing::Local(window) | OperandIndexing::Fragment(window) => {
+                            let index = if resident.len() == 1 { 0 } else { ordinal };
+                            if resident.len() != 1
+                                && resident.len() != results_by_tile[0][usize::from(tile)].len()
+                            {
+                                return Err(ExpansionError::InvalidOperatorPlan);
                             }
-                        })
-                        .collect::<ExpansionResult<Vec<_>>>()?;
-                    let results = results
-                        .into_iter()
-                        .map(|shard| self.full_view(shard))
-                        .collect::<Vec<_>>();
-                    if donate_cast {
-                        let [input]: [ShardView; 1] = inputs
-                            .try_into()
-                            .map_err(|_| ExpansionError::InvalidOperatorPlan)?;
-                        let [output]: [ShardView; 1] = results
-                            .try_into()
-                            .map_err(|_| ExpansionError::ResultArity)?;
-                        self.build_shifted_cast(
-                            body,
-                            tile,
-                            operation_provenance(operation),
-                            kernel.clone(),
-                            input,
-                            output,
-                        )?;
-                    } else {
-                        let run = self.bind_kernel(
-                            operation_provenance(operation),
-                            kernel.clone(),
-                            inputs,
-                            results,
-                        )?;
-                        self.append_kernel(body, tile, run)?;
+                            let source = resident
+                                .get(index)
+                                .ok_or(ExpansionError::InvalidOperatorPlan)?;
+                            if matches!(indexing, OperandIndexing::Fragment(_)) {
+                                self.fragment_window(source, window)
+                            } else {
+                                self.window(source, window)
+                            }
+                        }
                     }
+                })
+                .collect::<ExpansionResult<Vec<_>>>()?;
+            let results = results
+                .into_iter()
+                .enumerate()
+                .map(|(index, shard)| {
+                    let view = self.full_view(shard);
+                    operation
+                        .output_windows
+                        .get(index)
+                        .map_or(Ok(view.clone()), |window| {
+                            self.fragment_window(&view, window)
+                        })
+                })
+                .collect::<ExpansionResult<Vec<_>>>()?;
+            if inputs
+                .iter()
+                .chain(&results)
+                .any(|v| v.extents.iter().any(|e| e.start == e.physical_end))
+            {
+                continue;
+            }
+            if donate_cast {
+                let [input]: [ShardView; 1] = inputs
+                    .try_into()
+                    .map_err(|_| ExpansionError::InvalidOperatorPlan)?;
+                let [output]: [ShardView; 1] = results
+                    .try_into()
+                    .map_err(|_| ExpansionError::ResultArity)?;
+                self.build_shifted_cast(
+                    body,
+                    tile,
+                    operation_provenance(operation),
+                    kernel.clone(),
+                    input,
+                    output,
+                )?;
+            } else {
+                let mut kind = kernel.clone();
+                if let MidOperationKind::Gemm {
+                    axes,
+                    inner_block,
+                    output_columns,
+                    ..
+                } = &mut kind
+                {
+                    let li = axes.left_inner.resolve(inputs[0].extents.len())?;
+                    let oc = axes.output_column.resolve(results[0].extents.len())?;
+                    *inner_block = inputs[0].extents[li].physical_end - inputs[0].extents[li].start;
+                    *output_columns =
+                        results[0].extents[oc].physical_end - results[0].extents[oc].start;
                 }
-                Ok(())
+                let run =
+                    self.bind_kernel(operation_provenance(operation), kind, inputs, results)?;
+                self.append_kernel(body, tile, run)?;
             }
         }
+        Ok(())
     }
 
     pub(super) fn elementwise_view(
@@ -204,6 +223,25 @@ impl TileGraphBuilder {
             .map(|&(axis, start, end)| (usize::from(axis), start, end))
             .collect::<Vec<_>>();
         self.narrow_view(source, &ranges)
+    }
+
+    fn fragment_window(
+        &self,
+        source: &ShardView,
+        window: &OperandWindow,
+    ) -> ExpansionResult<ShardView> {
+        let mut result = source.clone();
+        for &(axis, start, end) in &window.0 {
+            let e = result
+                .extents
+                .get_mut(axis as usize)
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
+            let origin = e.start;
+            e.start = origin.saturating_add(start).min(e.physical_end);
+            e.physical_end = origin.saturating_add(end).min(e.physical_end).max(e.start);
+            e.logical_end = e.logical_end.min(e.physical_end).max(e.start);
+        }
+        Ok(result)
     }
 
     /// Preserve per-tile fragment order without rescanning all shards for each

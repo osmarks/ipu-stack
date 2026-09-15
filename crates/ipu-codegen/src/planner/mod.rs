@@ -9,13 +9,16 @@ pub(crate) mod candidates;
 pub(crate) mod catalogue;
 mod error;
 pub(crate) mod fragments;
+pub(crate) mod fusion;
 mod gemm;
 mod layernorm;
 pub(crate) mod operator;
 mod parameter_homes;
+mod reduction;
 pub use catalogue::OperatorCandidate;
 pub use error::{LoweringError, LoweringResult};
 pub use operator::{GemmOrientation, LocalOperandStaging, OperatorFamily};
+pub use reduction::ReductionStaging;
 #[cfg(test)]
 pub(crate) mod test_support;
 

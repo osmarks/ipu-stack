@@ -286,13 +286,13 @@ pub use low::{
     BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
     shard_storage_bytes,
 };
-pub use mid::ReductionStaging;
 pub(crate) use mid::*;
 pub use package::{
     CompiledPackage, DiagnosticShard, DiagnosticTensor, TileProgramData, build_tile_program_package,
 };
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
+pub use planner::ReductionStaging;
 pub use supervisor::*;
 // Compatibility name for planner choices; this is not an executable mid node.
 pub use planner::OperatorFamily as MidOperator;

@@ -115,10 +115,14 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    operation.output_aliases().iter().any(|&(output, input)| {
-        operation.results[output] == value
-            && value_can_alias(operation.inputs[input], target, operations)
-    })
+    operation
+        .output_aliases
+        .as_slice()
+        .iter()
+        .any(|&(output, input)| {
+            operation.results[output] == value
+                && value_can_alias(operation.inputs[input], target, operations)
+        })
 }
 
 fn repeat_yield_can_alias(
@@ -151,7 +155,7 @@ fn repeat_yield_can_alias(
                 aliases.extend(operation.results.iter().copied());
             }
             _ => {
-                let output_aliases = operation.output_aliases();
+                let output_aliases = operation.output_aliases.as_slice();
                 for &(output, input) in output_aliases {
                     if aliases.contains(&operation.inputs[input]) {
                         aliases.insert(operation.results[output]);
@@ -182,6 +186,7 @@ mod tests {
             },
             kind,
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         };
         let gelu = || MidOperationKind::Gelu;
         for reuse_local in [false, true] {

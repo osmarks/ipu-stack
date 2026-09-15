@@ -3,7 +3,7 @@
 use crate::graph::{AttentionOptions, GemmOptions};
 use crate::kernel::AccumulationPrecision;
 use crate::mid::MidOperationKind;
-use crate::mid::ReductionStaging;
+use crate::planner::ReductionStaging;
 use crate::planner::catalogue::blocked_gemm_dispatch;
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisFactorView,

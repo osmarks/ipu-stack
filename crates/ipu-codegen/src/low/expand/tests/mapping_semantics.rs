@@ -338,6 +338,7 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 })
                 .collect(),
             ..MidProgram::default()

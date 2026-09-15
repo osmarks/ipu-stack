@@ -205,6 +205,7 @@ fn reorder_region(
                 },
                 operands: vec![OperandIndexing::Elementwise { result: 0 }],
                 output_aliases: vec![],
+                output_windows: Vec::new(),
             };
             before.entry(at).or_default().push(early);
             shared.push((input, id, at));
@@ -227,7 +228,7 @@ fn reorder_region(
 }
 
 fn may_write_existing_storage(op: &MidOperation) -> bool {
-    !op.output_aliases().is_empty() || matches!(op.kind, MidOperationKind::Repeat(_))
+    !op.output_aliases.as_slice().is_empty() || matches!(op.kind, MidOperationKind::Repeat(_))
 }
 
 #[cfg(test)]
@@ -297,6 +298,7 @@ mod tests {
                     },
                     kind,
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 })
                 .collect(),
             outputs: vec![MidValueId(2)],
@@ -325,6 +327,7 @@ mod tests {
                 kind: MidOperationKind::Gelu,
                 operands: vec![OperandIndexing::Elementwise { result: 0 }],
                 output_aliases: vec![(0, 0)],
+                output_windows: Vec::new(),
             },
         );
         mid.values.push(alias);
@@ -354,6 +357,7 @@ mod tests {
             }),
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         }];
         mid.reorder_casts();
         let MidOperationKind::Repeat(repeat) = &mid.operations[0].kind else {
@@ -386,6 +390,7 @@ mod tests {
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             },
         );
         mid.values.push(original);

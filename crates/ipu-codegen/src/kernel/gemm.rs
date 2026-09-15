@@ -12,6 +12,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
         inner_block,
         output_columns,
         mode,
+        ..
     } = run.kernel
     else {
         return Err(KernelAbiError::RequirementMismatch);

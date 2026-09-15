@@ -120,12 +120,12 @@ pub(crate) fn build_fragment(
     Some(Arc::new(b.program))
 }
 
-pub(super) struct FragmentBuilder {
-    pub(super) program: MidProgram,
+pub(crate) struct FragmentBuilder {
+    pub(crate) program: MidProgram,
 }
 
 impl FragmentBuilder {
-    pub(super) fn new(inputs: &[TensorType]) -> Self {
+    pub(crate) fn new(inputs: &[TensorType]) -> Self {
         let mut b = Self {
             program: MidProgram::default(),
         };
@@ -163,19 +163,14 @@ impl FragmentBuilder {
         outputs: impl IntoIterator<Item = TensorType>,
         kind: MidOperationKind,
     ) -> Vec<MidValueId> {
-        let results = outputs
-            .into_iter()
-            .map(|output| self.value(output))
-            .collect::<Vec<_>>();
-        self.program.operations.push(MidOperation {
-            source: None,
+        self.compute(
             inputs,
-            results: results.clone(),
+            outputs
+                .into_iter()
+                .map(|output| (output, None, crate::OperandWindow::default())),
             kind,
-            operands: Vec::new(),
-            output_aliases: Vec::new(),
-        });
-        results
+            Vec::new(),
+        )
     }
 
     pub(super) fn cast(&mut self, input: MidValueId, precision: Precision) -> MidValueId {
@@ -222,6 +217,7 @@ impl FragmentBuilder {
                     && source.format.layout.order == output.format.layout.order
                     && source.format.layout.memory_class == output.format.layout.memory_class
                     && same_distribution(source, &output)))
+            && (reuse_local || self.can_borrow_dense(input, &output))
         {
             return input;
         }
@@ -240,6 +236,60 @@ impl FragmentBuilder {
         )[0]
     }
 
+    /// Prove a copy may borrow a contiguous, aligned region rather than pack it.
+    /// A previous borrowing copy can retain its source's strides, so its declared
+    /// layout is insufficient evidence; unknown backing geometry requires packing.
+    pub(super) fn can_borrow_dense(&self, input: MidValueId, output: &TensorType) -> bool {
+        if self.program.operations.iter().any(|op| {
+            op.results.contains(&input)
+                && matches!(
+                    op.kind,
+                    MidOperationKind::Copy {
+                        reuse_local: true,
+                        ..
+                    }
+                )
+        }) {
+            return false;
+        }
+        let source = self.tensor(input);
+        if source == output {
+            return true;
+        }
+        if source.format.precision != output.format.precision
+            || source.format.layout.order != output.format.layout.order
+        {
+            return false;
+        }
+        let (Ok(sources), Ok(targets)) = (
+            source.format.layout.shard_extents(&source.shape),
+            output.format.layout.shard_extents(&output.shape),
+        ) else {
+            return false;
+        };
+        targets.iter().all(|(_, target)| {
+            sources.iter().any(|(_, backing)| {
+                backing.len() == target.len()
+                    && backing.iter().zip(target).all(|(a, b)| {
+                        a.start <= b.start
+                            && a.physical_end >= b.physical_end
+                            && a.logical_end >= b.logical_end
+                    })
+                    && crate::storage::byte_traversal(
+                        crate::storage::TensorStorage {
+                            format: &source.format,
+                            extents: backing,
+                        },
+                        target,
+                        true,
+                    )
+                    .ok()
+                    .and_then(|t| t.contiguous_span())
+                    .is_some_and(|s| s.offset.is_multiple_of(8))
+            })
+        })
+    }
+
     pub(super) fn kernel(
         &mut self,
 
@@ -249,33 +299,46 @@ impl FragmentBuilder {
         reuse: Option<MidValueId>,
         operands: Vec<OperandIndexing>,
     ) -> MidValueId {
-        self.compute(inputs, [(output, reuse)], kernel, operands)[0]
+        self.compute(
+            inputs,
+            [(output, reuse, crate::OperandWindow::default())],
+            kernel,
+            operands,
+        )[0]
     }
 
     pub(super) fn compute(
         &mut self,
 
         mut inputs: Vec<MidValueId>,
-        outputs: impl IntoIterator<Item = (TensorType, Option<MidValueId>)>,
-        mut kind: MidOperationKind,
+        outputs: impl IntoIterator<Item = (TensorType, Option<MidValueId>, crate::OperandWindow)>,
+        kind: MidOperationKind,
         operands: Vec<OperandIndexing>,
     ) -> Vec<MidValueId> {
         let mut types = Vec::new();
         let mut output_aliases = Vec::new();
-        for (output, reuse) in outputs {
+        let mut output_windows = Vec::new();
+        for (output, reuse, window) in outputs {
             if let Some(value) = reuse {
                 output_aliases.push((types.len(), inputs.len()));
                 inputs.push(value);
             }
             types.push(output);
+            output_windows.push(window);
         }
-        if let MidOperationKind::Product(product) = &mut kind {
-            product.output_aliases = output_aliases.clone();
-        }
-        let results = self.emit(inputs, types, kind);
-        let operation = self.program.operations.last_mut().unwrap();
-        operation.operands = operands;
-        operation.output_aliases = output_aliases;
+        let results = types
+            .into_iter()
+            .map(|ty| self.value(ty))
+            .collect::<Vec<_>>();
+        self.program.operations.push(MidOperation {
+            source: None,
+            inputs,
+            results: results.clone(),
+            kind,
+            operands,
+            output_aliases,
+            output_windows,
+        });
         results
     }
 }

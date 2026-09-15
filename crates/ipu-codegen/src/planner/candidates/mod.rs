@@ -3,7 +3,7 @@
 use crate::estimate::{CostModel, MemoryPeaks, MemoryUsage};
 use crate::graph::{Operation, OperationKind, ValueId};
 use crate::kernel::AccumulationPrecision;
-use crate::mid::ReductionStaging;
+use crate::planner::ReductionStaging;
 use crate::tensor::Precision;
 use crate::{
     AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,

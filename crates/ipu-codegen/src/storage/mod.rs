@@ -8,7 +8,9 @@ pub(crate) use geometry::{
     CopyMapping, CopyPair, DestinationGeometry, GeometryCache, GeometryView,
 };
 mod traversal;
-pub(crate) use traversal::{ByteTraversal, StridedSpan, byte_traversal, panel_byte_traversal};
+pub(crate) use traversal::{
+    ByteTraversal, StridedSpan, byte_traversal, contiguous_axis_blocks, panel_byte_traversal,
+};
 
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision, ShardExtent, TensorFormat,

@@ -363,6 +363,13 @@ mod tests {
                         weights: GemmWeightLoad::Standard,
                         inner_block: 64,
                         output_columns: 16,
+                        axes: crate::GemmAxes {
+                            left_inner: crate::TensorAxis::FromEnd(1),
+                            right_inner: crate::TensorAxis::FromEnd(2),
+                            output_column: crate::TensorAxis::FromEnd(1),
+                            valid_inner: None,
+                            valid_columns: None,
+                        },
                     },
                     vec![view(0), view(1)],
                     2,

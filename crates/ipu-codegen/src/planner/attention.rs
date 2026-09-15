@@ -1,9 +1,11 @@
 //! Distributed attention stages and bounded key-block materialization.
 
 use super::fragments::{FragmentBuilder, project_grid};
+use super::gemm::Product;
+use crate::GemmAxes;
 use crate::kernel::{AccumulationPrecision, GemmKernelMode};
 use crate::mid::MidOperationKind;
-use crate::mid::{MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes};
+use crate::mid::{MidValueId, OperandIndexing, OperandWindow};
 use crate::planner::operator::ProductGrid;
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder,
@@ -41,8 +43,6 @@ impl FragmentBuilder {
             inner_block,
             output_columns,
             axes,
-            operands: Default::default(),
-            output_aliases: Vec::new(),
         };
         let query = self.tensor(MidValueId::from_index(0)).clone();
         let key = self.tensor(MidValueId::from_index(1)).clone();
@@ -76,14 +76,14 @@ impl FragmentBuilder {
         weights_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
         let mut product_type = scores_type.clone();
         product_type.shape.0[2] = value_width;
-        let qk_axes = ProductAxes {
+        let qk_axes = GemmAxes {
             valid_inner: Some(query.shape.0[2]),
             valid_columns: None,
             left_inner: TensorAxis::FromEnd(1),
             right_inner: TensorAxis::FromEnd(1),
             output_column: TensorAxis::FromEnd(1),
         };
-        let pv_axes = ProductAxes {
+        let pv_axes = GemmAxes {
             valid_inner: None,
             valid_columns: Some(final_output.shape.0[2]),
             left_inner: TensorAxis::FromEnd(1),
@@ -175,7 +175,7 @@ impl FragmentBuilder {
                     query_buffer,
                     k,
                     &rows,
-                    ProductAxes {
+                    GemmAxes {
                         valid_columns: Some(valid),
                         ..qk_axes
                     },
@@ -183,19 +183,19 @@ impl FragmentBuilder {
                     fp8_scales[0],
                 )?
             } else {
-                self.compute(
+                self.product(
                     vec![query_buffer, k],
-                    [(scores_type.clone(), None)],
-                    MidOperationKind::Product(product(
+                    (scores_type.clone(), None),
+                    product(
                         query_width,
                         key_block,
-                        ProductAxes {
+                        GemmAxes {
                             valid_columns: Some(valid),
                             ..qk_axes
                         },
-                    )),
-                    Vec::new(),
-                )[0]
+                    ),
+                    vec![crate::OperandIndexing::local(); 2],
+                )?
             };
             let workspaces = crate::kernel::softmax_workspaces(&weights_type, valid != key_block)?;
             let mut outputs = vec![(weights_type.clone(), weights)];
@@ -207,7 +207,9 @@ impl FragmentBuilder {
             );
             let softmax = self.compute(
                 vec![scores],
-                outputs,
+                outputs
+                    .into_iter()
+                    .map(|(ty, reuse)| (ty, reuse, crate::OperandWindow::default())),
                 MidOperationKind::AttentionSoftmax {
                     head_dimension: query.shape.0[2],
                     key_columns: valid,
@@ -228,7 +230,7 @@ impl FragmentBuilder {
                     weights_id,
                     v,
                     &product_type,
-                    ProductAxes {
+                    GemmAxes {
                         valid_inner: Some(valid),
                         ..pv_axes
                     },
@@ -236,25 +238,22 @@ impl FragmentBuilder {
                     fp8_scales[1],
                 )?
             } else {
-                self.compute(
+                self.product(
                     vec![weights_id, v],
-                    [(product_type.clone(), None)],
-                    MidOperationKind::Product(Product {
-                        operands: [
-                            OperandWindow(vec![(2, 0, key_block)]),
-                            OperandWindow::default(),
-                        ],
-                        ..product(
-                            key_block,
-                            value_width,
-                            ProductAxes {
-                                valid_inner: Some(valid),
-                                ..pv_axes
-                            },
-                        )
-                    }),
-                    Vec::new(),
-                )[0]
+                    (product_type.clone(), None),
+                    product(
+                        key_block,
+                        value_width,
+                        GemmAxes {
+                            valid_inner: Some(valid),
+                            ..pv_axes
+                        },
+                    ),
+                    vec![
+                        OperandIndexing::Local(OperandWindow(vec![(2, 0, key_block)])),
+                        OperandIndexing::local(),
+                    ],
+                )?
             };
             let final_block = materialized || start + key_block >= key_rows;
             let direct_f16 = final_block && final_output.format.precision == Precision::F16;

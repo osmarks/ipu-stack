@@ -32,7 +32,7 @@ pub(crate) fn baseline(
     }
     program.compose_copies();
     if !config.diagnostic_checkpoints {
-        if let Some(fused) = program.with_fusions()
+        if let Some(fused) = crate::planner::fusion::fuse(&program)
             && let Some((before, _)) = crate::estimate::analyze_mid(&program, &BTreeMap::new())
             && fused.estimated_cycles < before.total
             && fused.peak_memory.fits_ipu21_with_budget(
@@ -414,6 +414,7 @@ impl<C: CostModel> Builder<'_, C> {
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 });
                 *input = result;
             }
@@ -543,6 +544,7 @@ impl<C: CostModel> Builder<'_, C> {
             }),
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         });
         Ok(())
     }

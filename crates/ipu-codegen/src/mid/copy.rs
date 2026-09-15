@@ -165,16 +165,6 @@ pub(crate) fn independent_copy_prefix(
     })
 }
 
-pub(crate) fn independent_sum_prefix(
-    operations: &[MidOperation],
-    checkpoints: bool,
-    storage_groups: &[MidValueId],
-) -> usize {
-    independent_prefix(operations, checkpoints, storage_groups, |kind| {
-        matches!(kind, MidOperationKind::Sum { .. })
-    })
-}
-
 fn independent_prefix(
     operations: &[MidOperation],
     checkpoints: bool,
@@ -467,6 +457,7 @@ mod tests {
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             })
             .collect();
         (operations, values)

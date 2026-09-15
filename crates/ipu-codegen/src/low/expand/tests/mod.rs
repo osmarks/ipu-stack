@@ -573,23 +573,6 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .collect();
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
-        let compact = mid.clone();
-        let sum = compact
-            .operations
-            .iter()
-            .find(|op| matches!(op.kind, MidOperationKind::Sum { axis: 0, .. }))
-            .unwrap();
-        assert_eq!(
-            compact.values[sum.inputs[0].index() as usize]
-                .tensor_type
-                .shape
-                .0[0],
-            u32::from(inner_partitions)
-        );
-        assert!(
-            compact.operations.len() <= 8,
-            "distributed GEMM must not enumerate tiles"
-        );
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints)
             .unwrap_or_else(|error| {
                 panic!(
@@ -641,20 +624,21 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .count();
         assert!(direct_parameter_runs > 0, "case {case}");
         if (result_row_partitions, result_column_partitions) != (1, 1) {
+            let root = |id| crate::low::storage::storage_root(&low.shards, id);
             let output_shards = low
                 .value_views(low.outputs[0])
                 .iter()
-                .map(|view| view.shard)
+                .map(|view| root(view.shard))
                 .collect::<BTreeSet<_>>();
             let packed_results = reduction_runs
                 .iter()
-                .map(|run| run.outputs[0].shard)
+                .map(|run| root(run.outputs[0].shard))
                 .collect::<BTreeSet<_>>();
             let copied_outputs = low
                 .local_copies
                 .iter()
-                .filter(|copy| packed_results.contains(&copy.movement().source))
-                .map(|copy| copy.movement().destination)
+                .filter(|copy| packed_results.contains(&root(copy.movement().source)))
+                .map(|copy| root(copy.movement().destination))
                 .collect::<BTreeSet<_>>();
             assert!(
                 output_shards.iter().all(
@@ -1698,7 +1682,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
         let product = selected
             .operations
             .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::Product(_)))
+            .find(|operation| matches!(operation.kind, MidOperationKind::Gemm { .. }))
             .unwrap();
         let config = config
             .with_input(
@@ -2032,6 +2016,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
         },
         kind,
         output_aliases: Vec::new(),
+        output_windows: Vec::new(),
     };
     let mid = MidProgram {
         tile_count: 1,

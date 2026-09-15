@@ -4,8 +4,8 @@ use crate::kernel::AccumulationPrecision;
 use crate::low::CopyPolicy;
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, Product,
-    ProductAxes, ReductionStaging, cast_order, expand_tiles,
+    CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, cast_order,
+    expand_tiles,
 };
 use crate::planner::cache::FragmentCache;
 use crate::planner::candidates::{
@@ -34,6 +34,7 @@ use crate::{
     AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmPlanConstraint,
     PipelineConfig,
 };
+use crate::{GemmAxes, ReductionStaging};
 use std::collections::{BTreeMap, BTreeSet};
 const RANDOM_CASES: usize = 128;
 
@@ -819,13 +820,13 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let operator = lowered
             .operations
             .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::Product(Product { .. })))
+            .find(|operation| matches!(operation.kind, MidOperationKind::Gemm { .. }))
             .unwrap();
-        let MidOperationKind::Product(Product {
+        let MidOperationKind::Gemm {
             multiply: selected_multiply,
             accumulate: selected_accumulate,
             ..
-        }) = operator.kind
+        } = operator.kind
         else {
             panic!("random case {case}: expected GEMM");
         };
@@ -909,7 +910,7 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             .operations
             .iter()
             .filter_map(|operation| match operation.kind {
-                MidOperationKind::Product(Product { multiply, .. }) => Some(multiply),
+                MidOperationKind::Gemm { multiply, .. } => Some(multiply),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -994,7 +995,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
         for op in &compact.operations {
             if matches!(
                 op.kind,
-                MidOperationKind::Product(_) | MidOperationKind::AttentionSoftmax { .. }
+                MidOperationKind::Gemm { .. } | MidOperationKind::AttentionSoftmax { .. }
             ) {
                 assert_eq!(
                     compact.values[op.results[0].index() as usize]
@@ -1219,14 +1220,14 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .find(|op| {
             matches!(
                 op.kind,
-                MidOperationKind::Product(Product {
+                MidOperationKind::Gemm {
                     inner_block: 128,
-                    axes: ProductAxes {
+                    axes: GemmAxes {
                         right_inner: TensorAxis::FromEnd(2),
                         ..
                     },
                     ..
-                })
+                }
             )
         })
         .unwrap();
@@ -2115,7 +2116,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
             match &op.kind {
-                MidOperationKind::Product(Product { multiply, .. }) => {
+                MidOperationKind::Gemm { multiply, .. } => {
                     assert!(op.inputs.iter().take(2).all(|id| {
                         values[id.index() as usize].tensor_type.format.precision == *multiply
                     }));

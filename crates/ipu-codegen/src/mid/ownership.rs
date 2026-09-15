@@ -81,21 +81,13 @@ pub(crate) fn bind_owners(
             compute => {
                 for (index, input) in operation.inputs.iter_mut().enumerate() {
                     let result = match compute {
-                        MidOperationKind::Product(product) => {
-                            (index < product.operands.len()).then_some(0)
-                        }
-                        MidOperationKind::Sum { .. } => None,
                         _ => operation.operands.get(index).map(|operand| match operand {
                             OperandIndexing::Elementwise { result } => *result,
-                            OperandIndexing::Local(_) => 0,
+                            OperandIndexing::Local(_) | OperandIndexing::Fragment(_) => 0,
                         }),
                     };
                     let mut result = result;
-                    let aliases = match compute {
-                        MidOperationKind::Product(product) => &product.output_aliases,
-                        _ => &operation.output_aliases,
-                    };
-                    for &(output, alias_input) in aliases {
+                    for &(output, alias_input) in &operation.output_aliases {
                         if alias_input != index {
                             continue;
                         }
@@ -149,6 +141,7 @@ fn append_owner_copy(
     let id = value.id;
     values.push(value);
     operations.push(MidOperation {
+        output_windows: Vec::new(),
         source,
         inputs: vec![input],
         results: vec![id],

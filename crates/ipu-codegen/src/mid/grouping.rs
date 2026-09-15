@@ -38,7 +38,7 @@ impl MidProgram {
                     for input in operation.read_values() {
                         uses[groups[input.index() as usize].index() as usize] += 1;
                     }
-                    if matches!(operation.kind, MidOperationKind::Sum { .. })
+                    if matches!(operation.kind, MidOperationKind::ReductionSum { .. })
                         && operation.results.len() == 1
                     {
                         producers.insert(operation.results[0], operation);
@@ -116,8 +116,8 @@ fn group_region(
             if selected.len() >= limit
                 || !(matches!(
                     op.kind,
-                    MidOperationKind::Copy { .. } | MidOperationKind::Sum { .. }
-                ) || matches!(&op.kind, MidOperationKind::Product(product) if product.output_aliases.is_empty()))
+                    MidOperationKind::Copy { .. } | MidOperationKind::ReductionSum { .. }
+                ) || matches!(&op.kind, MidOperationKind::Gemm { .. } if op.output_aliases.is_empty()))
                 || selected
                     .iter()
                     .any(|&i| conflicts(&operations[i], op, values))
@@ -227,7 +227,7 @@ fn reduction_outputs(
         .iter()
         .enumerate()
         .filter_map(|(i, op)| {
-            (matches!(op.kind, MidOperationKind::Sum { .. })
+            (matches!(op.kind, MidOperationKind::ReductionSum { .. })
                 && op.results.len() == 1
                 && used.contains(&group(op.results[0]))
                 && !forbidden.contains(&group(op.results[0])))
@@ -287,7 +287,7 @@ mod tests {
     use super::*;
     use crate::graph::{ComputeGraph, ValueId};
 
-    use crate::mid::{CoordinateMapping, MidRegion, MidRepeat, ReductionStaging};
+    use crate::mid::{CoordinateMapping, MidRegion, MidRepeat};
     use crate::tensor::{AxisFactorView, Layout, Precision, TensorType};
 
     impl MidProgram {
@@ -331,6 +331,7 @@ mod tests {
             kind: primitive,
             operands: Vec::new(),
             output_aliases: Vec::new(),
+            output_windows: Vec::new(),
         };
         let copy = |input, output| {
             operation(
@@ -353,22 +354,8 @@ mod tests {
             )
         };
         program.operations = vec![
-            operation(
-                4,
-                0,
-                MidOperationKind::Sum {
-                    axis: 0,
-                    staging: ReductionStaging::Complete,
-                },
-            ),
-            operation(
-                5,
-                1,
-                MidOperationKind::Sum {
-                    axis: 0,
-                    staging: ReductionStaging::Complete,
-                },
-            ),
+            operation(4, 0, MidOperationKind::ReductionSum { partials: 2 }),
+            operation(5, 1, MidOperationKind::ReductionSum { partials: 2 }),
             copy(0, 2),
             copy(1, 3),
         ];
@@ -453,6 +440,7 @@ mod tests {
                 }),
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             });
             body
         };

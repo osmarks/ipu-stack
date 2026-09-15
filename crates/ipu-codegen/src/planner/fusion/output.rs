@@ -1,4 +1,4 @@
-//! Fuse supported producer epilogues before or after redistribution.
+//! Choose supported producer epilogues before or after redistribution.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
 use crate::low::CopyPolicy;
 use crate::mid::MidOperationKind;
@@ -172,7 +172,7 @@ fn fuse_fp8_outputs_at(
             continue;
         }
         if at_source {
-            value.id = MidValueId(values.len() as u32);
+            value.id = MidValueId::from_index(values.len() as u32);
             value.storage_group = value.id;
             let mut fused = producer.clone();
             fused.results = vec![value.id];
@@ -180,6 +180,7 @@ fn fuse_fp8_outputs_at(
             fused.operands = operands.clone();
             fused.output_aliases = vec![];
             let copy = MidOperation {
+                output_windows: Vec::new(),
                 inputs: vec![value.id],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
@@ -262,7 +263,7 @@ fn fuse_fp8_outputs_at(
                     replacement.inputs.push(parameter);
                     continue;
                 }
-                value.id = MidValueId((original_value_count + new_values.len()) as u32);
+                value.id = MidValueId::from_index((original_value_count + new_values.len()) as u32);
                 value.storage_group = value.id;
                 copies.push(MidOperation {
                     source: producer.source,
@@ -276,6 +277,7 @@ fn fuse_fp8_outputs_at(
                     },
                     operands: Vec::new(),
                     output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
                 });
                 replacement.inputs.push(value.id);
                 new_values.push(value);

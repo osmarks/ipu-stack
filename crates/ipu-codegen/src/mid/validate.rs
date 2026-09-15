@@ -92,65 +92,7 @@ impl MidProgram {
                                 .format
                                 .precision
                 }
-                MidOperationKind::Product(product) => {
-                    arity.0 >= 2
-                        && arity.1 == 1
-                        && product.inner_block > 0
-                        && product.output_columns > 0
-                        && product
-                            .axes
-                            .left_inner
-                            .resolve(
-                                self.values[operation.inputs[0].index() as usize]
-                                    .tensor_type
-                                    .shape
-                                    .0
-                                    .len(),
-                            )
-                            .is_ok()
-                        && product
-                            .axes
-                            .right_inner
-                            .resolve(
-                                self.values[operation.inputs[1].index() as usize]
-                                    .tensor_type
-                                    .shape
-                                    .0
-                                    .len(),
-                            )
-                            .is_ok()
-                        && product
-                            .axes
-                            .output_column
-                            .resolve(
-                                self.values[operation.results[0].index() as usize]
-                                    .tensor_type
-                                    .shape
-                                    .0
-                                    .len(),
-                            )
-                            .is_ok()
-                }
 
-                MidOperationKind::Sum { axis, .. } => {
-                    if arity != (1, 1) {
-                        false
-                    } else {
-                        let input = &self.values[operation.inputs[0].index() as usize].tensor_type;
-                        let output =
-                            &self.values[operation.results[0].index() as usize].tensor_type;
-                        let axis = usize::from(*axis);
-                        axis < input.shape.0.len()
-                            && input.format.precision == output.format.precision
-                            && input
-                                .shape
-                                .0
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(i, d)| (i != axis).then_some(d))
-                                .eq(&output.shape.0)
-                    }
-                }
                 MidOperationKind::Repeat(repeat) => {
                     self.validate_region(
                         &repeat.body.arguments,
@@ -172,6 +114,19 @@ impl MidProgram {
                     let operands = &operation.operands;
                     arity.1 != 0
                         && operands.len() <= arity.0
+                        && operation.output_windows.len() <= arity.1
+                        && operation.output_windows.iter().zip(&operation.results).all(
+                            |(window, result)| {
+                                let rank = self.values[result.index() as usize]
+                                    .tensor_type
+                                    .shape
+                                    .0
+                                    .len();
+                                window.0.iter().all(|&(axis, start, end)| {
+                                    usize::from(axis) < rank && start < end
+                                })
+                            },
+                        )
                         && operation
                             .inputs
                             .iter()
@@ -191,7 +146,8 @@ impl MidProgram {
                                             .is_some()
                                         })
                                     }
-                                    OperandIndexing::Local(window) => {
+                                    OperandIndexing::Local(window)
+                                    | OperandIndexing::Fragment(window) => {
                                         window.0.iter().all(|&(axis, start, end)| {
                                             usize::from(axis) < input.shape.0.len() && start < end
                                         })
@@ -199,7 +155,16 @@ impl MidProgram {
                                 }
                             })
                         && match kernel {
-                            MidOperationKind::Gemm { .. } => false, // Distributed products have explicit axes and blocking.
+                            MidOperationKind::Gemm {
+                                inner_block,
+                                output_columns,
+                                ..
+                            } => {
+                                arity.0 >= 2
+                                    && arity.1 == 1
+                                    && *inner_block > 0
+                                    && *output_columns > 0
+                            }
                             MidOperationKind::Cast { from, to } => {
                                 arity.0 >= 1
                                     && arity.1 == 1
@@ -226,7 +191,8 @@ impl MidProgram {
                 }
             };
             let aliases_valid = operation
-                .output_aliases()
+                .output_aliases
+                .as_slice()
                 .iter()
                 .all(|&(output, input)| output < arity.1 && input < arity.0);
             if !valid || !aliases_valid {

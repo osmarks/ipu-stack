@@ -8,11 +8,9 @@ mod compute;
 mod buffers;
 mod cast;
 mod copies;
-mod gemm;
 mod mapping;
 mod movement;
 mod ownership;
-mod reduce;
 mod repeat;
 #[cfg(test)]
 use super::{view_byte_spans, view_byte_traversal};
@@ -246,30 +244,8 @@ impl TileGraphBuilder {
                 checkpoints,
                 &self.storage_groups,
             );
-            let sums = crate::mid::independent_sum_prefix(
-                &operations[index..],
-                checkpoints,
-                &self.storage_groups,
-            );
-            let group = copies.max(sums);
-            let lowered = if sums > 1 {
-                let mut batch = reduce::SumBatch::default();
-                for operation in &operations[index..index + sums] {
-                    let MidOperationKind::Sum { axis, staging } = operation.kind else {
-                        unreachable!()
-                    };
-                    self.prepare_sum(operation, usize::from(axis), staging, &mut batch)?;
-                }
-                self.append_sum_batch(
-                    batch,
-                    WorkProvenance {
-                        operation: None,
-                        value: None,
-                        reason: WorkReason::OperatorKernel,
-                    },
-                    &mut tiles,
-                )
-            } else if copies != 0 {
+            let group = copies;
+            let lowered = if copies != 0 {
                 let mut batch = movement::MaterializationBatch::default();
                 for operation in &operations[index..index + group] {
                     self.prepare_copy_tensor(operation, &mut batch, &mut tiles)?;

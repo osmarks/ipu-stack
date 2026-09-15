@@ -13,7 +13,6 @@ pub(crate) mod cast_order;
 mod compute;
 mod copy;
 mod fragment;
-mod fusion;
 mod grouping;
 pub(crate) mod ownership;
 mod packing;
@@ -21,7 +20,7 @@ pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
 pub use copy::CoordinateMapping;
-pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
+pub(crate) use copy::independent_copy_prefix;
 pub(crate) use fragment::append_fragment;
 pub use validate::ProgramError;
 
@@ -69,11 +68,6 @@ pub enum MidOperationKind {
         policy: crate::CopyPolicy,
         packing: crate::PackingPolicy,
     },
-    Product(Product),
-    Sum {
-        axis: u16,
-        staging: ReductionStaging,
-    },
     /// Physical byte range initialized during tile expansion.
     FillZero {
         offset: u32,
@@ -82,6 +76,7 @@ pub enum MidOperationKind {
         padding_only: bool,
     },
     Gemm {
+        axes: crate::kernel::GemmAxes,
         multiply: Precision,
         accumulate: AccumulationPrecision,
         mode: GemmKernelMode,
@@ -139,6 +134,9 @@ pub struct MidOperation {
     pub kind: MidOperationKind,
     pub operands: Vec<OperandIndexing>,
     pub output_aliases: Vec<(usize, usize)>,
+    /// Writable ranges relative to each resident output fragment; omitted
+    /// outputs use the full fragment. Writes retain the allocation's strides.
+    pub output_windows: Vec<OperandWindow>,
 }
 
 impl MidOperation {

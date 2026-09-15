@@ -1,4 +1,4 @@
-//! Preserve live residuals while fusing their addition with local statistics.
+//! Fuse addition with local statistics while preserving live residuals.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
 use crate::mid::MidOperationKind;
 
@@ -104,7 +104,7 @@ pub(super) fn run(
                 continue;
             };
             statistic_parts = *stats_type.shape.0.iter().rev().nth(1).unwrap() as u16;
-            let id = MidValueId(values.len() as u32);
+            let id = MidValueId::from_index(values.len() as u32);
             stats_value = Some(MidValue {
                 id,
                 tensor_type: stats_type,
@@ -117,6 +117,7 @@ pub(super) fn run(
             current.results[0]
         };
         let fused = MidOperation {
+            output_windows: Vec::new(),
             inputs: add.inputs.clone(),
             results: vec![stats, sum],
             kind: MidOperationKind::AddLayerNormMoments,
@@ -162,7 +163,7 @@ pub(super) fn run(
                 .axes
                 .retain(|axis| axis.axis != TensorAxis::FromStart((rank - 1) as u16));
             tensor_type.format.layout.tiling.replicas *= target_parts;
-            let id = MidValueId(values.len() as u32);
+            let id = MidValueId::from_index(values.len() as u32);
             let copy = MidOperation {
                 source: current.source,
                 inputs: vec![stats],
@@ -175,6 +176,7 @@ pub(super) fn run(
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             };
             values.push(MidValue {
                 id,
@@ -308,7 +310,7 @@ mod tests {
             .with_automatic_input(gamma, Precision::F16)
             .with_automatic_input(beta, Precision::F16);
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let fused = mid.with_fusions().unwrap();
+        let fused = crate::planner::fusion::fuse(&mid).unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         assert!(
             low.kernel_runs
@@ -338,7 +340,7 @@ mod tests {
             ..MidProgram::default()
         };
         for index in 0..6 {
-            let id = MidValueId(index);
+            let id = MidValueId::from_index(index);
             program.values.push(MidValue {
                 id,
                 owners: crate::tensor::OwnerMap::default(),
@@ -357,13 +359,17 @@ mod tests {
         for (kernel, inputs, result) in [
             (
                 MidOperationKind::Add,
-                vec![MidValueId(0), MidValueId(1)],
-                MidValueId(4),
+                vec![MidValueId::from_index(0), MidValueId::from_index(1)],
+                MidValueId::from_index(4),
             ),
             (
                 MidOperationKind::LayerNorm,
-                vec![MidValueId(4), MidValueId(2), MidValueId(3)],
-                MidValueId(5),
+                vec![
+                    MidValueId::from_index(4),
+                    MidValueId::from_index(2),
+                    MidValueId::from_index(3),
+                ],
+                MidValueId::from_index(5),
             ),
         ] {
             program.operations.push(MidOperation {
@@ -373,16 +379,17 @@ mod tests {
                 operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                 inputs,
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             });
         }
-        program.outputs = vec![MidValueId(4), MidValueId(5)];
-        let fused = program.with_fusions().unwrap();
+        program.outputs = vec![MidValueId::from_index(4), MidValueId::from_index(5)];
+        let fused = crate::planner::fusion::fuse(&program).unwrap();
         assert_eq!(fused.outputs, program.outputs);
         assert_eq!(
             fused.operations[0].results,
-            vec![MidValueId(6), MidValueId(4)]
+            vec![MidValueId::from_index(6), MidValueId::from_index(4)]
         );
-        assert_eq!(fused.operations[1].inputs[0], MidValueId(4));
+        assert_eq!(fused.operations[1].inputs[0], MidValueId::from_index(4));
         let mut expanded = (*crate::expand_tiles(&fused).unwrap()).clone();
         for run in &mut expanded.kernel_runs {
             if run.kernel == MidOperationKind::AddLayerNormMoments {
@@ -451,7 +458,7 @@ mod tests {
         for operand in &mut norm.inputs {
             let source = *operand;
             let mut value = program.values[source.index() as usize].clone();
-            value.id = MidValueId(program.values.len() as u32);
+            value.id = MidValueId::from_index(program.values.len() as u32);
             value.storage_group = value.id;
             value.tensor_type.format.layout = Layout::row_sharded(2);
             program.operations.push(MidOperation {
@@ -466,14 +473,15 @@ mod tests {
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
+                output_windows: Vec::new(),
             });
             *operand = value.id;
             program.values.push(value);
         }
         let norm_input = norm.inputs[0];
         program.operations.push(norm);
-        let fused = program.with_fusions().unwrap();
-        assert_eq!(fused.operations[0].results[1], MidValueId(4));
+        let fused = crate::planner::fusion::fuse(&program).unwrap();
+        assert_eq!(fused.operations[0].results[1], MidValueId::from_index(4));
         assert_eq!(fused.operations.last().unwrap().inputs[0], norm_input);
         assert_eq!(fused.outputs, program.outputs);
         let graph = crate::expand_tiles(&fused).unwrap();
@@ -504,8 +512,7 @@ mod tests {
         for id in [0, 1, 4] {
             program.values[id].tensor_type.format.layout = feature_layout.clone();
         }
-        let fused = program
-            .with_fusions()
+        let fused = crate::planner::fusion::fuse(&program)
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         let placement = crate::place(&low).unwrap();

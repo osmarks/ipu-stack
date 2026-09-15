@@ -3,25 +3,6 @@
 use super::*;
 
 impl TileGraphBuilder {
-    pub(super) fn append_physical_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        self.append_ordered_phase(transfers, provenance, CopyOrder::Physical, tiles)
-    }
-
-    pub(super) fn append_ordered_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        order: CopyOrder,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        self.append_mixed_phase(std::iter::once((order, transfers)), provenance, tiles)
-    }
-
     pub(super) fn append_mixed_phase(
         &mut self,
         mappings: impl IntoIterator<Item = (CopyOrder, BTreeMap<ShardView, Vec<ShardView>>)>,
