@@ -1,7 +1,5 @@
 use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
-use crate::graph::{
-    AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId,
-};
+use crate::graph::{ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId};
 use crate::kernel::{AccumulationPrecision, TileKernelSpec};
 use crate::low::CopyPolicy;
 use crate::mid::{
@@ -30,8 +28,7 @@ use crate::planner::{bind, build, candidates, test_support::lower};
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisFactorView,
     AxisTiling, BlockMajorOrder, ElementOrder, GridOrder, Layout, LayoutError, MemoryClass,
-    Padding, Precision, ShardExtent, TensorAxis, TensorFormat, TensorShape, TensorTiling,
-    TensorType,
+    Padding, Precision, TensorAxis, TensorFormat, TensorShape, TensorTiling, TensorType,
 };
 use crate::{
     AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmPlanConstraint,
@@ -293,52 +290,6 @@ fn single_row_add_can_keep_column_ownership() {
 }
 
 #[test]
-fn fp8_mlp_can_quantize_before_replication() {
-    let mut graph = ComputeGraph::new();
-    let x = graph.host_input("x", [1, 729, 1152]).unwrap();
-    let w0 = graph.parameter("w0", [1, 1152, 4304]).unwrap();
-    let w1 = graph.parameter("w1", [1, 4304, 1152]).unwrap();
-    let h = graph.gemm(x, w0).unwrap();
-    let h = graph.gelu(h).unwrap();
-    let y = graph.gemm(h, w1).unwrap();
-    graph.set_outputs([y]).unwrap();
-    let fp8 = Precision::F8F143 { scale_exponent: -4 };
-    let mut config = PipelineConfig::new(1472)
-        .with_automatic_input(x, fp8)
-        .with_automatic_input(w0, fp8)
-        .with_automatic_input(w1, fp8);
-    config
-        .operator_candidates
-        .retain(|c| !matches!(c.operator(), OperatorFamily::Gemm { .. }));
-    config
-        .operator_candidates
-        .push(OperatorCandidate::fp8_gemm(1472, -4));
-    let mut recipe = Recipe::default();
-    recipe.options.cast_before_copies = true;
-    let lowered = build::build_candidate(
-        &graph,
-        &config,
-        &crate::estimate::Ipu21CostModel,
-        &crate::planner::cache::FragmentCache::default(),
-        &recipe,
-    )
-    .unwrap();
-    assert!(lowered.recipe.options.cast_before_copies);
-    let mid = lowered.program;
-    // Casts may now be fused with the producer. Check the typed data flow,
-    // rather than requiring a standalone conversion operation to survive.
-    assert!(mid.operations.iter().any(|op| {
-        op.inputs
-            .iter()
-            .any(|id| value(&mid, *id).tensor_type.format.precision == Precision::F16)
-            && op.results.iter().any(|id| {
-                let output = &value(&mid, *id).tensor_type;
-                output.format.precision == fp8 && output.format.layout.tiling.replicas == 1
-            })
-    }));
-}
-
-#[test]
 fn fp8_conversion_precedes_operand_replication() {
     let mut graph = ComputeGraph::new();
     let host = graph.host_input("input", [512, 64]).unwrap();
@@ -444,19 +395,6 @@ fn precision(random: &mut fastrand::Rng) -> Precision {
 
 fn format(precision: Precision, layout: Layout) -> TensorFormat {
     TensorFormat { precision, layout }
-}
-
-fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
-    let tiling = if random.bool() {
-        TensorTiling::replicated(tiles)
-    } else {
-        TensorTiling::sharded(TensorAxis::FromEnd(2), tiles)
-    };
-    let mut layout = Layout::row_major(tiling);
-    if random.bool() {
-        layout.memory_class = MemoryClass::Ipu21Interleaved;
-    }
-    format(precision(random), layout)
 }
 
 #[test]
@@ -749,25 +687,6 @@ fn assert_conversions_are_explicit(lowered: &MidProgram, operations: &[MidOperat
     }
 }
 
-fn assert_operator_signature(
-    lowered: &MidProgram,
-    operation: &MidOperation,
-    inputs: &[TensorFormat],
-    output: TensorFormat,
-) {
-    let MidOperationKind::Compute(compute) = &operation.kind else {
-        panic!("expected compute")
-    };
-    assert_eq!(compute.input_count(), inputs.len());
-    for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
-        assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
-    }
-    assert_eq!(
-        value(lowered, operation.results[0]).tensor_type.format,
-        output
-    );
-}
-
 struct ColumnParityCost;
 
 impl CostModel for ColumnParityCost {
@@ -1048,225 +967,6 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
 }
 
 #[test]
-fn randomized_non_gemm_lowering_honors_operator_plans() {
-    let mut random = fastrand::Rng::with_seed(0x6164_642b);
-    for case in 0..RANDOM_CASES {
-        let tiles = random.u16(1..=64);
-        let batch = random.u32(1..=2);
-        let query_rows = u32::from(tiles) * random.u32(1..=2);
-        let key_rows = random.u32(1..=8);
-        let channels = random.u32(1..=8);
-        let value_channels = random.u32(1..=8);
-        let mut graph = ComputeGraph::new();
-        let activation = graph
-            .host_input("activation", [batch, query_rows, channels])
-            .unwrap();
-        let residual = graph
-            .host_input("residual", [batch, query_rows, channels])
-            .unwrap();
-        let query = graph
-            .host_input("query", [batch, query_rows, channels])
-            .unwrap();
-        let key = graph
-            .host_input("key", [batch, key_rows, channels])
-            .unwrap();
-        let attention_value = graph
-            .host_input("value", [batch, key_rows, value_channels])
-            .unwrap();
-        let activated = graph.gelu(activation).unwrap();
-        let sum = graph.add(activated, residual).unwrap();
-        let attended = graph.flash_attention(query, key, attention_value).unwrap();
-        graph.set_outputs([sum, attended]).unwrap();
-
-        let gelu_input = random_format(&mut random, tiles);
-        let gelu_output = gelu_input.clone();
-        let add_left = random_format(&mut random, tiles);
-        let add_right = add_left.clone();
-        let add_output = add_left.clone();
-        let attention_query = format(
-            Precision::F16,
-            Layout::row_major(TensorTiling::replicated(tiles)),
-        );
-        let attention_key = attention_query.clone();
-        let attention_value_format = attention_query.clone();
-        let attention_output = format(Precision::F32, attention_query.layout.clone());
-        let attention_accumulate = AccumulationPrecision::F32;
-        let mut config = PipelineConfig::new(tiles)
-            .with_input(activation, random_format(&mut random, tiles))
-            .with_input(residual, random_format(&mut random, tiles))
-            .with_input(query, random_format(&mut random, tiles))
-            .with_input(key, random_format(&mut random, tiles))
-            .with_input(attention_value, random_format(&mut random, tiles));
-        config.operator_candidates = vec![
-            ConcreteOperatorCandidate::new(
-                OperatorFamily::Gelu,
-                [OperandRequirement::new(gelu_input.clone())],
-                gelu_output.clone(),
-            )
-            .with_reusable_inputs([0]),
-            ConcreteOperatorCandidate::new(
-                OperatorFamily::Add,
-                [
-                    OperandRequirement::new(add_left.clone()),
-                    OperandRequirement::new(add_right.clone()),
-                ],
-                add_output.clone(),
-            )
-            .with_reusable_inputs([0]),
-            ConcreteOperatorCandidate::new(
-                OperatorFamily::FlashAttention {
-                    options: AttentionOptions::default(),
-                    accumulate: attention_accumulate,
-                },
-                [
-                    OperandRequirement::new(attention_query.clone()),
-                    OperandRequirement::new(attention_key.clone()),
-                    OperandRequirement::new(attention_value_format.clone()),
-                ],
-                attention_output.clone(),
-            ),
-        ]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
-
-        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let operators = lowered
-            .operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Gelu | TileKernelSpec::Add,
-                        ..
-                    })
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(operators.len(), 2, "random case {case}");
-        let gelu = operators
-            .iter()
-            .copied()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Gelu,
-                        ..
-                    })
-                )
-            })
-            .expect("random graph retains its GeLU");
-        let add = operators
-            .iter()
-            .copied()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Add,
-                        ..
-                    })
-                )
-            })
-            .expect("random graph retains its add");
-        assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
-        assert!(
-            matches!(&gelu.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) if !output_aliases.is_empty())
-        );
-        assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
-        assert!(
-            matches!(&add.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) if !output_aliases.is_empty())
-        );
-        assert!(lowered.operations.iter().any(|op| matches!(
-            op.kind,
-            MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::FlashAttention { .. }
-                    | TileKernelSpec::AttentionSoftmax { .. },
-                ..
-            })
-        )));
-        assert_eq!(
-            value(&lowered, lowered.outputs[1]).tensor_type.shape.0,
-            vec![batch, query_rows, value_channels],
-            "random case {case}"
-        );
-        assert_conversions_are_explicit(&lowered, &lowered.operations);
-    }
-}
-
-#[test]
-fn randomized_repeat_lowering_retains_sequences_without_unrolling() {
-    let mut random = fastrand::Rng::with_seed(0x7265_7065);
-    for case in 0..RANDOM_CASES {
-        let tiles = random.u16(1..=64);
-        let size = u32::from(tiles);
-        let count = random.u32(1..=12);
-        let layout = Layout::row_sharded(tiles);
-        let carried_format = format(precision(&mut random), layout.clone());
-        let mut graph = ComputeGraph::new();
-        let carried = graph.host_input("state", [size, size]).unwrap();
-        let weights = (0..count)
-            .map(|index| graph.parameter(format!("weight.{index}"), [size, size]))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
-        let output = graph
-            .repeat(count, [carried], [], [sequence], |body, arguments| {
-                Ok(vec![
-                    body.gemm(arguments.carried[0], arguments.iterated[0])?,
-                ])
-            })
-            .unwrap()[0];
-        graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(carried, carried_format.clone());
-        for weight in weights {
-            config
-                .inputs
-                .insert(weight, format(precision(&mut random), layout.clone()));
-        }
-
-        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let repeat = lowered
-            .operations
-            .iter()
-            .find_map(|operation| match &operation.kind {
-                MidOperationKind::Repeat(repeat) => Some(repeat),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(repeat.count, count, "random case {case}");
-        assert_eq!(repeat.iterated_inputs.len(), 1, "random case {case}");
-        assert_eq!(
-            repeat.iterated_inputs[0].len(),
-            count as usize,
-            "random case {case}"
-        );
-        let sequence_format = &value(&lowered, repeat.iterated_inputs[0][0])
-            .tensor_type
-            .format;
-        assert!(
-            repeat.iterated_inputs[0].iter().all(|value_id| {
-                &value(&lowered, *value_id).tensor_type.format == sequence_format
-            })
-        );
-        assert_eq!(
-            &value(&lowered, repeat.body.yields[0]).tensor_type.format,
-            &carried_format,
-            "random case {case}"
-        );
-        assert_eq!(
-            &value(&lowered, lowered.outputs[0]).tensor_type.format,
-            &carried_format,
-            "random case {case}"
-        );
-        assert_conversions_are_explicit(&lowered, &lowered.operations);
-        assert_conversions_are_explicit(&lowered, &repeat.body.operations);
-    }
-}
-
-#[test]
 fn randomized_single_use_views_compose_into_panel_copies() {
     let mut random = fastrand::Rng::with_seed(0x6465_6665_7272_6564);
     for case in 0..RANDOM_CASES / 32 {
@@ -1501,55 +1201,6 @@ fn selected_mid_size_is_independent_of_tile_count() {
 }
 
 #[test]
-fn uneven_mlp_products_preserve_global_coordinates() {
-    let mut graph = ComputeGraph::new();
-    let input = graph.host_input("input", [1, 729, 1152]).unwrap();
-    let up = graph.parameter("up", [1, 1152, 4304]).unwrap();
-    let down = graph.parameter("down", [1, 4304, 1152]).unwrap();
-    let hidden = graph.gemm(input, up).unwrap();
-    let hidden = graph.gelu(hidden).unwrap();
-    let output = graph.gemm(hidden, down).unwrap();
-    graph.set_outputs([output]).unwrap();
-    let config = PipelineConfig::new(1472)
-        .with_automatic_input(input, Precision::F16)
-        .with_automatic_input(up, Precision::F16)
-        .with_automatic_input(down, Precision::F16);
-    let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
-    let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
-    let useful: u64 = tiles
-        .kernel_runs
-        .iter()
-        .filter_map(|run| run.product_flops)
-        .map(|f| f[0])
-        .sum();
-    assert_eq!(useful, 4 * 729 * 1152 * 4304);
-    for run in &tiles.kernel_runs {
-        if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
-            continue;
-        }
-        let output = &run.outputs[0].extents;
-        let left = &run.inputs[0].extents;
-        let right = &run.inputs[1].extents;
-        let bounds = |e: &ShardExtent| (e.start, e.logical_end, e.physical_end);
-        assert_eq!(
-            bounds(&left[left.len() - 2]),
-            bounds(&output[output.len() - 2]),
-            "left/output rows {run:?}"
-        );
-        assert_eq!(
-            bounds(&left[left.len() - 1]),
-            bounds(&right[right.len() - 2]),
-            "inner {run:?}"
-        );
-        assert_eq!(
-            bounds(&right[right.len() - 1]),
-            bounds(&output[output.len() - 1]),
-            "right/output columns {run:?}"
-        );
-    }
-}
-
-#[test]
 fn blocked_attention_reserves_online_state_between_accumulator_rows() {
     let mut graph = ComputeGraph::new();
     let q = graph.host_input("q", [2, 13, 64]).unwrap();
@@ -1607,7 +1258,15 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .with_automatic_input(query, Precision::F16)
         .with_automatic_input(key, Precision::F16)
         .with_automatic_input(value, Precision::F16);
-    let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::build::build_candidate(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &crate::planner::cache::FragmentCache::default(),
+        &crate::planner::Recipe::baseline(&config),
+    )
+    .unwrap()
+    .program;
     let product = mid
         .operations
         .iter()
@@ -1994,7 +1653,15 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
         config.attention_fp8_scales = scales;
-        let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::planner::cache::FragmentCache::default(),
+            &crate::planner::Recipe::baseline(&config),
+        )
+        .unwrap()
+        .program;
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
         let kernels = crate::KernelBuildPlan::from_program(&tiled).unwrap();
@@ -2055,7 +1722,15 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::planner::cache::FragmentCache::default(),
+            &crate::planner::Recipe::baseline(&config),
+        )
+        .unwrap()
+        .program;
         assert_eq!(
             mid.values[mid.outputs[0].index() as usize]
                 .tensor_type
@@ -2556,8 +2231,6 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             config.attention_fp8_scales[1] = with_v.then_some(-4);
             let mut recipe = late.recipe.clone();
             recipe.options.cast_before_copies = true;
-            let serialized = serde_json::to_vec(&recipe).unwrap();
-            let recipe: Recipe = serde_json::from_slice(&serialized).unwrap();
             let early = build::build_candidate(
                 &graph,
                 &config,

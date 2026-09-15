@@ -919,9 +919,7 @@ mod tests {
             incumbent.order = (0..count).collect();
             for (index, timing) in incumbent.timings.iter_mut().enumerate() {
                 *timing = Some(MaterializedTiming {
-                    start: index as u32,
                     end: index as u32 + 1,
-                    blocking_tile: 0,
                     predecessor: index.checked_sub(1),
                 });
             }

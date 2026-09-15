@@ -13,6 +13,7 @@ pub(crate) use support::{PackageSupport, size_support};
 mod tile_program;
 pub use tile_program::build_tile_program_package;
 
+use crate::exchange::ExchangeError;
 use crate::graph::{OperationId, ValueId};
 use crate::host;
 use crate::low::LowProgram;
@@ -28,7 +29,6 @@ use crate::{
 };
 use crate::{PipelineConfig, Precision, TileGraph};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
-use ipu_exchange::ExchangeError;
 use ipu_package::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_package::{
     Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
@@ -40,7 +40,6 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
-use std::time::Instant;
 
 const ENTRY_BYTES: u32 = 8;
 const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
@@ -315,29 +314,30 @@ pub(crate) fn emit_package(
             )));
         }
     }
-    let prepared = build_phase("prepare_tile_code", || {
-        physical_to_logical
-            .par_iter()
-            .enumerate()
-            .map(|(physical_tile, &logical)| {
-                let mut tile_program = finalizer.lower_tile(logical)?;
-                let profile = profile_addresses
-                    .as_ref()
-                    .map(|addresses| {
-                        instrument_profile(
-                            program,
-                            exchanges,
-                            logical,
-                            u32::try_from(physical_tile)?,
-                            &mut tile_program,
-                            addresses[usize::from(logical)],
-                        )
-                    })
-                    .transpose()?;
-                Ok((tile_program, profile))
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()
-    })?;
+    let prepared =
+        tracing::info_span!("prepare_tile_code").in_scope(|| -> PackageBuildResult<_> {
+            physical_to_logical
+                .par_iter()
+                .enumerate()
+                .map(|(physical_tile, &logical)| {
+                    let mut tile_program = finalizer.lower_tile(logical)?;
+                    let profile = profile_addresses
+                        .as_ref()
+                        .map(|addresses| {
+                            instrument_profile(
+                                program,
+                                exchanges,
+                                logical,
+                                u32::try_from(physical_tile)?,
+                                &mut tile_program,
+                                addresses[usize::from(logical)],
+                            )
+                        })
+                        .transpose()?;
+                    Ok((tile_program, profile))
+                })
+                .collect::<PackageBuildResult<Vec<_>>>()
+        })?;
     let generate = || {
         prepared
             .iter()
@@ -357,7 +357,7 @@ pub(crate) fn emit_package(
             })
             .collect::<PackageBuildResult<Vec<_>>>()
     };
-    let generated = build_phase("emit_tile_code", generate)?;
+    let generated = tracing::info_span!("emit_tile_code").in_scope(generate)?;
     let actual_code_bytes = generated.iter().try_fold(0u32, |maximum, program| {
         Ok::<_, PackageBuildError>(maximum.max(u32::try_from(program.bytes.len())?))
     })?;
@@ -379,19 +379,20 @@ pub(crate) fn emit_package(
         code_address,
         host_staging_address: host.staging_address,
     };
-    let tiles = build_phase("build_tile_images", || {
-        (0..execution_tile_count)
-            .map(|physical_tile| {
-                build_tile(
-                    u32::from(physical_tile),
-                    u32::from(physical_to_logical[usize::from(physical_tile)]),
-                    &generated[usize::from(physical_tile)],
-                    &host.segments[usize::from(physical_tile)],
-                    &tile_build,
-                )
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()
-    })?;
+    let tiles =
+        tracing::info_span!("build_tile_images").in_scope(|| -> PackageBuildResult<_> {
+            (0..execution_tile_count)
+                .map(|physical_tile| {
+                    build_tile(
+                        u32::from(physical_tile),
+                        u32::from(physical_to_logical[usize::from(physical_tile)]),
+                        &generated[usize::from(physical_tile)],
+                        &host.segments[usize::from(physical_tile)],
+                        &tile_build,
+                    )
+                })
+                .collect::<PackageBuildResult<Vec<_>>>()
+        })?;
     let mut application = assemble_application(tiles, outputs, layout, host)?;
     for (physical, program) in generated.iter().enumerate() {
         add_generated_debug_map(
@@ -579,23 +580,6 @@ fn add_generated_debug_map(
         }
     }
     Ok(())
-}
-
-pub(crate) fn build_phase<T>(
-    phase: &'static str,
-    build: impl FnOnce() -> PackageBuildResult<T>,
-) -> PackageBuildResult<T> {
-    let span = tracing::info_span!("ipu_codegen.package.phase", phase);
-    let _entered = span.enter();
-    let started = Instant::now();
-    let result = build();
-    tracing::info!(
-        phase,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        success = result.is_ok(),
-        "package build phase finished"
-    );
-    result
 }
 
 pub(crate) fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
@@ -865,7 +849,6 @@ mod tests {
     use super::*;
     use crate::ComputeGraph;
     use crate::estimate::Ipu21CostModel;
-    use crate::planner::build_baseline;
 
     #[test]
     fn package_assembly_maps_host_code_by_physical_tile() {
@@ -1037,7 +1020,15 @@ mod tests {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::planner::cache::FragmentCache::default(),
+            &crate::planner::Recipe::baseline(&config),
+        )
+        .unwrap()
+        .program;
         let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
         assert!(
             low.logical_values

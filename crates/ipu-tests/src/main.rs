@@ -80,7 +80,7 @@ struct Arguments {
     /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
     no_profile: bool,
-    /// Log exchange scheduling lower bounds and critical dependency chains.
+    /// Decode the exchange-stress fixture's supervisor rows.
     #[arg(long)]
     exchange_diagnostics: bool,
     /// Decode every active supervisor row for this exchange-stress case.
@@ -123,15 +123,6 @@ struct Arguments {
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
-    /// Time baseline or saved-recipe selection, costing and low expansion; no placement or hardware.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule", "capture_exchange_schedule"])]
-    benchmark_expansion: Option<PathBuf>,
-    /// Disable low-fragment caching for an expansion benchmark comparison.
-    #[arg(long, requires = "benchmark_expansion")]
-    benchmark_expansion_uncached: bool,
-    /// Capture the expanded canonical baseline before scheduling, linking, or hardware execution.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
-    capture_exchange_schedule: Option<PathBuf>,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -156,12 +147,6 @@ struct Arguments {
     /// Maximum ordered local improvement steps; later candidates may be built speculatively.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
-    /// Resume saved mid-plan search; optimization steps are additional on resume.
-    #[arg(long, conflicts_with = "reuse_package")]
-    load_search_state: Option<PathBuf>,
-    /// Save completed search progress atomically, including after each improvement.
-    #[arg(long, conflicts_with = "reuse_package")]
-    save_search_state: Option<PathBuf>,
     /// Use the experimental capacity-first baseline before local optimization.
     #[arg(long)]
     capacity_baseline: bool,
@@ -515,10 +500,8 @@ fn main() -> Result<()> {
     {
         bail!("--profile-output and --no-profile require a benchmark workload");
     }
-    if arguments.exchange_diagnostic_case.is_some()
-        && !matches!(arguments.workload, Workload::ExchangeStress)
-    {
-        bail!("--exchange-diagnostic-case requires --workload exchange-stress");
+    if arguments.exchange_diagnostics && !matches!(arguments.workload, Workload::ExchangeStress) {
+        bail!("--exchange-diagnostics requires --workload exchange-stress");
     }
     if !matches!(arguments.workload, Workload::SiglipMlpBenchmark)
         && (arguments.mlp_batch != SIGLIP_MLP_BATCH
@@ -737,8 +720,6 @@ fn main() -> Result<()> {
         pipeline = pipeline.with_operator_candidate_limit(width);
     }
     pipeline.optimization_steps = arguments.optimization_steps;
-    pipeline.load_search_state = arguments.load_search_state.clone();
-    pipeline.save_search_state = arguments.save_search_state.clone();
     pipeline.capacity_baseline = arguments.capacity_baseline;
     pipeline.exchange_stream_words = arguments.exchange_stream_words;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
@@ -769,7 +750,6 @@ fn main() -> Result<()> {
     if let Some(limit) = arguments.exchange_transfer_limit_per_tile {
         pipeline.exchange_transfer_limit_per_tile = limit;
     }
-    pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {
         pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
     } else if arguments.materialize_conversions {
@@ -1109,25 +1089,6 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
-    if let Some(path) = &arguments.benchmark_expansion {
-        let report = ipu_codegen::benchmark_mid_expansion(
-            &graph,
-            &package_config.pipeline,
-            !arguments.benchmark_expansion_uncached,
-        )?;
-        serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
-        return Ok(());
-    }
-    if let Some(path) = &arguments.capture_exchange_schedule {
-        let snapshot = ipu_codegen::capture_exchange_baseline(&graph, &package_config)?;
-        serde_json::to_writer(std::io::BufWriter::new(fs::File::create(path)?), &snapshot)?;
-        println!(
-            "Captured {} exchange phases to {}",
-            snapshot.phases.len(),
-            path.display()
-        );
-        return Ok(());
-    }
     if let Some(directory) = &arguments.reference_fixture {
         reference_fixture::validate(directory, &graph, arguments.reference_inferences)?;
     }
@@ -2414,7 +2375,7 @@ fn write_package(application: &Application, path: &Path) -> Result<()> {
 }
 
 fn inspect_exchange_rows(application: &Application, selected_tile: Option<u32>) -> Result<String> {
-    use ipu_exchange::diagnostic::{PlanOperation, SendEncoding};
+    use ipu_codegen::exchange::diagnostic::{PlanOperation, SendEncoding};
 
     let mut summaries = Vec::new();
     let mut selected = String::new();
@@ -2444,7 +2405,7 @@ fn inspect_exchange_rows(application: &Application, selected_tile: Option<u32>) 
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte exchange word")))
             .collect::<Vec<_>>();
         let diagnostic =
-            ipu_exchange::diagnostic::diagnose_plan_program(&words, Some(region.address))?;
+            ipu_codegen::exchange::diagnostic::diagnose_plan_program(&words, Some(region.address))?;
         let mut counts = [0usize; 6];
         for instruction in &diagnostic.instructions {
             match &instruction.operation {
@@ -2530,10 +2491,10 @@ fn exchange_row_failure_diagnostic(
         .map(|(offset, (&expected, &actual))| (offset, expected, actual))
         .collect::<Vec<_>>();
     let expected_decode =
-        ipu_exchange::diagnostic::diagnose_plan_program(&expected, Some(region.address))
+        ipu_codegen::exchange::diagnostic::diagnose_plan_program(&expected, Some(region.address))
             .map(|row| row.render_around_address(program_counter, 12));
     let actual_decode = (actual != expected).then(|| {
-        ipu_exchange::diagnostic::diagnose_plan_program(&actual, Some(region.address))
+        ipu_codegen::exchange::diagnostic::diagnose_plan_program(&actual, Some(region.address))
             .map(|row| row.render_around_address(program_counter, 12))
     });
     Some(format!(

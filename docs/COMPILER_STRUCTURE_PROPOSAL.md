@@ -348,10 +348,9 @@ The outer routine should read in this order:
 
 ```text
 compile runtime; create shared fragment/geometry caches
-load recipe, input bindings, visited choices and attempt count
-build baseline/resumed candidate as executable mid
+build baseline candidate as executable mid; initialize visited choices and attempt count
 evaluate_candidate(baseline); fail the build if no feasible incumbent exists
-fix logical input homes and save the accepted checkpoint
+fix logical input homes
 
 while attempt budget remains:
     propose recipes, including whole-program optimization settings
@@ -361,7 +360,7 @@ while attempt budget remains:
     evaluate candidates concurrently, each with its own schedule-cache snapshot
     choose the first feasible improvement in shortlist order
     record completed prefix; replace the whole incumbent or retain it
-    save checkpoint; stop when the existing stopping rule applies
+    stop when the existing stopping rule applies
 
 return the accepted package and its diagnostics
 ```
@@ -711,7 +710,7 @@ would just relocate it.
 
 `Topology` currently mixes a logical-to-physical mapping with methods that build
 encoded multicast plans. Split those responsibilities: the target supplies
-mapping/fabric facts; `ipu-exchange` consumes them to construct timed programs.
+mapping/fabric facts; `ipu-codegen::exchange` consumes them to construct timed programs.
 Do not move the entire scheduler into the target crate.
 
 Package validation may consume target facts, but the package format should not

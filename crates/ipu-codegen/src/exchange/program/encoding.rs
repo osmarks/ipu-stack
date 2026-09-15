@@ -1,7 +1,7 @@
 //! Reuse an encoded prefix only while its sender, control, and lookahead inputs
 //! remain unchanged. Speculative transfers still run the ordinary row encoder.
-use crate::chunked::Chunked;
-use crate::{
+use crate::exchange::program::chunked::Chunked;
+use crate::exchange::program::{
     EncodedRow, ExchangeError, OutgoingBaseWrite, ReceiveEvent, ScheduledSenderRow, SendAddress,
     append_receive_events_record, append_sender_message, plan_event_cycles,
     validate_receive_events,
@@ -262,7 +262,7 @@ pub(super) fn build_scheduled_program(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
+    use crate::exchange::program::*;
 
     #[test]
     fn outgoing_base_uses_control_gaps_and_preserves_incremental_encoding() {

@@ -9,7 +9,7 @@ Older experiment reports explain history, not the current pipeline.
 
 The public entry point is `build_package` in
 [lib.rs](../crates/ipu-codegen/src/lib.rs). Its `compile_graph` routine
-compiles the runtime, loads search state and builds an executable baseline. It
+compiles the runtime and builds an executable baseline. It
 calls `evaluate_candidate` directly for the incumbent and shortlisted alternatives.
 Even with zero optimization steps, the baseline must produce a complete package.
 
@@ -62,7 +62,7 @@ inventory and emission observe the same live work.
 [ipu-target](../crates/ipu-target/src/lib.rs) is a dependency leaf. Its IPU21
 modules own SRAM geometry, register IDs, supervisor instruction encoding and
 physical routing/pairing. Its C600 module supplies the compute-tile inventory.
-`Topology` describes physical tile identities; [exchange construction](../crates/ipu-exchange/src/lib.rs)
+`Topology` describes physical tile identities; [exchange construction](../crates/ipu-codegen/src/exchange/program.rs)
 takes that topology to construct multicast and point-to-point programs. Timing
 selection, row encoding and measured scheduling margins remain in exchange.
 
@@ -158,7 +158,7 @@ result subset therefore cannot accidentally restrict a larger workspace. The
 planner currently supplies the ordinary device embedding; this argument is a
 binding contract, not an additional mapping search.
 
-[screen::expand_and_screen](../crates/ipu-codegen/src/screen.rs)
+[evaluate_candidate](../crates/ipu-codegen/src/lib.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
 `evaluate_candidate` keeps provisional addresses local while
 [package/support.rs](../crates/ipu-codegen/src/package/support.rs) measures and
@@ -172,11 +172,10 @@ The provisional/final passes remain necessary: support changes available address
 and addresses can change hazards and row sharing. Each speculative candidate owns
 its schedule-cache snapshot; only the winner's final cache is promoted. The former
 `ScheduledPlan`, separate `BuiltApplication`, `validate` wrapper and finalization
-callback are removed. Checkpoints store recipes/progress in
-[planner/checkpoint.rs](../crates/ipu-codegen/src/planner/checkpoint.rs). The graph builder, family choices/catalogues, fragment cache and direct construction
-now live under [planner](../crates/ipu-codegen/src/planner/mod.rs). Checkpoints
-require the current schema and matching graph/configuration; obsolete states
-are rejected and the search must be rerun. There is no migration path.
+callback are removed. Attempt counts and visited recipes are local to the driver;
+search always starts from the baseline. The graph builder, family choices/catalogues,
+fragment cache and direct construction live under
+[planner](../crates/ipu-codegen/src/planner/mod.rs).
 [config.rs](../crates/ipu-codegen/src/config.rs) owns pipeline
 configuration. Mid contains executable semantics, binding and rewrites. Mapping proposals use the global recipe permutation.
 
@@ -385,7 +384,7 @@ untouched source/destination bytes.
 - `LogicalExchange` stores one source with multiple recipient views. Physical
   addresses, message lengths, pairing and hazard ordering are resolved in
   [codegen/exchange.rs](../crates/ipu-codegen/src/exchange.rs). The encoding and
-  timed-program builder live in [ipu-exchange](../crates/ipu-exchange/src/lib.rs).
+  timed-program builder live in [exchange encoding](../crates/ipu-codegen/src/exchange/program.rs).
 - [place.rs](../crates/ipu-codegen/src/place.rs) derives lifetimes, aliases,
   access tails, element-separation constraints and addresses. Parameters remain
   resident across host invocations. `storage_group` in mid concerns ownership
@@ -471,15 +470,15 @@ coverage for copies still needs to distinguish physical padding bytes.
 
 ## Trace 5: exchange encoding retains relocation sites
 
-[Exchange construction](../crates/ipu-exchange/src/lib.rs) prepares each transfer
+[Exchange construction](../crates/ipu-codegen/src/exchange/program.rs) prepares each transfer
 with its caller-assigned message identity. The phase encoder returns an
-[`EncodedRow`](../crates/ipu-exchange/src/row.rs): instruction words, send address
+[`EncodedRow`](../crates/ipu-codegen/src/exchange/program/row.rs): instruction words, send address
 sites with message-relative offsets and item widths, receive-pointer sites, and
 outgoing-base writes. Sites are recorded when the encoder emits an instruction,
 including both fields of an inline SENDPICP. Incoming bases are invocation
 arguments; timed rows currently contain only outgoing-base writes.
 
-[Incremental encoding](../crates/ipu-exchange/src/encoding.rs) retains the words
+[Incremental encoding](../crates/ipu-codegen/src/exchange/program/encoding.rs) retains the words
 and sites together in shared chunks. Reusing a checkpoint truncates every site
 list at the same instruction boundary. A staged trial's identity is part of its
 input, so identical words cannot retain another transfer's relocation identity.
@@ -494,7 +493,7 @@ same fields and unions the nonzero address sites across invocations. Each
 invocation restores that union, including zero addresses left by earlier rows.
 Metadata is discarded at final instruction/data emission.
 
-[Diagnostics](../crates/ipu-exchange/src/diagnostic.rs) independently decodes
+[Diagnostics](../crates/ipu-codegen/src/exchange/program/diagnostic.rs) independently decodes
 SDK/imported rows and validates generated instruction timing. Encoding tests
 compare every retained site against that decoder, including zero fields,
 paired restarts, inline receive controls, reordered messages and reused prefixes.
@@ -533,14 +532,11 @@ Exchange selection receives `stream_words` explicitly from the pipeline policy,
 separately from the cache. The cache records which policy produced each entry;
 a policy change cannot reuse an earlier selection. The public
 `select_exchange_schedule` entry point applies this same production selection to
-captured transfers. Current defaults, search coverage and checkpoint configuration
-remain unchanged.
+captured transfers.
 
 Destination facts retain no cost-dependent staging decisions. Changing packing
 policy reuses the facts. Exchange fragment size remains an explicit analysis input.
 
 [Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) cover earlier
-implementations. `--benchmark-expansion` records expansion, recosting and footprint
-analysis timings, cache counters and process RSS. `--benchmark-expansion-uncached`
-disables the shared geometry cache throughout. Cache allocation estimates and the
-automatic warm rerun have been removed; use a memory profiler for retained memory.
+implementations. Use tracing spans for compiler timing and a memory profiler for
+retained memory; the expansion benchmark and its cache counters have been removed.

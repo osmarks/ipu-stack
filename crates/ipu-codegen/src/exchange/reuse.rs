@@ -47,7 +47,7 @@ pub(super) fn normalized_rows(
         .into_iter()
         .map(|program| {
             program
-                .unwrap_or_else(ipu_exchange::EncodedRow::inactive)
+                .unwrap_or_else(crate::exchange::EncodedRow::inactive)
                 .normalized_words()
         })
         .collect())
@@ -120,7 +120,6 @@ impl ScheduleRecipe {
         };
         Ok(Some(ScheduledPending {
             pending,
-            receive_counts,
             incoming_bases,
             optimized,
         }))

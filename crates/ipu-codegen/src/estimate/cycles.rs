@@ -61,7 +61,7 @@ impl ExchangeFootprint {
         self.phases
             .saturating_add(
                 self.maximum_transfer_chunks_per_tile
-                    .saturating_mul(ipu_exchange::PLAN_WORDS as u64),
+                    .saturating_mul(crate::exchange::PLAN_WORDS as u64),
             )
             .saturating_mul(4)
     }

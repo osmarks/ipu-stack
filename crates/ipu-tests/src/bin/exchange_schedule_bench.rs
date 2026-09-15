@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use ipu_codegen::exchange::diagnostic::diagnose_plan_program;
 use ipu_codegen::{
     ExchangeScheduleCache, ExchangeScheduleSnapshot, ExchangeSchedulingPriority,
     schedule_exchange_problem_with_priority, validate_exchange_schedule,
 };
-use ipu_exchange::diagnostic::diagnose_plan_program;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::hint::black_box;
@@ -347,8 +347,6 @@ fn main() -> Result<()> {
                 schema_version: snapshot.schema_version,
                 tile_count: snapshot.tile_count,
                 phases: selected_problems,
-                phase_labels: snapshot.phase_labels.clone(),
-                phase_traffic: snapshot.phase_traffic.clone(),
             },
         )?;
     }

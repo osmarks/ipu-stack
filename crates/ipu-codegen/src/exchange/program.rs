@@ -1,24 +1,21 @@
-pub use ipu_target::c600::logical_to_physical as c600_logical_to_physical;
-pub use ipu_target::ipu21::fabric::Topology;
+//! Transfer instruction rows and their incremental assembly into tile programs.
+//! The exchange scheduler selects transfer order; this module encodes that order
+//! and validates the resulting sender/control/receiver instruction timelines.
+use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::fabric::{direction, paired_time_to_mux, time_to_mux};
-pub use ipu_target::ipu21::instruction::encode_delay_immediate as encode_exchange_delay;
 use ipu_target::ipu21::instruction::{DELAY_OPCODE, encode_delay_immediate as delay};
+use ipu_target::ipu21::instruction::{
+    PUT_SPECIAL_M_OPCODE, SYNC_OPCODE, put_special_from_m8, setzi_m,
+};
+use ipu_target::ipu21::instruction::{
+    RETURN_M10_INSTRUCTION, SYNC_ALL_INSTRUCTION, SYNC_HOST_INSTRUCTION, SYNC_RECEIVE_INSTRUCTION,
+    SYNC_SUPERVISOR_INSTRUCTION, encode_put_special_m,
+};
 use ipu_target::ipu21::registers::{
     INCOMING_BASE, INCOMING_DCOUNT as INCOMING_DCOUNT_REGISTER,
     INCOMING_MUX as INCOMING_MUX_REGISTER, OUTGOING_BASE,
 };
-pub use ipu_target::ipu21::registers::{TILE_MUX_EXCHANGE, TILE_MUX_HOST};
-// Compatibility exports. Instruction definitions belong to the target.
-use ipu_target::ipu21::instruction::{
-    PUT_SPECIAL_M_OPCODE, SYNC_OPCODE, put_special_from_m8, setzi_m,
-};
-pub use ipu_target::ipu21::instruction::{
-    RETURN_M10_INSTRUCTION, SANS_INACTIVE_INSTRUCTION, SYNC_ALL_INSTRUCTION, SYNC_ANS_INSTRUCTION,
-    SYNC_HOST_INSTRUCTION, SYNC_RECEIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, br_m,
-    encode_add_m_immediate, encode_and_m_immediate, encode_br_m, encode_brz_m_immediate,
-    encode_call_m_immediate, encode_delay_m, encode_ld32_m_immediate, encode_put_special_m,
-    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate, sans, sync,
-};
+use ipu_target::ipu21::registers::{TILE_MUX_EXCHANGE, TILE_MUX_HOST};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,7 +137,7 @@ struct ScheduledSenderRow {
 /// Borrowing the rows prevents address patches from invalidating the timing.
 pub struct PreparedTransfer<'a> {
     message: u32,
-    rows: &'a MulticastPlan,
+    rows: &'a TransferPlan,
     sender: ScheduledPayloadTiming,
     receivers: Vec<ReceiveRowTiming>,
 }
@@ -157,7 +154,7 @@ impl PreparedTransfer<'_> {
     }
 }
 
-impl MulticastPlan {
+impl TransferPlan {
     /// Retain the caller's transfer identity through speculative insertion,
     /// chronological reordering and final source-address relocation.
     pub fn prepare(&self, message: u32) -> Result<PreparedTransfer<'_>, ExchangeError> {
@@ -186,7 +183,7 @@ struct StagedTransfer {
     message: u32,
     source: u16,
     receivers: Vec<u16>,
-    plan: MulticastPlan,
+    plan: TransferPlan,
     offset: u32,
     words: u32,
     updates: Vec<(u16, TileProgramSchedule)>,
@@ -198,7 +195,7 @@ impl StagedTransfer {
         message: u32,
         source: u16,
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &TransferPlan,
         offset: u32,
         words: u32,
     ) -> bool {
@@ -2236,13 +2233,7 @@ enum HostPacketSize {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Plan {
-    pub sender: PlanRow,
-    pub receiver: PlanRow,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MulticastPlan {
+pub struct TransferPlan {
     pub sender: PlanRow,
     pub receivers: Vec<PlanRow>,
 }
@@ -2613,7 +2604,7 @@ pub fn paired_multicast(
     sender_logical: u16,
     receivers: &[u16],
     count: u32,
-) -> Result<MulticastPlan, ExchangeError> {
+) -> Result<TransferPlan, ExchangeError> {
     validate_count(count)?;
     if receivers.is_empty() || receivers.len() & 1 != 0 {
         return Err(ExchangeError::ReceiverSet);
@@ -2751,7 +2742,7 @@ pub fn point_to_point(
     sender_logical: u16,
     receiver_logical: u16,
     count: u32,
-) -> Result<Plan, ExchangeError> {
+) -> Result<TransferPlan, ExchangeError> {
     validate_count(count)?;
     if sender_logical == receiver_logical {
         return Err(ExchangeError::DuplicateTile);
@@ -2768,17 +2759,16 @@ pub fn point_to_point(
 
     let sender_row = primitive_sender_row(count, direction, sender_delay)?;
     let mut receiver_row = [0; PLAN_WORDS];
-    receiver_row[0] = 1;
-    receiver_row[1] = SYNC_SUPERVISOR_INSTRUCTION;
-    receiver_row[2] = delay_xpic(112, 0, 0);
-    receiver_row[3..7].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0));
+    receiver_row[0] = SYNC_SUPERVISOR_INSTRUCTION;
+    receiver_row[1] = delay_xpic(112, 0, sender);
+    receiver_row[2..6].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0));
     debug!(
         sender_logical,
         receiver_logical, count, "assembled point-to-point exchange"
     );
-    Ok(Plan {
+    Ok(TransferPlan {
         sender: sender_row,
-        receiver: receiver_row,
+        receivers: vec![receiver_row],
     })
 }
 
@@ -2788,7 +2778,7 @@ pub fn multicast(
     receiver_logical: &[u16],
     count: u32,
     schedule_offset: u32,
-) -> Result<MulticastPlan, ExchangeError> {
+) -> Result<TransferPlan, ExchangeError> {
     validate_count(count)?;
     let source_physical = u32::from(topology.physical(sender_logical)?);
     let mut used = HashSet::new();
@@ -2849,7 +2839,7 @@ pub fn multicast(
         schedule_offset,
         "assembled multicast exchange"
     );
-    Ok(MulticastPlan { sender, receivers })
+    Ok(TransferPlan { sender, receivers })
 }
 
 fn primitive_sender_row(
@@ -3011,20 +3001,6 @@ pub fn offset_plan(row: &mut PlanRow, cycles: u32) -> Result<(), ExchangeError> 
         remaining -= chunk;
     }
     Ok(())
-}
-
-pub fn finalize_point_receiver(
-    row: &PlanRow,
-    source_physical: u16,
-) -> Result<PlanRow, ExchangeError> {
-    let patch_index = row[0] as usize;
-    if patch_index >= PLAN_WORDS - 1 || u32::from(source_physical) > 0x1fff {
-        return Err(ExchangeError::Schedule("point receiver patch index"));
-    }
-    let mut executable = [0; PLAN_WORDS];
-    executable[..PLAN_WORDS - 1].copy_from_slice(&row[1..]);
-    executable[patch_index] = (executable[patch_index] & !0x1fff) | u32::from(source_physical);
-    Ok(executable)
 }
 
 fn validate_count(count: u32) -> Result<(), ExchangeError> {
@@ -3452,10 +3428,15 @@ mod tests {
             ),
         ];
         for (sender, receiver, count, expected_sender, expected_receiver) in cases {
+            // SDK fixtures include a patch-index prefix and leave the source
+            // mux unbound. Compare their executable form with the direct row.
+            let mut expected_receiver = expected_receiver[1..].to_vec();
+            expected_receiver[1] |= u32::from(topology.physical(sender).unwrap());
+            expected_receiver.push(0);
             let plan = point_to_point(&topology, sender, receiver, count).unwrap();
             assert_eq!(&plan.sender[..expected_sender.len()], &expected_sender);
             assert_eq!(
-                &plan.receiver[..expected_receiver.len()],
+                &plan.receivers[0][..expected_receiver.len()],
                 &expected_receiver
             );
             assert!(
@@ -3464,7 +3445,7 @@ mod tests {
                     .all(|word| *word == 0)
             );
             assert!(
-                plan.receiver[expected_receiver.len()..]
+                plan.receivers[0][expected_receiver.len()..]
                     .iter()
                     .all(|word| *word == 0)
             );
@@ -3978,7 +3959,7 @@ mod tests {
         let topology = Topology::c600();
         let short = multicast(&topology, 0, &[736, 1286], 1, 0).unwrap();
         let long = multicast(&topology, 0, &[736, 1286], 1024, 0).unwrap();
-        let horizon = |plan: &MulticastPlan| {
+        let horizon = |plan: &TransferPlan| {
             std::iter::once(&plan.sender)
                 .chain(plan.receivers.iter())
                 .map(|row| plan_event_cycles(row).unwrap())
@@ -4494,10 +4475,10 @@ mod tests {
     }
 
     #[test]
-    fn finalizes_point_receiver_for_direct_execution() {
+    fn point_receiver_is_ready_for_direct_execution() {
         let topology = Topology::c600();
         let plan = point_to_point(&topology, 274, 1286, 64).unwrap();
-        let row = finalize_point_receiver(&plan.receiver, topology.physical(274).unwrap()).unwrap();
+        let row = plan.receivers[0];
         assert_eq!(row[0], SYNC_SUPERVISOR_INSTRUCTION);
         assert_eq!(row[1] & 0x1fff, 9);
         assert_eq!(row[5], RETURN_M10_INSTRUCTION);

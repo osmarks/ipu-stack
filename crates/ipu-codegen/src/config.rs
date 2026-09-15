@@ -40,10 +40,6 @@ pub struct PipelineConfig {
     /// Parallel speculation can validate later proposals that an earlier
     /// improvement invalidates; these do not advance the search.
     pub optimization_steps: usize,
-    /// Resume a compatible mid-plan search checkpoint; steps are additional.
-    pub load_search_state: Option<std::path::PathBuf>,
-    /// Atomically save completed search progress after each selection.
-    pub save_search_state: Option<std::path::PathBuf>,
     /// Prefer distributed boundaries and conversion-inclusive memory costs.
     /// Experimental: smaller tensor peaks can still require larger exchange rows.
     pub capacity_baseline: bool,
@@ -94,9 +90,6 @@ pub struct PipelineConfig {
     pub profiling: bool,
     /// Insert all-tile patched-breakpoint stops after semantic operators.
     pub diagnostic_checkpoints: bool,
-    /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
-    /// critical dependency chains while constructing the final package.
-    pub exchange_diagnostics: bool,
     /// Controls whether one-use layout conversions may be populated as
     /// bounded slices immediately before their consuming dispatch.
     pub conversion_streaming: ConversionStreamingPolicy,
@@ -151,8 +144,6 @@ impl PipelineConfig {
             gemm_precisions: BTreeMap::new(),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
-            load_search_state: None,
-            save_search_state: None,
             capacity_baseline: false,
             exchange_stream_words: None,
             operator_candidate_limit: 64,
@@ -168,7 +159,6 @@ impl PipelineConfig {
             tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
             profiling: false,
             diagnostic_checkpoints: false,
-            exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
             attention_strategy: AttentionStrategy::Automatic,
             attention_products: AttentionProducts::Automatic,

@@ -15,8 +15,7 @@ or a timing benchmark; see the [validation report](docs/SIGLIP_PRETRAINED_VALIDA
 ## Components
 
 - `ipu-codegen`: tensor graph lowering, layout planning, allocation, device
-  kernels, and package construction.
-- `ipu-exchange`: device and host exchange scheduling and encoding.
+  kernels, device/host exchange scheduling and encoding, and package construction.
 - `ipu-elf`: Graphcore tile compilation and ELF linking.
 - `ipu-package`: `.ipuexe` packages and cycle-profile serialization.
 - `ipu-profile`: cycle-profile queries and interactive HTML rendering.
@@ -45,10 +44,6 @@ no tuning option or packing kernel. See the [relay measurements](docs/EXCHANGE_G
 The planner first builds a baseline with canonical layout boundaries and compact
 parameter storage, then evaluates local improvements. Accepted changes retain a
 complete feasible package. `--optimization-steps 0` selects the baseline alone.
-`--save-search-state search.json` checkpoints the mid-plan search after each
-completed selection. Resume with `--load-search-state search.json` and an
-additional `--optimization-steps` budget; supplying both paths updates the
-checkpoint as the search proceeds. The saved incumbent is revalidated on load.
 The experimental `--capacity-baseline` uses more distributed activation boundaries
 and includes conversions in memory ranking. It has enabled batch-2 PE capacity
 runs, but is not a general solution to larger-batch SigLIP planning.

@@ -4,7 +4,7 @@ use super::bindings::PackageBindings;
 use super::profile::{self, instrument_profile, profile_step_count};
 use super::{
     PackageBuildError, PackageBuildResult, RUNTIME_EXECUTABLE_START, active_topology,
-    allocate_package_code, build_phase, check_exchange_budget, invalid, link_runtime, linked_end,
+    allocate_package_code, check_exchange_budget, invalid, link_runtime, linked_end,
     protect_executable_elements, reserve_exchange_setup, reserve_fixed_runtime_memory,
     reserve_linked_image, runtime_retained_symbols, runtime_symbols,
 };
@@ -61,7 +61,7 @@ pub(crate) fn size_support(
 ) -> PackageBuildResult<PackageSupport> {
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
-    let layout = build_phase("link_runtime", || {
+    let layout = tracing::info_span!("link_runtime").in_scope(|| -> PackageBuildResult<_> {
         link_runtime(
             &objects,
             runtime_symbols(0, 0, 0)?,
@@ -214,44 +214,47 @@ pub(crate) fn size_support(
         4,
         "generated tile programs",
     )?;
-    let generated_code_bytes = build_phase("size_tile_code", || {
-        physical_to_logical
-            .par_iter()
-            .enumerate()
-            .map(|(physical, &logical)| {
-                let host = &provisional_host.programs[physical];
-                let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-                if let Some(addresses) = &provisional_profile_addresses {
-                    instrument_profile(
-                        program,
-                        provisional_exchanges,
-                        logical,
-                        u32::try_from(physical)?,
-                        &mut tile_program,
-                        addresses[usize::from(logical)],
+    let generated_code_bytes =
+        tracing::info_span!("size_tile_code").in_scope(|| -> PackageBuildResult<_> {
+            physical_to_logical
+                .par_iter()
+                .enumerate()
+                .map(|(physical, &logical)| {
+                    let host = &provisional_host.programs[physical];
+                    let mut tile_program = provisional_finalizer.lower_tile(logical)?;
+                    if let Some(addresses) = &provisional_profile_addresses {
+                        instrument_profile(
+                            program,
+                            provisional_exchanges,
+                            logical,
+                            u32::try_from(physical)?,
+                            &mut tile_program,
+                            addresses[usize::from(logical)],
+                        )?;
+                    }
+                    // Row sharing can change after final placement. Reserve its
+                    // optional setup call through the same emitter used below.
+                    reserve_exchange_setup(&mut tile_program.steps);
+                    let generated = emit(
+                        &tile_program,
+                        &layout.symbols,
+                        host,
+                        &CodegenOptions {
+                            invocations,
+                            code_address: sizing_code_address,
+                            initial_profile_address: config
+                                .profiling
+                                .then_some(PROFILE_START_CYCLE),
+                            final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
+                        },
                     )?;
-                }
-                // Row sharing can change after final placement. Reserve its
-                // optional setup call through the same emitter used below.
-                reserve_exchange_setup(&mut tile_program.steps);
-                let generated = emit(
-                    &tile_program,
-                    &layout.symbols,
-                    host,
-                    &CodegenOptions {
-                        invocations,
-                        code_address: sizing_code_address,
-                        initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
-                        final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
-                    },
-                )?;
-                Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .ok_or_else(|| invalid("execution topology has no tiles"))
-    })?;
+                    Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
+                })
+                .collect::<PackageBuildResult<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .ok_or_else(|| invalid("execution topology has no tiles"))
+        })?;
     tracing::info!(linked_end, host_code_base, host_code_bytes, generated_code_bytes,
         exchange_table_bytes,
         executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT),

@@ -140,14 +140,7 @@ pub(crate) fn program_cycles(
     program: &TileGraph,
     exchange: Option<&[u64]>,
 ) -> ExpansionResult<ProgramCycles> {
-    program_cycles_analyzed(program, exchange, &GeometryCache::default())
-}
-
-pub(crate) fn program_cycles_analyzed(
-    program: &TileGraph,
-    exchange: Option<&[u64]>,
-    geometry: &GeometryCache,
-) -> ExpansionResult<ProgramCycles> {
+    let geometry = GeometryCache::default();
     let estimated;
     let phases = if let Some(costs) = exchange {
         costs
@@ -156,7 +149,7 @@ pub(crate) fn program_cycles_analyzed(
             .exchange_phases
             .iter()
             .map(|phase| {
-                let traffic = geometry_traffic(program, phase, None, geometry)?;
+                let traffic = geometry_traffic(program, phase, None, &geometry)?;
                 let cycles = super::cycles::exchange_endpoint_cycles(&traffic, 1);
                 tracing::debug!(phase = phase.id.index(), source = ?phase.provenance.operation,
                     bytes = traffic.maximum_payload_bytes(), fragments = traffic.maximum_fragments(),
@@ -253,7 +246,7 @@ fn geometry_traffic(
             // scheduling can change that order, pairing and control overlap.
             let mut resets = 0;
             for [_, row] in &copy.rows {
-                let limit = ipu_exchange::MAX_TRANSFER_WORDS * 4;
+                let limit = crate::exchange::MAX_TRANSFER_WORDS * 4;
                 fragments += u64::from(row.rows) * u64::from(row.bytes.div_ceil(limit));
                 long_fragments += u64::from(row.rows)
                     * (u64::from(row.bytes / limit) * u64::from(limit > 256)
@@ -268,7 +261,7 @@ fn geometry_traffic(
                         row.rows,
                         row.stride,
                         transfer.destinations.len(),
-                        ipu_exchange::MAX_TRANSFER_WORDS * 4,
+                        crate::exchange::MAX_TRANSFER_WORDS * 4,
                     );
                 }
                 let end = &mut receive_end[usize::from(target.tile)];
@@ -408,7 +401,7 @@ fn enumerated_geometry_traffic(
                         resets += u64::from(*end != Some(address));
                         *end = Some(address + u64::from(bytes));
                         if let Some(storage) = storage.as_deref_mut() {
-                            let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+                            let max_bytes = u64::from(crate::exchange::MAX_TRANSFER_WORDS) * 4;
                             let mut remaining = u64::from(bytes);
                             let mut address =
                                 (u64::from(destination.shard.index()) << 32) + u64::from(offset);
@@ -429,7 +422,7 @@ fn enumerated_geometry_traffic(
                         }
                         fragments = fragments.saturating_add(
                             u64::from(bytes)
-                                .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
+                                .div_ceil(u64::from(crate::exchange::MAX_TRANSFER_WORDS) * 4),
                         );
                         Ok(())
                     },

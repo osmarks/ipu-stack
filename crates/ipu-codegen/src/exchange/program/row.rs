@@ -1,7 +1,7 @@
 //! Executable rows retain the relocation sites known during encoding. Consumers
 //! may change addresses and base operands without interpreting the instruction
 //! stream again; the independent decoder remains the oracle for imported rows.
-use crate::{ExchangeError, PIC_RECEIVE_ADDRESS_MASK, SEND_ADDRESS_MASK};
+use crate::exchange::program::{ExchangeError, PIC_RECEIVE_ADDRESS_MASK, SEND_ADDRESS_MASK};
 use ipu_target::ipu21::instruction::{RETURN_M10_INSTRUCTION, encode_put_special_m};
 use ipu_target::ipu21::registers::OUTGOING_BASE;
 
@@ -125,7 +125,7 @@ impl EncodedRow {
     /// Check all sites, including zero-valued fields, against the independent
     /// decoder. Run this on incremental rows as well as complete encodings.
     pub(crate) fn assert_relocation_sites(&self, messages: impl Iterator<Item = u32>) {
-        use crate::diagnostic::{
+        use crate::exchange::program::diagnostic::{
             IncomingControl, IncomingControlStream, PlanOperation, SendEncoding,
             diagnose_plan_program, normalized_exchange_address_words,
             sender_address_instruction_groups,
@@ -186,7 +186,9 @@ impl EncodedRow {
         for (index, site) in self.sends.iter().enumerate() {
             for address in [0, 0x54320, 0xffffc, 0x1ffff8, 3, u32::MAX] {
                 let mut word = self.words[site.word_offset as usize];
-                let expected = crate::patch_sender_instruction(&mut word, address).map(|()| word);
+                let expected =
+                    crate::exchange::program::patch_sender_instruction(&mut word, address)
+                        .map(|()| word);
                 assert_eq!(self.relocated_send(index, address), expected);
             }
         }

@@ -1,17 +1,16 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 use ipu_target::ipu21::fabric::Topology;
-#[cfg(test)]
-use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::ipu21::memory::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
-mod diagnostic;
+pub mod diagnostic;
+mod program;
+pub use program::*;
 mod hazards;
 use hazards::MemoryHistory;
 mod order;
 mod packet;
-use diagnostic::PhaseDiagnostics;
 pub use diagnostic::diagnose_exchange_tile;
 use order::{critical_neighborhood_order, point_to_point_matching_wave_order};
 mod replay;
@@ -28,18 +27,11 @@ pub(crate) use traffic::MappingTraffic;
 use crate::{
     BlockValueId, ExchangePhaseId, LogicalExchange, LowProgram, Placement, ShardDefinition,
 };
-use ipu_exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
-    ScheduledPayloadTiming, finalize_point_receiver, patch_receiver_address, patch_sender_address,
-};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-
-#[cfg(test)]
-use ipu_exchange::plan_event_cycles;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
@@ -47,7 +39,7 @@ pub struct PhysicalExchangePhase {
     /// Whether each logical tile participates in this phase's timed program.
     pub active: Vec<bool>,
     /// Synchronization-free timed supervisor program indexed by logical tile.
-    pub programs: Vec<ipu_exchange::EncodedRow>,
+    pub programs: Vec<crate::exchange::EncodedRow>,
     /// Per-tile base used by point-to-point receive rows in this phase.
     pub incoming_bases: Vec<u32>,
     /// Final local exchange event indexed by logical tile. Inactive tiles use zero.
@@ -108,24 +100,6 @@ pub struct ExchangeScheduleSnapshot {
     pub schema_version: u32,
     pub tile_count: u16,
     pub phases: Vec<ExchangeScheduleProblem>,
-    /// Optional compiler provenance for offline diagnostics; ignored by scheduling.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub phase_labels: BTreeMap<u32, String>,
-    /// All movement classes in a fused phase, before physical span expansion.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub phase_traffic: BTreeMap<u32, BTreeMap<String, ExchangeTrafficSummary>>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExchangeTrafficSummary {
-    pub logical_transfers: u64,
-    /// Source payload counted once per movement class. A multicast spanning
-    /// different destination classes contributes to each; do not sum as wire traffic.
-    pub transmitted_bytes: u64,
-    /// Payload delivered to all receivers in this class; additive across classes.
-    pub received_bytes: u64,
-    pub source_tiles: BTreeSet<u16>,
-    pub destination_tiles: BTreeSet<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +171,7 @@ pub enum ExchangeLoweringError {
     #[error(transparent)]
     Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
     #[error(transparent)]
-    Exchange(#[from] ipu_exchange::ExchangeError),
+    Exchange(#[from] crate::exchange::ExchangeError),
     #[error(transparent)]
     Storage(#[from] crate::StorageError),
     #[error("exchange refers to an unplaced shard")]
@@ -225,14 +199,12 @@ pub(crate) fn lower_exchanges(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
-    enable_diagnostics: bool,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
     lower_exchanges_cached(
         program,
         placement,
         topology,
         None,
-        enable_diagnostics,
         &mut ExchangeScheduleCache::default(),
     )
 }
@@ -321,119 +293,11 @@ fn prepare_phase(
     Ok(coalesce_pending_transfers(pending))
 }
 
-pub(crate) fn capture_exchange_schedule(
-    program: &LowProgram,
-    placement: &Placement,
-) -> Result<ExchangeScheduleSnapshot, ExchangeLoweringError> {
-    let repeat_inputs = repeat_source_bases(program, placement)?;
-    let phases = program
-        .exchange_phases
-        .par_iter()
-        .map(|phase| {
-            Ok(schedule_problem(
-                phase.id.index(),
-                &prepare_phase(program, placement, phase, &repeat_inputs)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-    Ok(ExchangeScheduleSnapshot {
-        schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
-        tile_count: program.tile_count,
-        phases,
-        phase_traffic: program
-            .exchange_phases
-            .iter()
-            .map(|phase| {
-                let mut groups = BTreeMap::<String, ExchangeTrafficSummary>::new();
-                for transfer in &phase.transfers {
-                    let source = &program.shards[transfer.source.shard.index() as usize];
-                    let order = transfer.span_order(&program.shards);
-                    let bytes = transfer
-                        .source
-                        .bind(&program.shards)?
-                        .traversal(order)?
-                        .byte_len();
-                    let describe = |shard: &crate::BlockValue, view: &crate::ShardView| {
-                        let widths = |extents: &[crate::ShardExtent]| {
-                            extents
-                                .iter()
-                                .map(|e| e.physical_end - e.start)
-                                .collect::<Vec<_>>()
-                        };
-                        format!(
-                            "{:?} {:?}; shard={:?}; view={:?}",
-                            shard.tensor_type.shape,
-                            shard.tensor_type.format,
-                            widths(&shard.extents),
-                            widths(&view.extents)
-                        )
-                    };
-                    let source_label = describe(source, &transfer.source);
-                    let mut receivers = BTreeMap::<String, Vec<u16>>::new();
-                    for view in &transfer.destinations {
-                        let target = &program.shards[view.shard.index() as usize];
-                        receivers
-                            .entry(describe(target, view))
-                            .or_default()
-                            .push(target.tile);
-                    }
-                    for (target, tiles) in receivers {
-                        let entry = groups
-                            .entry(format!("{order:?}: {source_label} -> {target}"))
-                            .or_default();
-                        entry.logical_transfers += 1;
-                        entry.transmitted_bytes += bytes;
-                        entry.received_bytes += bytes * tiles.len() as u64;
-                        entry.source_tiles.insert(source.tile);
-                        entry.destination_tiles.extend(tiles);
-                    }
-                }
-                Ok((phase.id.index(), groups))
-            })
-            .collect::<Result<_, ExchangeLoweringError>>()?,
-        phase_labels: program
-            .exchange_phases
-            .iter()
-            .map(|phase| {
-                let tensors = phase
-                    .transfers
-                    .first()
-                    .and_then(|transfer| {
-                        let source =
-                            &program.shards[transfer.source.shard.index() as usize].tensor_type;
-                        let destination = &program.shards
-                            [transfer.destinations.first()?.shard.index() as usize]
-                            .tensor_type;
-                        Some(format!(
-                            "{:?} {:?} {:?} -> {:?} {:?}",
-                            source.shape,
-                            source.format.precision,
-                            source.format.layout.order,
-                            destination.shape,
-                            destination.format.layout.order
-                        ))
-                    })
-                    .unwrap_or_default();
-                (
-                    phase.id.index(),
-                    format!(
-                        "op {:?} {:?}: {}",
-                        phase.provenance.operation.map(|op| op.index()),
-                        phase.provenance.reason,
-                        tensors
-                    ),
-                )
-            })
-            .collect(),
-    })
-}
-
 pub(crate) fn lower_exchanges_cached(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
     stream_words: Option<std::num::NonZeroU32>,
-    enable_diagnostics: bool,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
     let repeat_inputs = repeat_source_bases(program, placement)?;
@@ -454,7 +318,6 @@ pub(crate) fn lower_exchanges_cached(
             let pending = prepare_phase(program, placement, phase, &repeat_inputs)?;
             let ScheduledPending {
                 pending,
-                receive_counts,
                 incoming_bases,
                 optimized,
             } = select_phase(
@@ -494,38 +357,6 @@ pub(crate) fn lower_exchanges_cached(
                 selected_kind,
                 neighborhood_improvements,
             } = optimized;
-            if enable_diagnostics {
-                let repeat_iterations = pending
-                    .iter()
-                    .map(|transfer| transfer.source_addresses.len())
-                    .max()
-                    .unwrap_or(1);
-                if repeat_iterations > 1 {
-                    let mut unsafe_pending = pending.clone();
-                    for transfer in &mut unsafe_pending {
-                        transfer.source_addresses.truncate(1);
-                        transfer.refresh_source_elements();
-                    }
-                    let unsafe_schedule = optimize_pending_schedule(
-                        topology,
-                        &unsafe_pending,
-                        &incoming_bases,
-                        &receive_counts,
-                        program.tile_count,
-                        stream_words,
-                    )?;
-                    tracing::info!(
-                        phase = phase.id.index(),
-                        repeat_iterations,
-                        unsafe_horizon = unsafe_schedule.schedule.horizon,
-                        repeat_safe_horizon = schedule.horizon,
-                        repeat_safety_cost = schedule
-                            .horizon
-                            .saturating_sub(unsafe_schedule.schedule.horizon),
-                        "compared repeat-safe exchange schedule with first-iteration-only baseline"
-                    );
-                }
-            }
             if pending.len() > 1_000 {
                 tracing::info!(
                     phase = phase.id.index(),
@@ -536,37 +367,6 @@ pub(crate) fn lower_exchanges_cached(
                     selected_kind,
                     neighborhood_improvements,
                     "optimized physical exchange schedule"
-                );
-            }
-            let mut diagnostics =
-                enable_diagnostics.then(|| PhaseDiagnostics::new(program.tile_count));
-            if let Some(diagnostics) = &mut diagnostics {
-                let mut endpoint_roles = vec![0usize; usize::from(program.tile_count)];
-                for tile in pending.iter().flat_map(PendingTransfer::tiles) {
-                    endpoint_roles[usize::from(tile)] += 1;
-                }
-                diagnostics.maximum_endpoint_roles = endpoint_roles.into_iter().max().unwrap_or(0);
-                for &index in &schedule.order {
-                    let transfer = &pending[index];
-                    let timing = schedule.timings[index].ok_or(ExchangeLoweringError::Overflow)?;
-                    diagnostics.record(
-                        transfer.source,
-                        transfer.source_address(),
-                        &transfer.destinations,
-                        transfer.words,
-                        timing.start,
-                        timing.end,
-                        timing.blocking_tile,
-                    );
-                }
-            }
-            if let Some(diagnostics) = diagnostics {
-                diagnostics.emit(
-                    phase.id.index(),
-                    &phase.provenance,
-                    schedule.horizon,
-                    &schedule.tile_availability,
-                    &schedule.builder,
                 );
             }
             let mut physical = schedule.into_phase(phase.id, incoming_bases)?;
@@ -606,8 +406,6 @@ pub(crate) fn lower_exchanges_cached(
                 schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
                 tile_count: program.tile_count,
                 phases: schedule_phases,
-                phase_labels: BTreeMap::new(),
-                phase_traffic: BTreeMap::new(),
             },
         }
     })
@@ -932,7 +730,7 @@ fn paired_transfer_alternatives(
             .iter()
             .map(|&(tile, _)| tile)
             .collect::<Vec<_>>();
-        if ipu_exchange::paired_multicast(
+        if crate::exchange::paired_multicast(
             &topology,
             transfer.source,
             &paired_tiles,
@@ -1135,7 +933,6 @@ struct OptimizedSchedule {
 
 struct ScheduledPending {
     pending: Vec<PendingTransfer>,
-    receive_counts: Vec<usize>,
     incoming_bases: Vec<u32>,
     optimized: OptimizedSchedule,
 }
@@ -1157,7 +954,6 @@ fn optimize_owned_pending(
     )?;
     Ok(ScheduledPending {
         pending,
-        receive_counts,
         incoming_bases,
         optimized,
     })
@@ -1491,7 +1287,7 @@ pub fn validate_exchange_schedule(
         .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
         let decoded =
-            ipu_exchange::diagnostic::diagnose_plan_program(phase.programs[tile].words(), None)?;
+            crate::exchange::diagnostic::diagnose_plan_program(phase.programs[tile].words(), None)?;
         if decoded.event_cycles != phase.tile_event_cycles[tile] {
             return Err(fail(format!(
                 "phase {} tile {tile} decoded horizon {} differs from {}",
@@ -2131,9 +1927,7 @@ struct TilePredecessor {
 
 #[derive(Clone, Copy, Debug)]
 struct MaterializedTiming {
-    start: u32,
     end: u32,
-    blocking_tile: u16,
     predecessor: Option<usize>,
 }
 
@@ -2316,9 +2110,7 @@ impl MaterializedSchedule {
         last_transfer[usize::from(transfer.source)].send = Some(index);
         self.order.push(index);
         self.timings[index] = Some(MaterializedTiming {
-            start: timing.payload_start,
             end: completion,
-            blocking_tile,
             predecessor,
         });
         Ok(completion)
@@ -2345,7 +2137,7 @@ impl MaterializedSchedule {
             programs: encoded
                 .programs
                 .into_iter()
-                .map(|program| program.unwrap_or_else(ipu_exchange::EncodedRow::inactive))
+                .map(|program| program.unwrap_or_else(crate::exchange::EncodedRow::inactive))
                 .collect(),
             incoming_bases,
             tile_event_cycles: encoded.tile_event_cycles,
@@ -2469,7 +2261,7 @@ fn materialize_valid_schedule_order(
         false,
     ) {
         Ok(schedule) => Ok(schedule),
-        Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
+        Err(ExchangeLoweringError::Exchange(crate::exchange::ExchangeError::Schedule(
             "SENDPICP instruction alignment",
         ))) => materialize_schedule_order(
             topology,
@@ -2531,7 +2323,7 @@ fn materialize_schedule_order(
     if schedule_encoding_is_valid(&schedule)? {
         Ok(schedule)
     } else {
-        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment").into())
+        Err(crate::exchange::ExchangeError::Schedule("SENDPICP instruction alignment").into())
     }
 }
 
@@ -2540,7 +2332,9 @@ fn schedule_encoding_is_valid(
 ) -> Result<bool, ExchangeLoweringError> {
     match schedule.builder.finish() {
         Ok(_) => Ok(true),
-        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
+        Err(crate::exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => {
+            Ok(false)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -2631,18 +2425,11 @@ fn append_transfer(
                 && incoming_bases[usize::from(tile)] == address
         });
     let mut plan = if width == ExchangeItemWidth::Paired64 {
-        ipu_exchange::paired_multicast(&topology, source, &tiles, item_count)?
+        crate::exchange::paired_multicast(&topology, source, &tiles, item_count)?
     } else if point_receiver {
-        let point = ipu_exchange::point_to_point(&topology, source, tiles[0], words)?;
-        MulticastPlan {
-            sender: point.sender,
-            receivers: vec![finalize_point_receiver(
-                &point.receiver,
-                topology.physical(source)?,
-            )?],
-        }
+        point_to_point(&topology, source, tiles[0], words)?
     } else {
-        ipu_exchange::multicast(&topology, source, &tiles, item_count, 0)?
+        crate::exchange::multicast(&topology, source, &tiles, item_count, 0)?
     };
     patch_sender_address(&mut plan.sender, source_address)?;
     if !point_receiver {
@@ -2778,7 +2565,7 @@ pub(crate) fn effective_memory_elements(address: u32, words: u32) -> Vec<Exchang
 }
 
 pub fn inactive_exchange_program() -> Vec<u32> {
-    ipu_exchange::EncodedRow::inactive().into_words()
+    crate::exchange::EncodedRow::inactive().into_words()
 }
 
 #[cfg(test)]

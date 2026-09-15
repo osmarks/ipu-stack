@@ -4,7 +4,6 @@ mod movement;
 pub use movement::CopyOrder;
 pub(crate) use movement::{for_each_copy_span, uncovered_bytes};
 mod geometry;
-pub use geometry::GeometryCacheStats;
 pub(crate) use geometry::{
     CopyMapping, CopyPair, DestinationGeometry, GeometryCache, GeometryView,
 };

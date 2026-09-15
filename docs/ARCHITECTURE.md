@@ -20,8 +20,7 @@ outer control flow is only part of it.
 
 | Component | Current responsibility |
 | --- | --- |
-| `ipu-codegen` | Semantic graph, distributed layout/implementation selection, mid rewrites, tile expansion, costs, placement, exchange integration, kernel selection, supervisor emission and package construction |
-| `ipu-exchange` | Timed exchange programs and encodings, host-exchange packets, topology/multicast construction, plus shared supervisor instruction encoders |
+| `ipu-codegen` | Semantic graph, layout/implementation selection, mid rewrites, tile expansion, costs, placement, device/host exchange scheduling and encoding, kernels, supervisor emission and package construction |
 | `ipu-elf` | SDK kernel compilation and artifact caching; ELF inspection, linking and relocations |
 | `ipu-package` | Serialized application and profile formats, validation and host bindings; currently also owns several IPU21 memory/loader constants |
 | `ipu-driver` | Device access, reset/loading, diagnostic registers and host-exchange sessions |

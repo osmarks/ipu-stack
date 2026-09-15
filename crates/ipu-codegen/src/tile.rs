@@ -412,7 +412,7 @@ fn layout_exchange_rows(
         offsets.extend(program.nonzero_address_word_offsets());
     }
     let mut shared = BTreeMap::<(Vec<u32>, Option<u32>), SharedRow>::new();
-    let inactive = ipu_exchange::EncodedRow::inactive();
+    let inactive = crate::exchange::EncodedRow::inactive();
     for phase in exchanges {
         let (active, base_program) = if tile < scheduled_tile_count {
             let index = usize::from(tile);
@@ -597,9 +597,9 @@ mod tests {
     #[test]
     fn shared_rows_restore_zero_addresses_in_either_order() {
         let row = |address| {
-            let mut plan = ipu_exchange::multicast(&Topology::c600(), 0, &[1], 4, 0).unwrap();
-            ipu_exchange::patch_sender_address(&mut plan.sender, address).unwrap();
-            let mut builder = ipu_exchange::PhaseProgramBuilder::new(2);
+            let mut plan = crate::exchange::multicast(&Topology::c600(), 0, &[1], 4, 0).unwrap();
+            crate::exchange::patch_sender_address(&mut plan.sender, address).unwrap();
+            let mut builder = crate::exchange::PhaseProgramBuilder::new(2);
             builder
                 .append_transfer_at(0, &[], &[1], &plan.prepare(0).unwrap(), 0, 4)
                 .unwrap();
@@ -760,7 +760,7 @@ mod tests {
             );
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
-            let exchanges = lower_exchanges(&low, &placement, &Topology::c600(), false)
+            let exchanges = lower_exchanges(&low, &placement, &Topology::c600())
                 .unwrap()
                 .phases;
             let filler_tiles = random.u16(1..=4);

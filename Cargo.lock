@@ -350,7 +350,6 @@ dependencies = [
  "foldhash",
  "hashbrown",
  "ipu-elf",
- "ipu-exchange",
  "ipu-package",
  "ipu-target",
  "min-max-heap",
@@ -384,17 +383,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "ipu-exchange"
-version = "0.1.0"
-dependencies = [
- "fastrand",
- "ipu-target",
- "serde",
  "thiserror",
  "tracing",
 ]
@@ -448,7 +436,6 @@ dependencies = [
  "ipu-codegen",
  "ipu-driver",
  "ipu-elf",
- "ipu-exchange",
  "ipu-package",
  "ipu-runtime",
  "ipu-target",

@@ -14,57 +14,31 @@ use std::sync::{
 type Map<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
 static NEXT_VIEW: AtomicU64 = AtomicU64::new(0);
 
-#[derive(serde::Serialize)]
-pub struct GeometryCacheStats {
-    pub views: CacheStats,
-    pub pairs: CacheStats,
-    pub destinations: CacheStats,
-}
-#[derive(serde::Serialize)]
-pub struct CacheStats {
-    pub entries: usize,
-    pub hits: u64,
-    pub misses: u64,
-}
-
 struct Memo<K, V> {
     limit: usize,
-    state: Mutex<(Map<K, Arc<V>>, u64, u64)>,
+    state: Mutex<Map<K, Arc<V>>>,
 }
 impl<K: Eq + Hash, V> Memo<K, V> {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            state: Mutex::new((Map::default(), 0, 0)),
+            state: Mutex::new(Map::default()),
         }
     }
     fn get(&self, key: K, build: impl FnOnce() -> StorageResult<V>) -> StorageResult<Arc<V>> {
-        if self.limit == 0 {
-            return build().map(Arc::new);
-        }
         {
-            let mut state = self.state.lock().unwrap();
-            if let Some(value) = state.0.get(&key).cloned() {
-                state.1 += 1;
+            let state = self.state.lock().unwrap();
+            if let Some(value) = state.get(&key).cloned() {
                 return Ok(value);
             }
-            state.2 += 1;
         }
         // Independent candidates may construct unrelated facts concurrently.
         let value = Arc::new(build()?);
         let mut state = self.state.lock().unwrap();
-        if state.0.len() < self.limit {
-            return Ok(Arc::clone(state.0.entry(key).or_insert(value)));
+        if state.len() < self.limit {
+            return Ok(Arc::clone(state.entry(key).or_insert(value)));
         }
         Ok(value)
-    }
-    fn stats(&self) -> CacheStats {
-        let state = self.state.lock().unwrap();
-        CacheStats {
-            entries: state.0.len(),
-            hits: state.1,
-            misses: state.2,
-        }
     }
 }
 
@@ -184,20 +158,6 @@ impl Default for GeometryCache {
     }
 }
 impl GeometryCache {
-    pub(crate) fn disabled() -> Self {
-        Self {
-            views: Memo::new(0),
-            pairs: Memo::new(0),
-            destinations: Memo::new(0),
-        }
-    }
-    pub(crate) fn stats(&self) -> GeometryCacheStats {
-        GeometryCacheStats {
-            views: self.views.stats(),
-            pairs: self.pairs.stats(),
-            destinations: self.destinations.stats(),
-        }
-    }
     pub(crate) fn view(
         &self,
         storage: TensorStorage<'_>,

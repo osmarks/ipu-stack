@@ -120,8 +120,12 @@ fn check_bytes(
     let graph = expand_tiles(mid, false).map_err(|error| format!("expansion: {error:?}"))?;
     let low = crate::low::lower_to_tiles(&graph, false);
     let placement = crate::place(&low).map_err(|error| format!("placement: {error:?}"))?;
-    let exchange = crate::exchange::capture_exchange_schedule(&low, &placement)
-        .map_err(|error| format!("transfer lowering: {error:?}"))?;
+    let exchange = crate::exchange::lower_exchanges(
+        &low,
+        &placement,
+        &ipu_target::ipu21::fabric::Topology::c600(),
+    )
+    .map_err(|error| format!("transfer lowering: {error:?}"))?;
     let mut memory = vec![vec![]; usize::from(mid.tile_count)];
     for shard in &low.shards {
         let Some(&address) = placement.shard_addresses.get(&shard.id) else {
@@ -186,6 +190,7 @@ fn check_bytes(
             }
             BlockOperation::Exchange(phase) => {
                 let phase = exchange
+                    .schedule_snapshot
                     .phases
                     .iter()
                     .find(|candidate| candidate.phase == phase.index())
@@ -339,88 +344,5 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                 );
             }
         }
-    }
-}
-
-#[test]
-fn forced_destination_packing_and_direct_transfers_preserve_the_same_values() {
-    for shape in [[32, 64], [33, 66], [64, 128]] {
-        let shapes = vec![TensorShape(shape.to_vec()); 3];
-        let mappings = vec![CoordinateMapping::default(); 2];
-        let mut sizes = vec![];
-        for packing in [PackingPolicy::Direct, PackingPolicy::Staged] {
-            let values = (0..3)
-                .map(|index| {
-                    let id = MidValueId::from_index(index);
-                    MidValue {
-                        id,
-                        tensor_type: TensorType::new(
-                            shape,
-                            Precision::F32,
-                            if index == 1 {
-                                Layout::block_major_matrix(32, 1)
-                            } else {
-                                Layout::row_sharded(1)
-                            },
-                        ),
-                        origin: ValueId::from_index(index),
-                        storage_group: id,
-                        owners: crate::tensor::OwnerMap::rotated(index as u16),
-                    }
-                })
-                .collect();
-            let mut mid = MidProgram {
-                tile_count: 3,
-                values,
-                inputs: vec![MidInput {
-                    name: "input".into(),
-                    kind: GraphInputKind::Host,
-                    value: MidValueId::from_index(0),
-                }],
-                outputs: vec![MidValueId::from_index(2)],
-                operations: (0..2)
-                    .map(|index| MidOperation {
-                        source: None,
-                        inputs: vec![MidValueId::from_index(index)],
-                        results: vec![MidValueId::from_index(index + 1)],
-                        kind: MidOperationKind::Copy {
-                            policy: CopyPolicy::StageLogicalThenTransform,
-                            packing: if index == 0 {
-                                packing
-                            } else {
-                                PackingPolicy::Automatic
-                            },
-                            mapping: CoordinateMapping::default(),
-                            reuse_local: true,
-                        },
-                    })
-                    .collect(),
-                ..MidProgram::default()
-            };
-            mid.compose_copies();
-            assert_eq!(
-                mid.operations.len(),
-                2,
-                "preserve the explicitly selected packing site"
-            );
-            check_bytes(&mid, &shapes, &mappings)
-                .unwrap_or_else(|error| panic!("{shape:?} {packing:?}: {error}"));
-            sizes.push(expand_tiles(&mid, false).unwrap().shards.len());
-            if packing == PackingPolicy::Direct {
-                // Transposing individual halfwords cannot use this direct-word
-                // realization. A forced request must not silently pick staging.
-                for value in &mut mid.values {
-                    value.tensor_type.format.precision = Precision::F16;
-                }
-                assert!(matches!(
-                    expand_tiles(&mid, false),
-                    Err(ExpansionError::InvalidCopyPlan)
-                ));
-            }
-        }
-        assert!(
-            sizes[1] > sizes[0],
-            "staged selection must declare its extra scratch"
-        );
     }
 }

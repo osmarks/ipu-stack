@@ -62,18 +62,11 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         for relative in [true, false] {
             let items = if paired { words / 2 } else { words };
             let mut plan = if paired {
-                ipu_exchange::paired_multicast(&topology, 0, &destinations, items)?
+                ipu_codegen::exchange::paired_multicast(&topology, 0, &destinations, items)?
             } else if destinations.len() == 1 {
-                let point = ipu_exchange::point_to_point(&topology, 0, destinations[0], words)?;
-                MulticastPlan {
-                    sender: point.sender,
-                    receivers: vec![finalize_point_receiver(
-                        &point.receiver,
-                        topology.physical(0)?,
-                    )?],
-                }
+                ipu_codegen::exchange::point_to_point(&topology, 0, destinations[0], words)?
             } else {
-                ipu_exchange::multicast(&topology, 0, &destinations, words, 0)?
+                ipu_codegen::exchange::multicast(&topology, 0, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, if relative { 0 } else { source_address })?;
             for row in &mut plan.receivers {
@@ -126,18 +119,11 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             let relative = section != 1;
             let address = 0x6d000 + case * 3 * stride + section * stride;
             let mut plan = if paired {
-                ipu_exchange::paired_multicast(&topology, 0, &destinations, words / 2)?
+                ipu_codegen::exchange::paired_multicast(&topology, 0, &destinations, words / 2)?
             } else if destinations.len() == 1 {
-                let point = ipu_exchange::point_to_point(&topology, 0, destinations[0], words)?;
-                MulticastPlan {
-                    sender: point.sender,
-                    receivers: vec![finalize_point_receiver(
-                        &point.receiver,
-                        topology.physical(0)?,
-                    )?],
-                }
+                ipu_codegen::exchange::point_to_point(&topology, 0, destinations[0], words)?
             } else {
-                ipu_exchange::multicast(&topology, 0, &destinations, words, 0)?
+                ipu_codegen::exchange::multicast(&topology, 0, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, if relative { 0 } else { source_address })?;
             if destinations.len() != 1 {
@@ -213,7 +199,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                 }
                 let mut body = phase.programs[usize::from(tile)]
                     .clone()
-                    .map(ipu_exchange::EncodedRow::into_words)
+                    .map(ipu_codegen::exchange::EncodedRow::into_words)
                     .unwrap_or_else(inactive_exchange_program);
                 assert_eq!(
                     body.pop(),
@@ -301,7 +287,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                             address: *address,
                             words: phase.programs[usize::from(tile)]
                                 .clone()
-                                .map(ipu_exchange::EncodedRow::into_words)
+                                .map(ipu_codegen::exchange::EncodedRow::into_words)
                                 .unwrap_or_else(inactive_exchange_program),
                         },
                     )

@@ -20,8 +20,7 @@ pub(crate) use mid::{
 #[cfg(test)]
 pub(crate) use program::program_cycles;
 pub(crate) use program::{
-    ProgramCycles, exchange_phase_estimate, program_cycles_analyzed, program_footprint_analyzed,
-    scheduled_program_cycles,
+    ProgramCycles, exchange_phase_estimate, program_footprint_analyzed, scheduled_program_cycles,
 };
 mod movement;
 mod tensor;
@@ -46,6 +45,3 @@ pub(crate) use traffic::*;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) use program::program_footprint;

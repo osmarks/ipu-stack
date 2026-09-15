@@ -251,11 +251,6 @@ mod tests {
                     && p.recipe.options.reuse_cast_inputs
                         != changed.recipe.options.reuse_cast_inputs)
         );
-        for proposal in choices {
-            let encoded = serde_json::to_vec(&proposal.recipe).unwrap();
-            let restored: Recipe = serde_json::from_slice(&encoded).unwrap();
-            assert!(restored == proposal.recipe);
-        }
     }
     #[test]
     fn global_mapping_replays_without_changing_logical_work() {

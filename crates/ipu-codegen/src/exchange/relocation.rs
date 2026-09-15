@@ -87,15 +87,16 @@ pub(super) fn relocate_repeat_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::diagnostic::sender_address_instruction_groups;
+    use crate::exchange::diagnostic::{PlanOperation, diagnose_plan_program};
+    use crate::exchange::patch_sender_instruction;
     use crate::exchange::{
         ExchangeActivityKind, ExchangeItemWidth, SchedulingProblem,
         materialize_valid_schedule_order, receive_configuration, schedule_problem,
         validate_exchange_schedule,
     };
+
     use crate::low::ExchangePhaseId;
-    use ipu_exchange::diagnostic::sender_address_instruction_groups;
-    use ipu_exchange::diagnostic::{PlanOperation, diagnose_plan_program};
-    use ipu_exchange::patch_sender_instruction;
     use ipu_target::ipu21::fabric::Topology;
 
     #[test]
@@ -225,11 +226,9 @@ mod tests {
                 .filter(|i| matches!(i.operation, PlanOperation::WriteBase { .. }))
                 .collect::<Vec<_>>();
             assert_eq!(switches.len(), 4);
-            assert!(
-                switches.iter().all(
-                    |i| i.end_cycle - i.start_cycle == ipu_exchange::EXCHANGE_BASE_WRITE_CYCLES
-                )
-            );
+            assert!(switches.iter().all(
+                |i| i.end_cycle - i.start_cycle == crate::exchange::EXCHANGE_BASE_WRITE_CYCLES
+            ));
             let groups = sender_address_instruction_groups(row).unwrap();
             let sends = physical.activities[0]
                 .iter()

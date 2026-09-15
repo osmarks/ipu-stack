@@ -625,7 +625,7 @@ impl TileGraphBuilder {
                 destination.storage(),
                 &geometric_mappings,
                 copy_order,
-                ipu_exchange::MAX_TRANSFER_WORDS * 4,
+                crate::exchange::MAX_TRANSFER_WORDS * 4,
             )?;
             let preparation = select_destination_packing(
                 &destination.tensor_type,

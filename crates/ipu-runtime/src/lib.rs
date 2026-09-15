@@ -51,6 +51,7 @@ pub fn init_tracing() {
     let builder = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_target(false);
     if std::env::var("IPU_LOG_FORMAT").as_deref() == Ok("json") {
         builder.json().try_init().ok();

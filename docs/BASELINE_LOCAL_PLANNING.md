@@ -31,41 +31,7 @@ also build later candidates before the first improvement is selected. It retains
 built incumbent, including its final allocation and schedule. Rejection never
 starts a fresh global search. A failed baseline is reported as such.
 
-### Saving and resuming
-
-`ipu-trivial-test --save-search-state search.json` writes a versioned JSON
-checkpoint after baseline validation, mapping selection, and each completed
-local-search round. `--load-search-state search.json` resumes that search.
-On resume, `--optimization-steps N` grants **N additional ordered attempts**;
-zero simply rebuilds the saved incumbent. Set both paths to the same file to
-continue updating it. For example, add these flags to otherwise identical builds:
-
-```sh
-# First build: eight steps and a checkpoint.
---optimization-steps 8 --save-search-state search.json
-# Next build: up to sixteen further steps, preserving progress.
---optimization-steps 16 --load-search-state search.json --save-search-state search.json
-```
-
-The checkpoint contains operator recipes, open boundaries, conversion/packing
-and reduction choices, retained candidate catalogues, fixed input homes, tile
-mapping, the ordered attempt count and visited recipes. Rejected ordered
-proposals are recorded even when a round produces no improvement, so a resumed
-run can examine the remaining shortlist. Uncommitted speculative evaluations
-are not part of the ordered history.
-
-It does not contain a physical executable or scheduler cache. Loading rebuilds
-and completely validates the saved incumbent before considering replacements;
-it skips the earlier optimization path. Graph and search-configuration identity
-are checked before lowering. Budget and checkpoint/profile-output paths can
-change; tensor precisions, layouts, memory budgets and other planning settings
-must match. Profiling instrumentation must also match. The schema is internal
-to the compiler, not a stable plan interchange format across compiler revisions.
-
-Checkpoint writes use a temporary file and atomic rename, so interruption leaves
-the last completed checkpoint intact. The regular package output is still
-written when the build finishes. The API equivalents are
-`PipelineConfig::{load_search_state, save_search_state}`.
+Search runs start from the baseline; progress is not saved or resumed.
 
 The default baseline uses contiguous row blocks targeting one 16 KiB SRAM
 element per owner. Parameter sequences use compact native homes and a shared

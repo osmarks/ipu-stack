@@ -126,9 +126,15 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
     let placement = crate::place(&low).unwrap();
     // Each output slice is eight bytes, but the AMP panel interleaves its
     // useful halfwords with padded rows. Raw sends cannot read it.
-    let snapshot = crate::exchange::capture_exchange_schedule(&low, &placement).unwrap();
+    let snapshot = crate::exchange::lower_exchanges(
+        &low,
+        &placement,
+        &ipu_target::ipu21::fabric::Topology::c600(),
+    )
+    .unwrap();
     assert!(
         snapshot
+            .schedule_snapshot
             .phases
             .iter()
             .any(|phase| !phase.transfers.is_empty())
@@ -238,9 +244,15 @@ fn shifted_halfword_crops_pack_before_physical_exchange() {
     let graph = expand_tiles(&mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
     let placement = crate::place(&low).unwrap();
-    let snapshot = crate::exchange::capture_exchange_schedule(&low, &placement).unwrap();
+    let snapshot = crate::exchange::lower_exchanges(
+        &low,
+        &placement,
+        &ipu_target::ipu21::fabric::Topology::c600(),
+    )
+    .unwrap();
     assert!(
         snapshot
+            .schedule_snapshot
             .phases
             .iter()
             .any(|phase| !phase.transfers.is_empty())

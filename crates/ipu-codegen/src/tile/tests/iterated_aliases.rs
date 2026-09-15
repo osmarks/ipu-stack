@@ -84,7 +84,6 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
             &low,
             &placement,
             &ipu_target::ipu21::fabric::Topology::c600(),
-            false,
         )
         .unwrap()
         .phases;
@@ -194,7 +193,6 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
                 &low,
                 &placement,
                 &ipu_target::ipu21::fabric::Topology::c600(),
-                false,
             )
             .unwrap()
             .phases;

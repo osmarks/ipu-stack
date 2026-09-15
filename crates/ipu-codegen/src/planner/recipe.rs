@@ -3,10 +3,9 @@ use crate::PipelineConfig;
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidProgram;
 use crate::planner::operator::OperatorPlan;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Options {
     pub cast_before_copies: bool,
     pub reuse_cast_inputs: bool,
@@ -16,7 +15,7 @@ pub(crate) struct Options {
     pub tile_mapping: Vec<u16>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     pub open_boundaries: BTreeSet<ValueId>,

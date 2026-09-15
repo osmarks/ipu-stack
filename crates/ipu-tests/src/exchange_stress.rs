@@ -1,4 +1,9 @@
 use anyhow::{Context, Result, bail};
+use ipu_codegen::exchange::{
+    PhaseProgramBuilder, PhaseTransferTiming, patch_receiver_address, patch_sender_address,
+    scheduled_receiver_timing,
+};
+
 use ipu_codegen::{
     CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
     ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram, TileProgramData,
@@ -6,10 +11,6 @@ use ipu_codegen::{
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
-use ipu_exchange::{
-    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
-};
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
 use ipu_target::ipu21::fabric::Topology;
@@ -135,7 +136,7 @@ pub(crate) fn build_wide(
     }
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
-    if words < 128 || words & 1 != 0 || words / 2 > ipu_exchange::MAX_TRANSFER_WORDS {
+    if words < 128 || words & 1 != 0 || words / 2 > ipu_codegen::exchange::MAX_TRANSFER_WORDS {
         bail!("paired 64-bit exchange payload must contain 128..=8296 even u32 words");
     }
     let items = words / 2;
@@ -242,7 +243,8 @@ pub(crate) fn build_wide(
         let source_address = source_base + region_offset + source_bank_offset;
         let destination_address = destination_base + region_offset + destination_bank_offset;
 
-        let mut plan = ipu_exchange::paired_multicast(&topology, source, &destinations, items)?;
+        let mut plan =
+            ipu_codegen::exchange::paired_multicast(&topology, source, &destinations, items)?;
         patch_sender_address(&mut plan.sender, source_address)?;
         for row in &mut plan.receivers {
             patch_receiver_address(row, destination_address)?;
@@ -270,7 +272,7 @@ pub(crate) fn build_wide(
         let mut rows = phase
             .programs
             .into_iter()
-            .map(|row| row.map(ipu_exchange::EncodedRow::into_words))
+            .map(|row| row.map(ipu_codegen::exchange::EncodedRow::into_words))
             .collect::<Vec<_>>();
         for row in rows.iter_mut().flatten() {
             row.insert(
@@ -480,10 +482,10 @@ pub(crate) fn build(
     if cases == 0 {
         bail!("--exchange-cases must be nonzero");
     }
-    if maximum_words == 0 || maximum_words > ipu_exchange::MAX_TRANSFER_WORDS {
+    if maximum_words == 0 || maximum_words > ipu_codegen::exchange::MAX_TRANSFER_WORDS {
         bail!(
             "--exchange-max-words must be in 1..={}",
-            ipu_exchange::MAX_TRANSFER_WORDS
+            ipu_codegen::exchange::MAX_TRANSFER_WORDS
         );
     }
     if maximum_transfers == 0 {
@@ -648,17 +650,9 @@ pub(crate) fn build(
                 .map(|&tile| allocate(&mut expected_cursors, tile, bytes, DATA_LIMIT, &mut rng))
                 .collect::<Result<Vec<_>>>()?;
             let mut plan = if destinations.len() == 1 {
-                let point =
-                    ipu_exchange::point_to_point(&topology, source, destinations[0], words)?;
-                MulticastPlan {
-                    sender: point.sender,
-                    receivers: vec![finalize_point_receiver(
-                        &point.receiver,
-                        topology.physical(source)?,
-                    )?],
-                }
+                ipu_codegen::exchange::point_to_point(&topology, source, destinations[0], words)?
             } else {
-                ipu_exchange::multicast(&topology, source, &destinations, words, 0)?
+                ipu_codegen::exchange::multicast(&topology, source, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, source_address)?;
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
@@ -715,7 +709,7 @@ pub(crate) fn build(
             .finish()?
             .programs
             .into_iter()
-            .map(|row| row.map(ipu_exchange::EncodedRow::into_words))
+            .map(|row| row.map(ipu_codegen::exchange::EncodedRow::into_words))
             .collect::<Vec<_>>();
         let maximum_row_words = rows
             .iter()
@@ -1490,8 +1484,10 @@ impl StressPackage {
             .programs
             .iter()
             .map(|(&tile, program)| {
-                let decoded =
-                    ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row.address))?;
+                let decoded = ipu_codegen::exchange::diagnostic::diagnose_plan_program(
+                    program,
+                    Some(row.address),
+                )?;
                 Ok(format!(
                     "tile={tile} words={} events={}\n{}",
                     program.len(),
@@ -1565,9 +1561,11 @@ impl StressPackage {
                     .filter(|(_, (expected, actual))| expected != actual)
                     .map(|(offset, (&expected, &actual))| (offset, expected, actual))
                     .collect::<Vec<_>>();
-                let decode =
-                    ipu_exchange::diagnostic::diagnose_plan_program(expected, Some(row.address))
-                        .map(|diagnostic| diagnostic.render_around_address(pc, 16));
+                let decode = ipu_codegen::exchange::diagnostic::diagnose_plan_program(
+                    expected,
+                    Some(row.address),
+                )
+                .map(|diagnostic| diagnostic.render_around_address(pc, 16));
                 Some((
                     logical,
                     physical,
@@ -1653,8 +1651,9 @@ fn overlap_specs(
         bail!("overlap case requires exactly three tiles");
     };
     let words = random_words(rng, maximum_words);
-    let incoming = point_plan(topology, incoming_source, pivot, words)?;
-    let outgoing = point_plan(topology, pivot, outgoing_destination, words)?;
+    let incoming = ipu_codegen::exchange::point_to_point(topology, incoming_source, pivot, words)?;
+    let outgoing =
+        ipu_codegen::exchange::point_to_point(topology, pivot, outgoing_destination, words)?;
     let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
     let incoming_base =
         empty.transfer_timing_at(incoming_source, &[pivot], &incoming.prepare(0)?, 0, words)?;
@@ -1700,30 +1699,14 @@ fn overlap_specs(
     })
 }
 
-fn point_plan(
-    topology: &Topology,
-    source: u16,
-    destination: u16,
-    words: u32,
-) -> Result<MulticastPlan> {
-    let point = ipu_exchange::point_to_point(&topology, source, destination, words)?;
-    Ok(MulticastPlan {
-        sender: point.sender,
-        receivers: vec![finalize_point_receiver(
-            &point.receiver,
-            topology.physical(source)?,
-        )?],
-    })
-}
-
 fn paired_control_words(
     topology: &Topology,
     source: u16,
     receiver: u16,
     maximum: u32,
 ) -> Result<Option<u32>> {
-    let plan = ipu_exchange::point_to_point(&topology, source, receiver, 1)?;
-    let receiver = finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
+    let plan = ipu_codegen::exchange::point_to_point(&topology, source, receiver, 1)?;
+    let receiver = plan.receivers[0];
     let timing = scheduled_receiver_timing(&receiver, 0)?;
     Ok(timing
         .pointer_event

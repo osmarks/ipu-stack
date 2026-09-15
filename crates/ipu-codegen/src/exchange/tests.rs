@@ -1,10 +1,11 @@
 use super::order::maximum_ready_matching;
 use super::*;
 use crate::estimate::Ipu21CostModel;
+use crate::exchange::diagnostic::sender_address_instruction_groups;
+use crate::exchange::patch_sender_instruction;
 use crate::planner::test_support::lower;
 use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
-use ipu_exchange::diagnostic::sender_address_instruction_groups;
-use ipu_exchange::patch_sender_instruction;
+use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 
 #[test]
 fn grouped_ready_queue_matches_eager_priority() {
@@ -121,7 +122,7 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                 destinations.sort_unstable();
                 destinations.dedup();
                 if width == ExchangeItemWidth::Paired64
-                    && ipu_exchange::paired_multicast(
+                    && crate::exchange::paired_multicast(
                         &Topology::c600(),
                         source,
                         &destinations,
@@ -655,7 +656,7 @@ fn randomized_eligible_physical_pairs_use_double_width_transfers() {
             .map(|&(tile, _)| tile)
             .collect::<Vec<_>>();
         let paired_is_encodable =
-            ipu_exchange::paired_multicast(&topology, source, &paired_tiles, (words & !1) / 2)
+            crate::exchange::paired_multicast(&topology, source, &paired_tiles, (words & !1) / 2)
                 .is_ok();
         let alternatives =
             paired_transfer_alternatives(std::slice::from_ref(&original), &topology, tile_count)
@@ -802,9 +803,7 @@ fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
                 last_transfer[usize::from(tile)] = Some(index);
             }
             incumbent.timings[index] = Some(MaterializedTiming {
-                start: index as u32,
                 end: index as u32 + 1,
-                blocking_tile: transfer.source,
                 predecessor,
             });
         }
@@ -853,11 +852,19 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
                 layout: Layout::block_major_matrix(64, tiles),
             },
         );
-    let mid = crate::planner::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::build::build_candidate(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &crate::planner::cache::FragmentCache::default(),
+        &crate::planner::Recipe::baseline(&config),
+    )
+    .unwrap()
+    .program;
     let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();
-    let phases = lower_exchanges(&low, &placement, &Topology::c600(), false).unwrap();
+    let phases = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
     assert!(!phases.phases.is_empty());
 }
 
@@ -894,7 +901,7 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
             config.diagnostic_checkpoints,
         );
         let placement = place(&low).unwrap();
-        let phases = lower_exchanges(&low, &placement, &Topology::c600(), false)
+        let phases = lower_exchanges(&low, &placement, &Topology::c600())
             .unwrap()
             .phases;
         assert_eq!(phases.len(), low.exchange_phases.len());
@@ -967,7 +974,7 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
     let expanded = crate::expand_tiles(&mid).unwrap();
     let low = crate::lower_to_tiles(&expanded, false);
     let placement = crate::place(&low).unwrap();
-    let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600(), false).unwrap();
+    let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
     assert!(
         exchanges
             .phases
@@ -1260,8 +1267,6 @@ fn snapshot_rejects_inactive_paired_sender_lane() {
             schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
             tile_count: tiles,
             phases: vec![problem.clone()],
-            phase_labels: BTreeMap::new(),
-            phase_traffic: BTreeMap::new(),
         };
         if tiles == 3 {
             assert!(matches!(

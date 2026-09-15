@@ -9,7 +9,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
     let topology = Topology::c600();
     let tiles = u16::try_from(topology.tile_count())?;
     let words = 16;
-    let mut plan = ipu_exchange::multicast(&topology, 0, &[1, 2], words, 0)?;
+    let mut plan = ipu_codegen::exchange::multicast(&topology, 0, &[1, 2], words, 0)?;
     patch_sender_address(&mut plan.sender, SOURCE_BASE)?;
     for row in &mut plan.receivers {
         patch_receiver_address(row, DATA_BASE)?;
@@ -27,7 +27,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
     for tile in 0..tiles {
         let mut row = phase.programs[usize::from(tile)]
             .clone()
-            .map(ipu_exchange::EncodedRow::into_words)
+            .map(ipu_codegen::exchange::EncodedRow::into_words)
             .unwrap_or_else(inactive_exchange_program);
         // Four instructions preserve the row's eight-byte instruction alignment.
         let mut prefix = vec![

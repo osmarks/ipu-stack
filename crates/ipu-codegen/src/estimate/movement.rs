@@ -77,7 +77,7 @@ pub(super) fn grid_fragments(input: &TensorType, output: &TensorType) -> Option<
 }
 
 fn endpoint_fragments(own: &[Bounds], peer: &[Bounds], element_bytes: u64) -> u64 {
-    let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    let max_bytes = u64::from(crate::exchange::MAX_TRANSFER_WORDS) * 4;
     let maximum_width = |bounds: &Bounds| {
         bounds
             .iter()
@@ -181,7 +181,7 @@ mod tests {
                     right.iter().copied(),
                     |_, _, bytes| {
                         fragments += u64::from(bytes)
-                            .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4);
+                            .div_ceil(u64::from(crate::exchange::MAX_TRANSFER_WORDS) * 4);
                         Ok(())
                     },
                 )

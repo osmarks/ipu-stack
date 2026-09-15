@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
 
-const HOST_DATA_START: u32 = ipu_exchange::HOST_PAGE_BYTES;
+const HOST_DATA_START: u32 = crate::exchange::HOST_PAGE_BYTES;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -81,7 +81,7 @@ pub(crate) fn plan(
     for transfer in weight_phases.iter_mut().chain(&mut input_phases).flatten() {
         transfer.copy_destination = Some(transfer.tile_address);
         transfer.tile_address = HOST_STAGING_ADDRESS;
-        ipu_exchange::plan_host_to_tile(
+        crate::exchange::plan_host_to_tile(
             crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
@@ -90,7 +90,7 @@ pub(crate) fn plan(
         )?;
     }
     for transfer in output_phases.iter().flatten() {
-        ipu_exchange::plan_tile_to_host(
+        crate::exchange::plan_tile_to_host(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -154,7 +154,7 @@ pub(crate) fn plan(
         input_batch_ends: input_ends,
         output_batch_ends: output_ends,
     });
-    let data_bytes = u64::from(ipu_exchange::HOST_PAGE_BYTES)
+    let data_bytes = u64::from(crate::exchange::HOST_PAGE_BYTES)
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
@@ -168,7 +168,7 @@ pub(crate) fn plan(
             pages: vec![
                 HostPage {
                     index: 0,
-                    size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
+                    size: u64::from(crate::exchange::HOST_PAGE_BYTES),
                 },
                 HostPage {
                     index: 1,
@@ -209,7 +209,7 @@ fn append_slice(
         .ok_or_else(|| invalid("host file offset overflow"))?;
     let mut remaining = u32::try_from(slice.size)?;
     while remaining != 0 {
-        let bytes = remaining.min(ipu_exchange::HOST_PAGE_BYTES);
+        let bytes = remaining.min(crate::exchange::HOST_PAGE_BYTES);
         result.push(PendingTransfer {
             transfer: Transfer {
                 direction,
@@ -253,7 +253,7 @@ fn batch(
                 continue;
             };
             let page_offset = slots[&tile]
-                .checked_mul(ipu_exchange::HOST_PAGE_BYTES)
+                .checked_mul(crate::exchange::HOST_PAGE_BYTES)
                 .ok_or_else(|| invalid("host page offset overflow"))?;
             pending.transfer.host_offset = HOST_DATA_START
                 .checked_add(page_offset)
@@ -395,14 +395,16 @@ fn phase_instructions(
 ) -> PackageBuildResult<(Vec<u32>, Vec<u32>)> {
     let target = target.map(target_program).transpose()?;
     let xreq = (!targets.is_empty())
-        .then(|| ipu_exchange::assemble_host_xreq_program_for_targets(targets, HOST_PACKET_ADDRESS))
+        .then(|| {
+            crate::exchange::assemble_host_xreq_program_for_targets(targets, HOST_PACKET_ADDRESS)
+        })
         .transpose()?;
     Ok(match (target, xreq) {
         (Some(target), Some(xreq)) => {
             let mut packets = xreq.packet_words;
             packets.extend_from_slice(&target.packet_words);
             (
-                ipu_exchange::wrap_combined_host_operation(
+                crate::exchange::wrap_combined_host_operation(
                     physical_tile,
                     &target.instructions,
                     HOST_PACKET_ADDRESS,
@@ -411,20 +413,20 @@ fn phase_instructions(
             )
         }
         (None, Some(xreq)) => (
-            ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
+            crate::exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
             xreq.packet_words,
         ),
         (Some(target), None) => (
-            ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
+            crate::exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
             target.packet_words,
         ),
         (None, None) => return Err(invalid("active host phase has no work")),
     })
 }
 
-fn target_program(transfer: Transfer) -> PackageBuildResult<ipu_exchange::TileToHostProgram> {
+fn target_program(transfer: Transfer) -> PackageBuildResult<crate::exchange::TileToHostProgram> {
     Ok(match transfer.direction {
-        Direction::ToTile => ipu_exchange::assemble_host_to_tile_target_program(
+        Direction::ToTile => crate::exchange::assemble_host_to_tile_target_program(
             crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
@@ -432,7 +434,7 @@ fn target_program(transfer: Transfer) -> PackageBuildResult<ipu_exchange::TileTo
             transfer.bytes,
             HOST_PACKET_ADDRESS + 8,
         )?,
-        Direction::ToHost => ipu_exchange::assemble_tile_to_host_target_program(
+        Direction::ToHost => crate::exchange::assemble_tile_to_host_target_program(
             crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
@@ -474,7 +476,7 @@ fn xreq_targets(physical_tile: u16, phase: &[Transfer]) -> PackageBuildResult<Ve
     phase
         .iter()
         .filter_map(
-            |transfer| match ipu_exchange::host_hierarchy(transfer.physical_tile) {
+            |transfer| match crate::exchange::host_hierarchy(transfer.physical_tile) {
                 Ok(hierarchy) if hierarchy.xreq_physical_tile == physical_tile => {
                     Some(Ok(transfer.physical_tile))
                 }

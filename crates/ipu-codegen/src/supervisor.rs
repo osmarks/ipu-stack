@@ -48,7 +48,7 @@ pub enum CodegenError {
     #[error(transparent)]
     Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
     #[error("exchange encoding failed: {0}")]
-    Exchange(#[from] ipu_exchange::ExchangeError),
+    Exchange(#[from] crate::exchange::ExchangeError),
     #[error("invalid tile program: {0}")]
     Invalid(String),
 }

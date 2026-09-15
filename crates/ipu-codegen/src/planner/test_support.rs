@@ -3,7 +3,8 @@ use crate::PipelineConfig;
 use crate::estimate::CostModel;
 use crate::graph::{ComputeGraph, GraphInputKind, Operation, OperationKind, ValueId};
 use crate::mid::MidProgram;
-use crate::planner::{FragmentCache, LoweringError, LoweringResult, Recipe, build};
+use crate::planner::cache::FragmentCache;
+use crate::planner::{LoweringError, LoweringResult, Recipe, build};
 use crate::tensor::{Layout, TensorFormat};
 use std::collections::BTreeSet;
 
