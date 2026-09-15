@@ -260,7 +260,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
 }
 
 #[test]
-fn factor_mappings_resolve_locally_reused_source_storage() {
+fn factor_mappings_keep_the_bound_source_selection() {
     let mut graph = ComputeGraph::new();
     let input = graph.host_input("input", [1, 4, 32]).unwrap();
     graph.set_outputs([input]).unwrap();
@@ -268,27 +268,30 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let mut builder = TileGraphBuilder::new(&mid).unwrap();
     let source = builder.shards[0].id;
-    let mut placeholder = builder.shards[0].clone();
-    placeholder.definition = ShardDefinition::Unmaterialized;
-    let reused = builder.push_shard(placeholder).unwrap();
-    builder
-        .borrowed_views
-        .insert(reused, builder.full_view(source));
+    let source_view = builder
+        .narrow_view(&builder.full_view(source), &[(1, 0, 2)])
+        .unwrap();
+    let source_shape = crate::TensorShape(vec![1, 2, 32]);
     let view = crate::AxisFactorView::new(2, 0, 2);
     let mut destination = builder.shards[0].clone();
-    destination.tensor_type.shape = view.output_shape(&destination.tensor_type.shape).unwrap();
+    destination.tensor_type.shape = view.output_shape(&source_shape).unwrap();
     destination.extents[0].logical_end = 2;
     destination.extents[0].physical_end = 2;
+    destination.extents[1].logical_end = 2;
+    destination.extents[1].physical_end = 2;
     destination.extents[2].logical_end = 16;
     destination.extents[2].physical_end = 16;
     let output = builder.push_shard(destination).unwrap();
     let mappings = builder
-        .window_view_mappings(&[reused], &[output], view, &[])
+        .window_view_mappings(&[source_view.clone()], &source_shape, &[output], view, &[])
         .unwrap();
     assert_eq!(mappings.len(), 2);
-    // Logical mapping retains the canonical identity; the shared physical
-    // planning boundary resolves it before deriving byte strides and copies.
-    assert!(mappings.iter().all(|(input, _)| input.shard == reused));
+    // Physical storage is already bound before mapping or copy geometry.
+    assert!(
+        mappings
+            .iter()
+            .all(|(input, _)| input.shard == source && input.extents[1].physical_end <= 2)
+    );
     let provenance = WorkProvenance {
         operation: None,
         value: None,
@@ -318,25 +321,41 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
             .all(|copy| copy.source == source)
     );
 
-    let logical = ShardView {
-        shard: reused,
-        extents: builder.shards[reused.index() as usize].extents.clone(),
-    };
     let run = builder
         .bind_kernel(
             provenance,
             TileKernelSpec::Gelu,
-            vec![logical.clone()],
-            vec![builder.full_view(source)],
+            vec![source_view.clone()],
+            vec![source_view.clone()],
         )
         .unwrap();
-    assert_eq!(run.inputs[0], builder.full_view(source));
-    let mut already_resolved = run.inputs[0].clone();
-    builder.resolve_read_view(&mut already_resolved).unwrap();
-    assert_eq!(already_resolved, run.inputs[0]);
-    let mut outside = logical;
+    assert_eq!(run.inputs[0], source_view);
+    let mut outside = source_view;
     outside.extents[2].physical_end += 1;
-    assert!(builder.resolve_read_view(&mut outside).is_err());
+    assert!(
+        builder
+            .bind_kernel(
+                provenance,
+                TileKernelSpec::Gelu,
+                vec![outside],
+                vec![run.outputs[0].clone()]
+            )
+            .is_err()
+    );
+    let mut unavailable = builder.shards[source.index() as usize].clone();
+    unavailable.definition = ShardDefinition::Unmaterialized;
+    let unavailable = builder.push_shard(unavailable).unwrap();
+    assert!(matches!(
+        builder.bind_kernel(
+            provenance,
+            TileKernelSpec::Gelu,
+            vec![builder.full_view(unavailable)],
+            vec![builder.full_view(source)]
+        ),
+        Err(ExpansionError::Kernel(crate::KernelError::Storage(
+            StorageError::InvalidView
+        )))
+    ));
 }
 
 fn format(tiles: u16) -> TensorFormat {
@@ -387,12 +406,12 @@ fn panel_construction_keeps_both_operand_casts_materialized() {
     assert_eq!(casts.len(), 2);
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for cast in casts {
-        assert!(!low.value_shards(cast.results[0]).is_empty());
+        assert!(!low.value_views(cast.results[0]).is_empty());
         assert!(
-            low.value_shards(cast.results[0])
+            low.value_views(cast.results[0])
                 .iter()
                 .all(|shard| !matches!(
-                    low.shards[shard.index() as usize].definition,
+                    low.shards[shard.shard.index() as usize].definition,
                     ShardDefinition::Unmaterialized
                 ))
         );
@@ -613,7 +632,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             "case {case}"
         );
         let parameter_shards = low
-            .value_shards(
+            .value_views(
                 low.inputs
                     .iter()
                     .find(|input| input.kind == crate::GraphInputKind::Parameter)
@@ -621,7 +640,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                     .value,
             )
             .iter()
-            .copied()
+            .map(|view| view.shard)
             .collect::<BTreeSet<_>>();
         let direct_parameter_runs = low
             .kernel_runs
@@ -634,9 +653,9 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         assert!(direct_parameter_runs > 0, "case {case}");
         if (result_row_partitions, result_column_partitions) != (1, 1) {
             let output_shards = low
-                .value_shards(low.outputs[0])
+                .value_views(low.outputs[0])
                 .iter()
-                .copied()
+                .map(|view| view.shard)
                 .collect::<BTreeSet<_>>();
             let packed_results = reduction_runs
                 .iter()
@@ -716,7 +735,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let parameter_tiles = |name: &str| {
-            low.value_shards(
+            low.value_views(
                 low.inputs
                     .iter()
                     .find(|input| input.name == name)
@@ -724,7 +743,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
                     .value,
             )
             .iter()
-            .map(|shard| low.shards[shard.index() as usize].tile)
+            .map(|shard| low.shards[shard.shard.index() as usize].tile)
             .collect::<BTreeSet<_>>()
         };
         let first = parameter_tiles("right.0");
@@ -1609,10 +1628,11 @@ fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert_eq!(low.tile_count, capacity, "case {case}");
         assert_eq!(
-            low.value_shards(low.outputs[0]).len(),
+            low.value_views(low.outputs[0]).len(),
             usize::from(selected_tiles)
         );
-        for &shard in low.value_shards(low.outputs[0]) {
+        for view in low.value_views(low.outputs[0]) {
+            let shard = view.shard;
             assert!(
                 low.shards[shard.index() as usize]
                     .extents
@@ -1783,8 +1803,8 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
             .div_ceil(u32::from(inner_partitions))
             .saturating_mul(columns.div_ceil(u32::from(column_partitions)))
             .saturating_mul(2);
-        assert!(low.value_shards(low.inputs[1].value).iter().all(|shard| {
-            crate::shard_storage_bytes(&low.shards[shard.index() as usize])
+        assert!(low.value_views(low.inputs[1].value).iter().all(|shard| {
+            crate::shard_storage_bytes(&low.shards[shard.shard.index() as usize])
                 == Ok(expected_weight_bytes)
         }));
     }
@@ -2096,7 +2116,7 @@ fn repeat_preserves_shared_initial_values() {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, false).unwrap();
         let placement = crate::place(&low).unwrap();
-        let initial = placement.shard_addresses[&low.value_shards(low.inputs[0].value)[0]];
+        let initial = placement.shard_addresses[&low.value_views(low.inputs[0].value)[0].shard];
         let repeat = &low.repeat_runs[0];
         for binding in &repeat.binding.carried {
             let result = placement.shard_addresses[&binding.result];
@@ -2231,7 +2251,8 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                                 ]
                             })
                             .collect::<Vec<_>>();
-                        let input_shard = low.value_shards(low.inputs[0].value)[0].index() as usize;
+                        let input_shard =
+                            low.value_views(low.inputs[0].value)[0].shard.index() as usize;
                         buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
                         for work in low.work(&low.tiles[0]) {
                             let copy = match work {
@@ -2274,7 +2295,8 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                             }
                         }
                         let window_shape = &mid.values[result.index() as usize].tensor_type.shape.0;
-                        let actual = &buffers[low.value_shards(low.outputs[0])[0].index() as usize];
+                        let actual =
+                            &buffers[low.value_views(low.outputs[0])[0].shard.index() as usize];
                         for source in 0..shape.iter().product::<u32>() {
                             let mut index = source;
                             let mut coordinates = vec![0; rank];
@@ -2508,7 +2530,9 @@ fn complete_panel_grid_stays_one_logical_exchange() {
             })
             .unwrap();
     }
-    let source = state.narrow_view(BlockValueId(0), &[(1, 0, 64)]).unwrap();
+    let source = state
+        .narrow_view(&state.full_view(BlockValueId(0)), &[(1, 0, 64)])
+        .unwrap();
     let destination = state.full_view(BlockValueId(1));
     let (mappings, order) = state
         .micro_panel_mappings(vec![(source.clone(), destination.clone())])
@@ -2606,8 +2630,12 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
     }
     let source = state.full_view(BlockValueId(0));
     let target = state.full_view(BlockValueId(1));
-    let clipped_source = state.narrow_view(BlockValueId(0), &[(1, 0, 12)]).unwrap();
-    let clipped_target = state.narrow_view(BlockValueId(2), &[(1, 0, 12)]).unwrap();
+    let clipped_source = state
+        .narrow_view(&state.full_view(BlockValueId(0)), &[(1, 0, 12)])
+        .unwrap();
+    let clipped_target = state
+        .narrow_view(&state.full_view(BlockValueId(2)), &[(1, 0, 12)])
+        .unwrap();
     let parts = super::mapping::split_mapping_at_panel_boundaries(
         &state.shards[0],
         clipped_source.clone(),

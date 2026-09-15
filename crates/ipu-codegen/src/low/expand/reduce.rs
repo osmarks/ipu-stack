@@ -29,8 +29,8 @@ impl TileGraphBuilder {
         else {
             return Err(ExpansionError::ResultArity);
         };
-        let sources = self.value_shards(*input)?.to_vec();
-        let outputs = self.value_shards(*output)?.to_vec();
+        let sources = self.allocation_shards(*input)?;
+        let outputs = self.allocation_shards(*output)?;
         let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<ShardView>>::new();
         for source in sources {
             let mut block = self.shards[source.index() as usize].clone();

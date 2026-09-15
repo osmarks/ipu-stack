@@ -13,8 +13,8 @@ impl TileGraphBuilder {
         let [result] = operation.results.as_slice() else {
             return Err(ExpansionError::ResultArity);
         };
-        let outputs = self.value_shards(*result)?.to_vec();
-        let inputs_by_tile = self.shards_by_tile(&operation.inputs)?;
+        let outputs = self.allocation_shards(*result)?;
+        let inputs_by_tile = self.views_by_tile(&operation.inputs)?;
         for output in outputs {
             let block = &self.shards[output.index() as usize];
             if block
@@ -30,7 +30,7 @@ impl TileGraphBuilder {
                 .iter()
                 .zip(&product.operands)
                 .map(|(tiles, window)| {
-                    let source = *tiles[usize::from(tile)]
+                    let source = tiles[usize::from(tile)]
                         .first()
                         .ok_or(ExpansionError::InvalidOperatorPlan)?;
                     self.window(source, window)
@@ -115,7 +115,7 @@ impl TileGraphBuilder {
             for k in (0..inner).step_by(*inner_block as usize) {
                 let width = (inner - k).min(*inner_block);
                 let l = self.narrow_view(
-                    left.shard,
+                    left,
                     &[(
                         left_inner,
                         left.extents[left_inner].start + k,
@@ -123,7 +123,7 @@ impl TileGraphBuilder {
                     )],
                 )?;
                 let r = self.narrow_view(
-                    right.shard,
+                    right,
                     &[
                         (
                             right_inner,
@@ -133,8 +133,10 @@ impl TileGraphBuilder {
                         (right_column, column, column_end),
                     ],
                 )?;
-                let destination =
-                    self.narrow_view(output, &[(output_column, column, column_end)])?;
+                let destination = self.narrow_view(
+                    &self.full_view(output),
+                    &[(output_column, column, column_end)],
+                )?;
                 let kernel = TileKernelSpec::Gemm {
                     multiply: product.multiply,
                     accumulate: product.accumulate,

@@ -41,7 +41,10 @@ impl TileGraphBuilder {
             })
             .collect::<Vec<_>>();
         for index in 0..repeat.carried_inputs {
-            for argument in self.value_shards(repeat.body.arguments[index])?.to_vec() {
+            for argument in self
+                .allocation_shards(repeat.body.arguments[index])?
+                .to_vec()
+            {
                 let initial = self.corresponding_shard(operation.inputs[index], argument)?;
                 let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
                 let result = self.corresponding_shard(operation.results[index], argument)?;
@@ -61,7 +64,7 @@ impl TileGraphBuilder {
             }
         }
         for index in repeat.carried_inputs..expected_inputs {
-            for &argument in self.value_shards(repeat.body.arguments[index])? {
+            for argument in self.allocation_shards(repeat.body.arguments[index])? {
                 let tile = self.shards[argument.index() as usize].tile;
                 bindings[usize::from(tile)]
                     .invariants
@@ -72,7 +75,9 @@ impl TileGraphBuilder {
             }
         }
         for (index, values) in repeat.iterated_inputs.iter().enumerate() {
-            for &argument in self.value_shards(repeat.body.arguments[expected_inputs + index])? {
+            for argument in
+                self.allocation_shards(repeat.body.arguments[expected_inputs + index])?
+            {
                 let inputs = values
                     .iter()
                     .map(|value| self.corresponding_shard(*value, argument))

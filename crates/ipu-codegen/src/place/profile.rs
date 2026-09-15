@@ -68,9 +68,9 @@ fn collect(
         .iter()
         .flat_map(|input| {
             program
-                .value_shards(input.value)
+                .value_views(input.value)
                 .iter()
-                .map(move |shard| (*shard, input))
+                .map(move |view| (view.shard, input))
         })
         .collect::<BTreeMap<_, _>>();
     let mut labels = Labels::default();
@@ -477,12 +477,13 @@ mod tests {
             .iter()
             .filter(|input| input.kind == crate::GraphInputKind::Parameter)
         {
-            for shard in low.value_shards(input.value) {
-                let tile = &report.tiles[usize::from(low.shards[shard.index() as usize].tile)];
+            for shard in low.value_views(input.value) {
+                let tile =
+                    &report.tiles[usize::from(low.shards[shard.shard.index() as usize].tile)];
                 let allocation = tile
                     .allocations
                     .iter()
-                    .find(|a| a.shards.contains(&shard.index()))
+                    .find(|a| a.shards.contains(&shard.shard.index()))
                     .unwrap();
                 assert_eq!((allocation.first, allocation.last), (0, u32::MAX));
                 assert!(allocation.start >= HOST_SCRATCH_RANGE.1);

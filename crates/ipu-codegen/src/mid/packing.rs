@@ -428,9 +428,9 @@ mod tests {
         );
         crate::place(&low).unwrap();
         let actual_tiles = low
-            .value_shards(packed)
+            .value_views(packed)
             .iter()
-            .map(|id| low.shards[id.index() as usize].tile)
+            .map(|id| low.shards[id.shard.index() as usize].tile)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             actual_tiles,

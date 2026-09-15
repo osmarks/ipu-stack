@@ -284,7 +284,7 @@ pub(crate) fn shard_elements(
     shard: &ipu_codegen::DiagnosticShard,
 ) -> Result<Vec<(usize, u32)>> {
     let logical_extents = shard
-        .storage
+        .view
         .extents
         .iter()
         .map(|extent| ShardExtent {
@@ -1041,6 +1041,67 @@ fn quantize(value: f32, precision: Precision) -> f32 {
 mod tests {
     use super::*;
     use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
+
+    #[test]
+    fn diagnostic_selection_preserves_backing_row_strides() -> Result<()> {
+        use ipu_codegen::{
+            BlockValue, BlockValueId, DiagnosticShard, Layout, ShardDefinition, TensorType,
+        };
+        let storage = BlockValue {
+            id: BlockValueId::from_index(0),
+            tile: 0,
+            tensor_type: TensorType::new([4, 8], Precision::F32, Layout::row_sharded(1)),
+            extents: vec![
+                ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: 4,
+                    physical_end: 4,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: 0,
+                    logical_end: 8,
+                    physical_end: 8,
+                },
+            ],
+            definition: ShardDefinition::Staging,
+        };
+        let shard = DiagnosticShard {
+            physical_tile: 0,
+            address: 0,
+            view: ShardView {
+                shard: storage.id,
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 1,
+                        logical_end: 3,
+                        physical_end: 3,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 2,
+                        logical_end: 5,
+                        physical_end: 5,
+                    },
+                ],
+            },
+            storage,
+        };
+        let tensor = DiagnosticTensor {
+            name: None,
+            value: ipu_codegen::ComputeGraph::new().host_input("selected", [3, 5])?,
+            shape: ipu_codegen::graph::TensorShape(vec![3, 5]),
+            precision: Precision::F32,
+            shards: vec![],
+        };
+        assert_eq!(
+            shard_elements(&tensor, &shard)?,
+            vec![(7, 40), (8, 44), (9, 48), (12, 72), (13, 76), (14, 80)]
+        );
+        Ok(())
+    }
 
     #[test]
     fn repeat_reference_binds_carried_invariant_and_iterated_values() -> Result<()> {

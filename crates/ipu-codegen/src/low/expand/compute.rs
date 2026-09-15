@@ -5,6 +5,20 @@ use super::*;
 use crate::tensor::Broadcast;
 use crate::{Compute, OperandIndexing, OperandWindow};
 
+/// Accesses that need a canonical allocation before family construction.
+/// Sum erases a contributor axis by reinterpreting whole allocations; an
+/// in-place result likewise cannot inherit a borrowed slice's backing stride.
+pub(super) fn allocation_inputs<'a>(
+    compute: &'a Compute,
+    inputs: &'a [MidValueId],
+) -> impl Iterator<Item = &'a MidValueId> {
+    let sum_input = matches!(compute, Compute::Sum { .. }).then_some(0);
+    sum_input
+        .into_iter()
+        .chain(compute.output_aliases().iter().map(|&(_, input)| input))
+        .filter_map(|index| inputs.get(index))
+}
+
 impl TileGraphBuilder {
     pub(super) fn build_compute(
         &mut self,
@@ -35,9 +49,9 @@ impl TileGraphBuilder {
                     .results
                     .first()
                     .ok_or(ExpansionError::ResultArity)?;
-                let outputs = self.value_shards(output)?.to_vec();
-                let inputs_by_tile = self.shards_by_tile(&operation.inputs)?;
-                let results_by_tile = self.shards_by_tile(&operation.results)?;
+                let outputs = self.allocation_shards(output)?;
+                let inputs_by_tile = self.views_by_tile(&operation.inputs)?;
+                let results_by_tile = self.views_by_tile(&operation.results)?;
                 // Results share the invocation distribution, even when their
                 // tensor ranks differ (for example residuals and row statistics).
                 if results_by_tile.iter().any(|result| {
@@ -63,7 +77,7 @@ impl TileGraphBuilder {
                     }
                     let results = results_by_tile
                         .iter()
-                        .map(|tiles| tiles[usize::from(tile)][ordinal])
+                        .map(|tiles| tiles[usize::from(tile)][ordinal].shard)
                         .collect::<Vec<_>>();
                     self.bind_compute_aliases(
                         &results,
@@ -78,7 +92,8 @@ impl TileGraphBuilder {
                     let inputs = inputs_by_tile
                         .iter()
                         .zip(operands)
-                        .map(|(tiles, indexing)| {
+                        .zip(&operation.inputs)
+                        .map(|((tiles, indexing), value)| {
                             let resident = &tiles[usize::from(tile)];
                             match indexing {
                                 OperandIndexing::Elementwise { result } => {
@@ -86,7 +101,15 @@ impl TileGraphBuilder {
                                         *results.get(*result).ok_or(ExpansionError::ResultArity)?;
                                     resident
                                         .iter()
-                                        .find_map(|&source| self.elementwise_view(source, output))
+                                        .find_map(|source| {
+                                            self.elementwise_view(
+                                                source,
+                                                &self.logical_values[value.index() as usize]
+                                                    .tensor_type
+                                                    .shape,
+                                                output,
+                                            )
+                                        })
                                         .ok_or(ExpansionError::InvalidOperatorPlan)
                                 }
                                 OperandIndexing::Local(window) => {
@@ -97,7 +120,7 @@ impl TileGraphBuilder {
                                     {
                                         return Err(ExpansionError::InvalidOperatorPlan);
                                     }
-                                    let source = *resident
+                                    let source = resident
                                         .get(index)
                                         .ok_or(ExpansionError::InvalidOperatorPlan)?;
                                     self.window(source, window)
@@ -141,13 +164,13 @@ impl TileGraphBuilder {
 
     pub(super) fn elementwise_view(
         &self,
-        source: BlockValueId,
+        source: &ShardView,
+        shape: &crate::TensorShape,
         output: BlockValueId,
     ) -> Option<ShardView> {
-        let input = &self.shards[source.index() as usize];
         let output = &self.shards[output.index() as usize];
-        let indexing = Broadcast::new(&input.tensor_type.shape.0, &output.tensor_type.shape.0)?;
-        let mut view = self.full_view(source);
+        let indexing = Broadcast::new(&shape.0, &output.tensor_type.shape.0)?;
+        let mut view = source.clone();
         for (axis, extent) in view.extents.iter_mut().enumerate() {
             if indexing.is_broadcast(axis) {
                 if extent.start != 0 || extent.logical_end == 0 {
@@ -175,7 +198,7 @@ impl TileGraphBuilder {
 
     pub(super) fn window(
         &self,
-        source: BlockValueId,
+        source: &ShardView,
         window: &OperandWindow,
     ) -> ExpansionResult<ShardView> {
         let ranges = window
@@ -188,16 +211,17 @@ impl TileGraphBuilder {
 
     /// Preserve per-tile fragment order without rescanning all shards for each
     /// output. Lifetime-only dependencies follow the explicit operands.
-    pub(super) fn shards_by_tile(
+    pub(super) fn views_by_tile(
         &self,
         inputs: &[MidValueId],
-    ) -> ExpansionResult<Vec<Vec<Vec<BlockValueId>>>> {
+    ) -> ExpansionResult<Vec<Vec<Vec<ShardView>>>> {
         inputs
             .iter()
             .map(|&value| {
                 let mut tiles = vec![Vec::new(); usize::from(self.tile_count)];
-                for &source in self.value_shards(value)? {
-                    tiles[usize::from(self.shards[source.index() as usize].tile)].push(source);
+                for source in self.value_views(value)? {
+                    tiles[usize::from(self.shards[source.shard.index() as usize].tile)]
+                        .push(source.clone());
                 }
                 Ok(tiles)
             })
@@ -208,7 +232,7 @@ impl TileGraphBuilder {
         &mut self,
         outputs: &[BlockValueId],
         aliases: &[(usize, usize)],
-        inputs_by_tile: &[Vec<Vec<BlockValueId>>],
+        inputs_by_tile: &[Vec<Vec<ShardView>>],
         offset: i32,
     ) -> ExpansionResult<()> {
         for &(result, input) in aliases {
@@ -216,11 +240,11 @@ impl TileGraphBuilder {
             let tile = self.shards[target.index() as usize].tile;
             let previous = inputs_by_tile[input][usize::from(tile)]
                 .iter()
-                .copied()
-                .find(|&source| {
-                    self.shards[source.index() as usize].extents
-                        == self.shards[target.index() as usize].extents
+                .find(|source| {
+                    source.extents == self.shards[target.index() as usize].extents
+                        && source.extents == self.shards[source.shard.index() as usize].extents
                 })
+                .map(|source| source.shard)
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
             self.shards[target.index() as usize].definition = if offset == 0 {
                 ShardDefinition::WritableAlias(previous)

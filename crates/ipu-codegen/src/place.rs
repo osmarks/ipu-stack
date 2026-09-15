@@ -450,11 +450,11 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
         .collect::<Vec<_>>();
     let mut lifetimes = vec![Lifetime::default(); program.shards.len()];
     for input in &program.inputs {
-        for shard in program.value_shards(input.value) {
-            lifetimes[shard.index() as usize].touch(0);
+        for shard in program.value_views(input.value) {
+            lifetimes[shard.shard.index() as usize].touch(0);
             // initialize uploads parameters once; every subsequent run needs them.
             if input.kind == crate::GraphInputKind::Parameter {
-                lifetimes[shard.index() as usize].touch(u32::MAX);
+                lifetimes[shard.shard.index() as usize].touch(u32::MAX);
             }
         }
     }
@@ -473,8 +473,8 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     }
     // The host reads every output only after device work has finished.
     for output in &program.outputs {
-        for shard in program.value_shards(*output) {
-            lifetimes[shard.index() as usize].touch(u32::MAX);
+        for shard in program.value_views(*output) {
+            lifetimes[shard.shard.index() as usize].touch(u32::MAX);
         }
     }
     for (index, lifetime) in lifetimes.iter_mut().enumerate() {
@@ -1373,9 +1373,9 @@ mod tests {
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
             let analysis = analyze_allocations(&low).unwrap();
             let roots = low
-                .value_shards(low.inputs[0].value)
+                .value_views(low.inputs[0].value)
                 .iter()
-                .map(|id| analysis.root_of_member[id.index() as usize])
+                .map(|id| analysis.root_of_member[id.shard.index() as usize])
                 .collect::<BTreeSet<_>>();
             for run in &low.kernel_runs {
                 assert!(run.outputs.iter().all(|out| {
@@ -1850,13 +1850,13 @@ mod tests {
             .unwrap()
             .clone();
         program.body.operations.extend([work.clone(), work]);
-        program.value_shards[program.outputs[0].index() as usize].reverse();
+        program.value_views[program.outputs[0].index() as usize].reverse();
         let low = lower_to_tiles(&std::sync::Arc::new(program), false);
         let lifetimes = collect_lifetimes(&low);
-        for &id in low.value_shards(low.outputs[0]) {
-            let tile = low.shards[id.index() as usize].tile;
+        for id in low.value_views(low.outputs[0]) {
+            let tile = low.shards[id.shard.index() as usize].tile;
             assert_eq!(
-                lifetimes[id.index() as usize].last,
+                lifetimes[id.shard.index() as usize].last,
                 u32::MAX,
                 "output on tile {tile}"
             );
@@ -2008,9 +2008,9 @@ mod tests {
             let placement = place(&low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {
-                    low.value_shards(value)
+                    low.value_views(value)
                         .iter()
-                        .copied()
+                        .map(|view| view.shard)
                         .find(|id| low.shards[id.index() as usize].tile == tile)
                         .unwrap()
                 };

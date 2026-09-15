@@ -496,7 +496,7 @@ mod tests {
             },
             inputs: vec![],
             outputs: vec![],
-            value_shards: vec![],
+            value_views: vec![],
             logical_values: vec![],
             checkpoints: vec![],
         };

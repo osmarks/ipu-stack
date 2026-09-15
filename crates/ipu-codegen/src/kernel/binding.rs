@@ -177,6 +177,11 @@ impl KernelRun {
             if view.shard != shard.id || shard.tile != tile {
                 return Err(KernelAbiError::RequirementMismatch.into());
             }
+            if shards[crate::storage_root(shards, view.shard).index() as usize].definition
+                == crate::ShardDefinition::Unmaterialized
+            {
+                return Err(StorageError::InvalidView.into());
+            }
             crate::storage::validate_view(shard.storage(), &view.extents)?;
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;

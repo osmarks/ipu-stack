@@ -312,8 +312,9 @@ pub struct TileGraph {
     pub body: BlockRegion,
     pub kernel_runs: Vec<KernelRun>,
     pub local_copies: Vec<LocalCopy>,
-    /// Canonical shards indexed by MidValueId; empty for unmaterialized values.
-    pub value_shards: Vec<Vec<BlockValueId>>,
+    /// Concrete reads indexed by MidValueId, including borrowed selections.
+    /// Logical shapes remain in logical_values; backing strides belong to shards.
+    pub value_views: Vec<Vec<ShardView>>,
     pub outputs: Vec<MidValueId>,
     pub logical_values: Vec<MidValue>,
     pub checkpoints: Vec<(OperationId, Vec<MidValueId>)>,
@@ -344,8 +345,8 @@ impl TileGraph {
         counts
     }
 
-    pub fn value_shards(&self, value: MidValueId) -> &[BlockValueId] {
-        &self.value_shards[value.index() as usize]
+    pub fn value_views(&self, value: MidValueId) -> &[ShardView] {
+        &self.value_views[value.index() as usize]
     }
 
     pub(crate) fn kernel_calls(&self) -> impl Iterator<Item = &KernelRun> {

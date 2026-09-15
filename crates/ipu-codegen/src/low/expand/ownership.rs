@@ -9,12 +9,12 @@ use super::*;
 
 #[derive(Clone)]
 struct Owners {
-    first: (usize, BlockValueId),
-    local: BTreeMap<u16, (usize, BlockValueId)>,
+    first: usize,
+    local: BTreeMap<u16, usize>,
 }
 
 impl Owners {
-    fn insert(&mut self, tile: u16, owner: (usize, BlockValueId)) {
+    fn insert(&mut self, tile: u16, owner: usize) {
         self.first = self.first.min(owner);
         self.local
             .entry(tile)
@@ -28,8 +28,8 @@ impl Owners {
         }
     }
 
-    fn select(&self, tile: u16) -> BlockValueId {
-        self.local.get(&tile).unwrap_or(&self.first).1
+    fn select(&self, tile: u16) -> usize {
+        *self.local.get(&tile).unwrap_or(&self.first)
     }
 }
 
@@ -41,22 +41,22 @@ pub(super) struct CopyRegions {
 }
 
 impl CopyRegions {
-    pub(super) fn new(shards: &[BlockValue], sources: &[BlockValueId]) -> Self {
+    pub(super) fn new(shards: &[BlockValue], sources: &[ShardView]) -> Self {
         let mut regions = BTreeMap::<Vec<ShardExtent>, Owners>::new();
-        for (index, &id) in sources.iter().enumerate() {
-            let shard = &shards[id.index() as usize];
+        for (index, view) in sources.iter().enumerate() {
+            let shard = &shards[view.shard.index() as usize];
             // Intersection geometry excludes padding. The selected shard still
             // determines shared padding later, where the copy order is known.
-            let mut extents = shard.extents.clone();
+            let mut extents = view.extents.clone();
             for extent in &mut extents {
                 extent.physical_end = extent.logical_end;
             }
             regions
                 .entry(extents)
-                .and_modify(|owners| owners.insert(shard.tile, (index, id)))
+                .and_modify(|owners| owners.insert(shard.tile, index))
                 .or_insert_with(|| Owners {
-                    first: (index, id),
-                    local: BTreeMap::from([(shard.tile, (index, id))]),
+                    first: index,
+                    local: BTreeMap::from([(shard.tile, index)]),
                 });
         }
         let mut sources = regions
@@ -99,7 +99,7 @@ impl CopyRegions {
         &mut self,
         target: &[ShardExtent],
         tile: u16,
-    ) -> Vec<(Vec<ShardExtent>, BlockValueId)> {
+    ) -> Vec<(Vec<ShardExtent>, usize)> {
         let mut key = target.to_vec();
         for extent in &mut key {
             extent.physical_end = extent.logical_end;
@@ -168,16 +168,14 @@ mod tests {
     // replica ownership was grouped. Keep ordering and clipped-region merging.
     fn reference(
         shards: &[BlockValue],
-        sources: &[BlockValueId],
+        sources: &[ShardView],
         target: &[ShardExtent],
         tile: u16,
-    ) -> Vec<(Vec<ShardExtent>, BlockValueId)> {
-        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<BlockValueId>>::new();
-        for &source in sources {
-            if let Some(extents) =
-                intersect_extents(&shards[source.index() as usize].extents, target)
-            {
-                groups.entry(extents).or_default().push(source);
+    ) -> Vec<(Vec<ShardExtent>, usize)> {
+        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<usize>>::new();
+        for (index, source) in sources.iter().enumerate() {
+            if let Some(extents) = intersect_extents(&source.extents, target) {
+                groups.entry(extents).or_default().push(index);
             }
         }
         groups
@@ -186,7 +184,7 @@ mod tests {
                 let selected = owners
                     .iter()
                     .copied()
-                    .find(|id| shards[id.index() as usize].tile == tile)
+                    .find(|&index| shards[sources[index].shard.index() as usize].tile == tile)
                     .unwrap_or(owners[0]);
                 (extents, selected)
             })
@@ -215,7 +213,20 @@ mod tests {
                     value
                 })
                 .collect::<Vec<_>>();
-            let mut sources = shards.iter().map(|s| s.id).collect::<Vec<_>>();
+            let mut sources = shards
+                .iter()
+                .map(|s| ShardView {
+                    shard: s.id,
+                    extents: s.extents.clone(),
+                })
+                .collect::<Vec<_>>();
+            for view in sources.clone().into_iter().take(8) {
+                let axis = usize::from(case % 2 == 0);
+                let mut selected = view;
+                let extent = &mut selected.extents[axis];
+                extent.start += (extent.logical_end - extent.start) / 2;
+                sources.push(selected);
+            }
             random.shuffle(&mut sources);
             let mut regions = CopyRegions::new(&shards, &sources);
             for _ in 0..16 {
@@ -237,20 +248,23 @@ mod tests {
         let shards = (0..1472)
             .map(|id| shard(id, id as u16, 0, 4096, id % 8))
             .collect::<Vec<_>>();
-        let sources = shards.iter().map(|s| s.id).collect::<Vec<_>>();
+        let sources = shards
+            .iter()
+            .map(|s| ShardView {
+                shard: s.id,
+                extents: s.extents.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut regions = CopyRegions::new(&shards, &sources);
         for tile in 0..1472 {
             assert_eq!(
                 regions.intersections(&shards[tile as usize].extents, tile)[0].1,
-                sources[tile as usize]
+                tile as usize
             );
         }
         assert_eq!(regions.sources.len(), 1);
         assert_eq!(regions.targets.len(), 1);
-        assert_eq!(
-            regions.intersections(&shards[0].extents, 1472)[0].1,
-            sources[0]
-        );
+        assert_eq!(regions.intersections(&shards[0].extents, 1472)[0].1, 0);
     }
 
     #[test]
@@ -275,7 +289,13 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            let sources = shards.iter().map(|s| s.id).collect::<Vec<_>>();
+            let sources = shards
+                .iter()
+                .map(|s| ShardView {
+                    shard: s.id,
+                    extents: s.extents.clone(),
+                })
+                .collect::<Vec<_>>();
             let targets = (0..target_parts * target_replicas)
                 .map(|id| {
                     let part = id / target_replicas;

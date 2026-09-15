@@ -56,8 +56,8 @@ fn exported_copies_have_complete_storage_and_preserve_identity_reuse() {
         let mid = copied_columns(columns);
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        let input = low.value_shards(low.inputs[0].value)[0];
-        let output = low.value_shards(low.outputs[0])[0];
+        let input = low.value_views(low.inputs[0].value)[0].shard;
+        let output = low.value_views(low.outputs[0])[0].shard;
         assert_ne!(
             low.shards[output.index() as usize].definition,
             ShardDefinition::Unmaterialized
@@ -135,7 +135,7 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
             .iter()
             .any(|phase| !phase.transfers.is_empty())
     );
-    let source = low.value_shards(low.inputs[0].value)[0];
+    let source = low.value_views(low.inputs[0].value)[0].shard;
     assert!(
         low.local_copies
             .iter()
@@ -189,11 +189,16 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
     }
     let graph = expand_tiles(&mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
-    let source = low.value_shards(low.inputs[0].value)[0];
-    let placeholder = low.value_shards(mid.values[1].id)[0];
+    let source = low.value_views(low.inputs[0].value)[0].shard;
+    let borrowed = &low.value_views(mid.values[1].id)[0];
+    assert_eq!(borrowed.shard, source);
     assert_eq!(
-        low.shards[placeholder.index() as usize].definition,
-        ShardDefinition::Unmaterialized
+        borrowed.extents[1].physical_end - borrowed.extents[1].start,
+        8
+    );
+    assert_eq!(
+        low.shards[source.index() as usize].extents[1].physical_end,
+        16
     );
     assert!(!low.exchange_phases.is_empty());
     for transfer in low
@@ -218,11 +223,6 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
-    assert!(
-        low.local_copies
-            .iter()
-            .all(|copy| copy.source != placeholder)
-    );
     crate::place(&low).unwrap();
 }
 
@@ -289,7 +289,10 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         .unwrap();
     run.call().unwrap();
     let scalar = &run.inputs[1];
-    assert_eq!(scalar.shard, graph.value_shards(graph.inputs[0].value)[0]);
+    assert_eq!(
+        scalar.shard,
+        graph.value_views(graph.inputs[0].value)[0].shard
+    );
     assert!(
         scalar
             .extents
@@ -443,8 +446,12 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
         mid.values.push(result);
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        let copied = low.value_shards(mid.values[1].id);
-        for &shard in copied {
+        let copied = low
+            .value_views(mid.values[1].id)
+            .iter()
+            .map(|view| view.shard)
+            .collect::<Vec<_>>();
+        for &shard in &copied {
             assert_ne!(
                 low.shards[shard.index() as usize].definition,
                 ShardDefinition::Unmaterialized
@@ -454,21 +461,22 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             run.call().unwrap();
         }
         let placement = crate::place(&low).unwrap();
-        for &shard in copied {
+        for &shard in &copied {
             let source = low
-                .value_shards(low.inputs[0].value)
+                .value_views(low.inputs[0].value)
                 .iter()
                 .find(|id| {
-                    low.shards[id.index() as usize].tile == low.shards[shard.index() as usize].tile
+                    low.shards[id.shard.index() as usize].tile
+                        == low.shards[shard.index() as usize].tile
                 })
                 .unwrap();
             assert_ne!(
                 placement.shard_addresses[&shard],
-                placement.shard_addresses[source]
+                placement.shard_addresses[&source.shard]
             );
         }
         if !sum {
-            let output = low.value_shards(low.outputs[1])[0];
+            let output = low.value_views(low.outputs[1])[0].shard;
             assert_eq!(
                 placement.shard_addresses[&output],
                 placement.shard_addresses[&copied[0]]

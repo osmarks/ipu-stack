@@ -123,9 +123,14 @@ shares workspace geometry between construction and local call validation;
 assembly receives explicit pointers. PV no longer copies a probability prefix,
 merge consumes FP32 statistics without key-size/weight-precision specialization,
 and the finite-padding proof no longer recognizes attention names. Initial merge
-calls also no longer fabricate a previous-state operand. Resolved storage reads,
-local-copy binding, remaining movement policies and cache consolidation are still
-unfinished.
+calls also no longer fabricate a previous-state operand.
+Low now retains concrete value views separately from logical shapes. Borrowed
+copies update those bindings; kernels and copies consume them before geometry.
+The borrowed-view repair map and its late resolution calls are removed. Source
+region ownership and diagnostics retain selections as well as backing storage.
+Compute dispatch owns its canonical-allocation declarations, while Repeat keeps
+explicit region requirements. Shared alias-relative access geometry, local-copy
+binding, remaining movement policies and cache consolidation are still unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

@@ -2758,6 +2758,10 @@ mod tests {
                 tensor.shards.push(DiagnosticShard {
                     physical_tile: physical[tile as usize],
                     address,
+                    view: ipu_codegen::ShardView {
+                        shard: storage.id,
+                        extents: storage.extents.clone(),
+                    },
                     storage,
                 });
                 file_offset += size + random.u64(0..=4) * 2;

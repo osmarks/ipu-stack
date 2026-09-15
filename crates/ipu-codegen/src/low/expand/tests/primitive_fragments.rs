@@ -159,9 +159,9 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
     mid.validate().unwrap();
     let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
     assert!(
-        low.value_shards[1]
+        low.value_views[1]
             .iter()
-            .all(|id| low.shards[id.index() as usize].tile == 5)
+            .all(|id| low.shards[id.shard.index() as usize].tile == 5)
     );
     let reductions = low
         .kernel_runs

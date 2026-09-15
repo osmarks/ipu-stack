@@ -273,9 +273,9 @@ fn recipe_can_place_gemm_partials_and_reduction_on_different_tiles() {
             .walk_operations()
             .find(|op| op.result_site(0).as_ref() == Some(result))
             .unwrap();
-        low.value_shards(op.results[0])
+        low.value_views(op.results[0])
             .iter()
-            .map(|id| low.shards[id.index() as usize].tile)
+            .map(|id| low.shards[id.shard.index() as usize].tile)
             .collect::<BTreeSet<_>>()
     };
     assert_eq!(tiles(&product), (0..8).map(|i| 2 * i).collect());
@@ -2669,8 +2669,8 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         .chain(
             low.inputs
                 .iter()
-                .flat_map(|input| low.value_shards(input.value))
-                .map(|&id| crate::storage_root(&low.shards, id)),
+                .flat_map(|input| low.value_views(input.value))
+                .map(|view| crate::storage_root(&low.shards, view.shard)),
         )
         .collect::<BTreeSet<_>>();
     for run in &low.kernel_runs {

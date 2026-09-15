@@ -360,20 +360,29 @@ ABI lookup, symbolic scalar-getter list and specialization reconstruction are
 removed. Fixed entry points and parameterized implementations use one identity
 enum; there is no unspecified specialization for another pass to discover.
 FP8 output epilogues share their contract with mid fusion, and optimistic cast
-and packing queries use their families' capabilities. Mixed-state/local-copy
-contracts and wider sharing of cost geometry remain to be refactored.
+and packing queries use their families' capabilities. Local-copy contracts and
+wider sharing of alias-relative access geometry remain to be refactored.
 After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
 groups exchanges across commuting local copies, then merges adjacent copies.
 It checks read/write hazards against completed storage bindings and respects
 compute, Repeat and checkpoint boundaries. It compacts the exchange arena and
 remaps references in all regions before the relay and padding passes run.
 
-[buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs) also mediates borrowed
-storage. `full_view` resolves a borrowed binding automatically, while other paths
-must call `resolve_read_view` before using physical geometry. That caller-dependent
-contract is separate from coordinate mapping and from following storage aliases
-with signed byte displacements. The proposal makes this access boundary explicit
-alongside movement and kernel binding.
+[buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs) binds logical values
+to concrete `ShardView`s. A borrowed copy replaces the result's binding with its
+source selection; subsequent consumers receive that view before inspecting
+geometry. `full_view` only describes a complete physical allocation. The separate
+borrowed-view map and late read-repair calls are removed. Low retains these value
+views, including selections, and diagnostic reads use them too.
+
+Logical shapes remain in `logical_values`: a scalar borrowed from a larger buffer
+still broadcasts as a scalar. Backing extents remain on the physical shard, so
+the scalar or cropped rows do not acquire a fictitious dense stride. Copy-region
+ownership indexes source views, allowing several selections of one backing shard.
+Compute dispatch declares its current canonical-allocation needs (Sum's axis
+reinterpretation and in-place results); Repeat declares its structured bindings.
+Both validate complete storage where required. Wider consolidation of these view
+bindings with signed allocation-relative alias addressing remains unfinished.
 
 ## What each later representation is for
 
@@ -527,9 +536,8 @@ uses standard hash maps. These are not all caches of the same computation.
 Family fragments are built by the constructor and consumed by costing;
 `CostModel` no longer constructs or caches executable programs.
 
-`borrowed_views` is different: it records storage substitutions made during
-expansion. It is mutable lowering state, not a memoization cache, and cannot be
-shared between candidates.
+`value_views` records actual storage bindings and is retained in low. It is
+program state, not a memoization cache, and cannot be shared between candidates.
 
 Exchange selection receives `stream_words` explicitly from the pipeline policy,
 separately from the cache. The cache records which policy produced each entry;

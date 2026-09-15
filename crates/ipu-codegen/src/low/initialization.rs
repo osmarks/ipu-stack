@@ -18,7 +18,7 @@ fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
     let mut readers = program
         .outputs
         .iter()
-        .flat_map(|&output| program.value_shards(output).iter().copied())
+        .flat_map(|&output| program.value_views(output).iter().map(|view| view.shard))
         .collect::<BTreeSet<_>>();
     for operation in program.body.walk() {
         match operation {
@@ -123,7 +123,12 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
         .inputs
         .iter()
         .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .flat_map(|input| program.value_shards(input.value).iter().copied())
+        .flat_map(|input| {
+            program
+                .value_views(input.value)
+                .iter()
+                .map(|view| view.shard)
+        })
         .map(root)
         .collect::<BTreeSet<_>>();
     let mut incoming = std::collections::BTreeMap::<BlockValueId, BTreeSet<BlockValueId>>::new();
@@ -361,7 +366,7 @@ mod tests {
                 ),
             ],
             local_copies: Vec::new(),
-            value_shards: vec![vec![BlockValueId(1)], vec![BlockValueId(0)]],
+            value_views: vec![vec![view(1)], vec![view(0)]],
             outputs: Vec::new(),
             logical_values: Vec::new(),
             checkpoints: Vec::new(),

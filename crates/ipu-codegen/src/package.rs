@@ -152,6 +152,7 @@ pub struct DiagnosticShard {
     pub physical_tile: u16,
     pub address: u32,
     pub storage: crate::BlockValue,
+    pub view: crate::ShardView,
 }
 
 pub(crate) fn package_multiply_precisions(
@@ -445,22 +446,24 @@ pub(crate) fn diagnostic_tensor(
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
     let shards = low
-        .value_shards(value)
+        .value_views(value)
         .iter()
-        .filter_map(|id| {
-            let storage = low.shards.get(id.index() as usize)?;
-            (storage.definition != crate::ShardDefinition::Unmaterialized).then_some((id, storage))
+        .filter_map(|view| {
+            let storage = low.shards.get(view.shard.index() as usize)?;
+            (storage.definition != crate::ShardDefinition::Unmaterialized)
+                .then_some((view, storage))
         })
-        .map(|(id, storage)| {
+        .map(|(view, storage)| {
             let address = placement
                 .shard_addresses
-                .get(id)
+                .get(&view.shard)
                 .copied()
                 .ok_or_else(|| invalid("diagnostic shard placement is missing"))?;
             Ok(DiagnosticShard {
                 physical_tile: topology.physical(storage.tile)?,
                 address,
                 storage: storage.clone(),
+                view: view.clone(),
             })
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;

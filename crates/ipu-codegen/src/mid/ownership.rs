@@ -410,10 +410,10 @@ mod tests {
         let low = crate::low::lower_to_tiles(&graph, false);
         let placement = crate::place(&low).unwrap();
         let donation = program.operations.last().unwrap().inputs[1];
-        let donation = low.value_shards(donation)[0];
-        let output = low.value_shards(id(2))[0];
+        let donation = low.value_views(donation)[0].shard;
+        let output = low.value_views(id(2))[0].shard;
         assert_eq!(
-            low.shards[low.value_shards(id(1))[0].index() as usize].tile,
+            low.shards[low.value_views(id(1))[0].shard.index() as usize].tile,
             1
         );
         // The family's owner 5 maps to tile 2; it does not become owner 0 of

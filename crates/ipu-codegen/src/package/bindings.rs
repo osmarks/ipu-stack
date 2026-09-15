@@ -28,7 +28,7 @@ impl PackageBindings {
                 placement,
                 topology,
                 input.name.clone(),
-                program.value_shards(input.value),
+                program.value_views(input.value),
             )?);
         }
         let mut outputs = program
@@ -41,7 +41,7 @@ impl PackageBindings {
                     placement,
                     topology,
                     format!("output.{index}"),
-                    program.value_shards(*output),
+                    program.value_views(*output),
                 )
             })
             .collect::<PackageBuildResult<Vec<_>>>()?;
@@ -106,11 +106,11 @@ fn binding(
     placement: &crate::Placement,
     topology: &Topology,
     name: String,
-    shards: &[crate::BlockValueId],
+    views: &[crate::ShardView],
 ) -> PackageBuildResult<Binding> {
-    let first = shards
+    let first = views
         .first()
-        .and_then(|id| program.shards.get(id.index() as usize))
+        .and_then(|view| program.shards.get(view.shard.index() as usize))
         .ok_or_else(|| invalid("binding has no shards"))?;
     let dtype = match first.tensor_type.format.precision {
         crate::Precision::F8F143 { .. } => "f8f143",
@@ -118,16 +118,21 @@ fn binding(
         crate::Precision::F32 => "f32",
     };
     let mut file_offset = 0u64;
-    let slices = shards
+    let slices = views
         .iter()
-        .map(|id| {
-            let shard = &program.shards[id.index() as usize];
+        .map(|view| {
+            let shard = &program.shards[view.shard.index() as usize];
+            if view.extents != shard.extents {
+                return Err(invalid(
+                    "host binding requires canonical whole-buffer storage",
+                ));
+            }
             let size = u64::from(shard_storage_bytes(shard)?);
             let slice = RegionSlice {
                 tile: u32::from(topology.physical(shard.tile)?),
                 tile_address: *placement
                     .shard_addresses
-                    .get(id)
+                    .get(&view.shard)
                     .ok_or_else(|| invalid("binding shard is not placed"))?,
                 file_offset,
                 size,

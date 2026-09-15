@@ -413,8 +413,8 @@ mod tests {
             let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
             let low = crate::low::lower_to_tiles(&graph, false);
             let placement = crate::place::place(&low).unwrap();
-            let parameter = low.value_shards(low.inputs[0].value)[0];
-            let output = low.value_shards(low.outputs[0])[0];
+            let parameter = low.value_views(low.inputs[0].value)[0].shard;
+            let output = low.value_views(low.outputs[0])[0].shard;
             let crate::ShardDefinition::ShiftedAlias {
                 source: input,
                 offset: -32768,
@@ -583,7 +583,7 @@ mod tests {
         mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        assert_eq!(low.value_shards(low.outputs[0]).len(), 2);
+        assert_eq!(low.value_views(low.outputs[0]).len(), 2);
         let placement = crate::place::place(&low).unwrap();
         let casts = low
             .kernel_runs

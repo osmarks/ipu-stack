@@ -104,7 +104,7 @@ pub(crate) fn expand_tiles_analyzed(
         .map(|input| input.value)
         .chain(graph.outputs.iter().copied())
     {
-        state.value_shards(value)?;
+        state.value_views(value)?;
     }
     let mut program = TileGraph {
         tile_count: graph.tile_count,
@@ -115,9 +115,9 @@ pub(crate) fn expand_tiles_analyzed(
         body,
         kernel_runs: state.kernel_runs,
         local_copies: state.local_copies,
-        value_shards: state.canonical,
+        value_views: state.bindings,
         outputs: graph.outputs.clone(),
-        logical_values: graph.values.clone(),
+        logical_values: state.logical_values,
         checkpoints: graph
             .operations
             .iter()
@@ -160,14 +160,14 @@ struct TileGraphBuilder {
     tile_count: u16,
     storage_groups: Vec<MidValueId>,
     shards: Vec<BlockValue>,
-    canonical: Vec<Vec<BlockValueId>>,
+    bindings: Vec<Vec<ShardView>>,
+    logical_values: Vec<crate::MidValue>,
     exported_values: BTreeSet<MidValueId>,
     required_storage: BTreeSet<MidValueId>,
     phases: Vec<ExchangePhase>,
     kernel_runs: Vec<KernelRun>,
     local_copies: Vec<LocalCopy>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
-    borrowed_views: BTreeMap<BlockValueId, ShardView>,
 }
 
 impl TileGraphBuilder {
@@ -182,14 +182,14 @@ impl TileGraphBuilder {
                 .map(|value| value.storage_group)
                 .collect(),
             shards: Vec::new(),
-            canonical: vec![Vec::new(); graph.values.len()],
+            bindings: vec![Vec::new(); graph.values.len()],
+            logical_values: graph.values.clone(),
             exported_values: graph.outputs.iter().copied().collect(),
             required_storage: BTreeSet::new(),
             phases: Vec::new(),
             kernel_runs: Vec::new(),
             local_copies: Vec::new(),
             kernel_metadata: Vec::new(),
-            borrowed_views: BTreeMap::new(),
         };
         let mut used = graph
             .inputs
@@ -204,22 +204,9 @@ impl TileGraphBuilder {
         ) {
             for operation in operations {
                 used.extend(operation.read_values().chain(&operation.results).copied());
-                // These ABIs bind or reshape an entire canonical allocation;
-                // a borrowed view with different backing strides is insufficient.
-                match &operation.kind {
-                    MidOperationKind::Compute(Compute::Sum { .. }) => {
-                        bindings.extend(operation.inputs.iter().copied());
-                    }
-                    MidOperationKind::Compute(compute) => {
-                        let output_aliases = compute.output_aliases();
-                        bindings.extend(
-                            output_aliases
-                                .iter()
-                                .filter_map(|&(_, input)| operation.inputs.get(input))
-                                .copied(),
-                        );
-                    }
-                    _ => {}
+                if let MidOperationKind::Compute(compute) = &operation.kind {
+                    bindings
+                        .extend(compute::allocation_inputs(compute, &operation.inputs).copied());
                 }
                 if let MidOperationKind::Repeat(repeat) = &operation.kind {
                     used.extend(
@@ -253,7 +240,7 @@ impl TileGraphBuilder {
                 .owners
                 .validate(layout.tiling.tile_count, tile_count)?;
             let extents = layout.shard_extents(&value.tensor_type.shape)?;
-            let mut value_shards = Vec::with_capacity(extents.len());
+            let mut value_views = Vec::with_capacity(extents.len());
             for (owner, extents) in extents {
                 let id = state.push_shard(BlockValue {
                     id: BlockValueId(0),
@@ -267,9 +254,9 @@ impl TileGraphBuilder {
                     extents,
                     definition: ShardDefinition::Value(value.id),
                 })?;
-                value_shards.push(id);
+                value_views.push(state.full_view(id));
             }
-            state.canonical[value.id.index() as usize] = value_shards;
+            state.bindings[value.id.index() as usize] = value_views;
         }
         Ok(state)
     }

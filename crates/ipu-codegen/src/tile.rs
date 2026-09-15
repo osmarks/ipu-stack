@@ -728,7 +728,7 @@ mod tests {
             inputs: vec![],
             body: Default::default(),
             kernel_runs: vec![],
-            value_shards: vec![],
+            value_views: vec![],
             outputs: vec![],
             logical_values: vec![],
             checkpoints: vec![],

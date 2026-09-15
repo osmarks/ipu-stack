@@ -35,8 +35,12 @@ impl TileGraphBuilder {
         else {
             return Err(ExpansionError::ResultArity);
         };
-        let inputs = self.value_shards(*input)?.to_vec();
-        let outputs = self.value_shards(*output)?.to_vec();
+        let inputs = self.value_views(*input)?.to_vec();
+        let outputs = self.allocation_shards(*output)?;
+        let source_shape = self.logical_values[input.index() as usize]
+            .tensor_type
+            .shape
+            .clone();
         // Whole-buffer bindings require canonical storage with its own strides.
         let reuse_local = reuse_local
             && packing == PackingPolicy::Automatic
@@ -66,13 +70,20 @@ impl TileGraphBuilder {
         let source_order = self.shards[inputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
+            .shard
             .index() as usize]
             .tensor_type
             .format
             .layout
             .order;
         let (mappings, order) = if let Some(view) = mapping.view {
-            let mappings = self.window_view_mappings(&inputs, &outputs, view, &mapping.offsets)?;
+            let mappings = self.window_view_mappings(
+                &inputs,
+                &source_shape,
+                &outputs,
+                view,
+                &mapping.offsets,
+            )?;
             if packing != PackingPolicy::Staged
                 && let Some(physical) = self.micro_panel_mappings(mappings.clone())?
             {
@@ -90,7 +101,13 @@ impl TileGraphBuilder {
                     .unpack_amp_to_row_major(*input, provenance, body)?
                     .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 (
-                    self.window_view_mappings(&unpacked, &outputs, view, &mapping.offsets)?,
+                    self.window_view_mappings(
+                        &unpacked,
+                        &source_shape,
+                        &outputs,
+                        view,
+                        &mapping.offsets,
+                    )?,
                     CopyOrder::Semantic,
                 )
             } else {
@@ -145,19 +162,19 @@ impl TileGraphBuilder {
         source: MidValueId,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> ExpansionResult<Option<Vec<BlockValueId>>> {
-        let sources = self.value_shards(source)?.to_vec();
-        for &source_shard in &sources {
-            let source = &self.shards[source_shard.index() as usize];
-            let compatible = source.extents.len() >= 2
+    ) -> ExpansionResult<Option<Vec<ShardView>>> {
+        let sources = self.value_views(source)?.to_vec();
+        for source_view in &sources {
+            let source = &self.shards[source_view.shard.index() as usize];
+            let compatible = source_view.extents.len() >= 2
                 && source.tensor_type.format.precision == Precision::F16
                 && match source.tensor_type.format.layout.order {
                     ElementOrder::Amp(AmpOrder::Output) => {
-                        let columns = source.extents[source.extents.len() - 1];
+                        let columns = source_view.extents[source_view.extents.len() - 1];
                         (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
                     ElementOrder::Amp(AmpOrder::TransposedLeft) => {
-                        let rows = source.extents[source.extents.len() - 2];
+                        let rows = source_view.extents[source_view.extents.len() - 2];
                         (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
                     ElementOrder::BlockMajor(_) => true,
@@ -165,47 +182,49 @@ impl TileGraphBuilder {
                 };
             if !compatible {
                 tracing::debug!(
-                    shard = source_shard.index(),
-                    rank = source.extents.len(),
+                    shard = source_view.shard.index(),
+                    rank = source_view.extents.len(),
                     precision = ?source.tensor_type.format.precision,
                     order = ?source.tensor_type.format.layout.order,
-                    extents = ?source.extents,
+                    extents = ?source_view.extents,
                     "cannot unpack source storage into row-major order"
                 );
                 return Ok(None);
             }
         }
 
-        let mut staging_shards = Vec::with_capacity(sources.len());
-        for source_shard in sources {
-            let source = &self.shards[source_shard.index() as usize];
-            let tile = source.tile;
-            let mut staging_type = source.tensor_type.clone();
+        let mut staging_views = Vec::with_capacity(sources.len());
+        for source_view in sources {
+            let block = &self.shards[source_view.shard.index() as usize];
+            let tile = block.tile;
+            let mut staging_type = self.logical_values[source.index() as usize]
+                .tensor_type
+                .clone();
             let to = Layout::row_major(TensorTiling::replicated(1));
             let from = std::mem::replace(&mut staging_type.format.layout, to.clone());
             let staging = self.push_shard(BlockValue {
                 id: BlockValueId(0),
                 tile,
                 tensor_type: staging_type,
-                extents: source.extents.clone(),
+                extents: source_view.extents.clone(),
                 definition: ShardDefinition::Staging,
             })?;
             let run = self.bind_kernel(
                 provenance,
                 TileKernelSpec::Rearrange { from, to },
-                vec![self.full_view(source_shard)],
+                vec![source_view],
                 vec![self.full_view(staging)],
             )?;
             self.append_kernel(tiles, tile, run)?;
-            staging_shards.push(staging);
+            staging_views.push(self.full_view(staging));
         }
-        Ok(Some(staging_shards))
+        Ok(Some(staging_views))
     }
 
     pub(super) fn local_rearrangement(
         &mut self,
         operation: &MidOperation,
-        inputs: &[BlockValueId],
+        inputs: &[ShardView],
         outputs: &[BlockValueId],
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
@@ -214,15 +233,15 @@ impl TileGraphBuilder {
         }
         let shards = inputs
             .iter()
-            .copied()
+            .cloned()
             .zip(outputs.iter().copied())
             .collect::<Vec<_>>();
         for (input, output) in shards {
-            let source = &self.shards[input.index() as usize];
+            let source = &self.shards[input.shard.index() as usize];
             let destination = &self.shards[output.index() as usize];
             if source.tile != destination.tile
-                || source.extents.len() != destination.extents.len()
-                || source
+                || input.extents.len() != destination.extents.len()
+                || input
                     .extents
                     .iter()
                     .zip(&destination.extents)
@@ -237,7 +256,7 @@ impl TileGraphBuilder {
                     from: source.tensor_type.format.layout.clone(),
                     to: destination.tensor_type.format.layout.clone(),
                 },
-                vec![self.full_view(input)],
+                vec![input],
                 vec![self.full_view(output)],
             )?;
             self.append_kernel(tiles, tile, run)?;
@@ -248,14 +267,14 @@ impl TileGraphBuilder {
     fn offset_copy_mappings(
         &mut self,
         operation: &MidOperation,
-        inputs: &[BlockValueId],
+        inputs: &[ShardView],
         outputs: &[BlockValueId],
         offsets: &[u32],
         reuse_local: bool,
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let mut regions = CopyRegions::new(&self.shards, inputs);
         let mut mappings = Vec::new();
-        for &output in outputs {
+        for (result_index, &output) in outputs.iter().enumerate() {
             let destination = &self.shards[output.index() as usize];
             let tile = destination.tile;
             let mut source_region = destination.extents.clone();
@@ -266,7 +285,7 @@ impl TileGraphBuilder {
                 .map(|(_, source)| {
                     (
                         intersect_extents_with_shared_padding(
-                            &self.shards[source.index() as usize].extents,
+                            &inputs[source].extents,
                             &source_region,
                         )
                         .expect("selected intersection remains nonempty"),
@@ -278,8 +297,8 @@ impl TileGraphBuilder {
                 && offsets.iter().all(|&offset| offset == 0)
                 && let [(extents, source)] = intersections.as_slice()
                 && *extents == self.shards[output.index() as usize].extents
-                && self.shards[source.index() as usize].tile == tile
-                && self.shards[source.index() as usize]
+                && self.shards[inputs[*source].shard.index() as usize].tile == tile
+                && self.shards[inputs[*source].shard.index() as usize]
                     .tensor_type
                     .format
                     .precision
@@ -287,7 +306,7 @@ impl TileGraphBuilder {
                         .tensor_type
                         .format
                         .precision
-                && self.shards[source.index() as usize]
+                && self.shards[inputs[*source].shard.index() as usize]
                     .tensor_type
                     .format
                     .layout
@@ -298,10 +317,10 @@ impl TileGraphBuilder {
                         .layout
                         .order
             {
-                let mut view = self.full_view(*source);
+                let mut view = inputs[*source].clone();
                 view.extents = extents.clone();
                 if !self.exported_values.contains(&operation.results[0]) {
-                    self.borrowed_views.insert(output, view);
+                    self.bindings[operation.results[0].index() as usize][result_index] = view;
                     self.shards[output.index() as usize].definition =
                         ShardDefinition::Unmaterialized;
                     continue;
@@ -319,7 +338,7 @@ impl TileGraphBuilder {
                 offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                 mappings.push((
                     ShardView {
-                        shard: source,
+                        shard: inputs[source].shard,
                         extents: source_extents,
                     },
                     ShardView {
@@ -334,20 +353,18 @@ impl TileGraphBuilder {
 
     pub(super) fn window_view_mappings(
         &self,
-        source_shards: &[BlockValueId],
+        sources: &[ShardView],
+        source_shape: &crate::TensorShape,
         output_shards: &[BlockValueId],
         view: AxisFactorView,
         offsets: &[u32],
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
-        let mut regions = CopyRegions::new(&self.shards, source_shards);
+        let mut regions = CopyRegions::new(&self.shards, sources);
         let mut mappings = Vec::new();
         for &output in output_shards {
             let mut output_extents = self.shards[output.index() as usize].extents.clone();
             offset_extents(&mut output_extents, offsets, u32::checked_add)?;
             let tile = self.shards[output.index() as usize].tile;
-            let source_shape = &self.shards[source_shards[0].index() as usize]
-                .tensor_type
-                .shape;
             let output_shape = view
                 .output_shape(source_shape)
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
@@ -392,7 +409,7 @@ impl TileGraphBuilder {
                             offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                             mappings.push((
                                 ShardView {
-                                    shard: source,
+                                    shard: sources[source].shard,
                                     extents: source_extents,
                                 },
                                 ShardView {
@@ -428,7 +445,7 @@ impl TileGraphBuilder {
                     destination_extents[split].start -= column_base;
                     destination_extents[split].logical_end -= column_base;
                     destination_extents[split].physical_end -= column_base;
-                    let source_shard = &self.shards[source.index() as usize];
+                    let source_shard = &sources[source];
                     let complete_part = source_extents[split].start == column_base
                         && source_extents[split].logical_end == column_base + part_width
                         && source_shard.extents[split].start == column_base
@@ -446,7 +463,7 @@ impl TileGraphBuilder {
                     }
                     offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                     let source_view = ShardView {
-                        shard: source,
+                        shard: sources[source].shard,
                         extents: source_extents,
                     };
                     let destination_view = ShardView {
@@ -468,7 +485,6 @@ impl TileGraphBuilder {
         mut mappings: Vec<(ShardView, ShardView)>,
     ) -> ExpansionResult<Option<(Vec<(ShardView, ShardView)>, CopyOrder)>> {
         for (source, destination) in &mut mappings {
-            self.resolve_read_view(source)?;
             extend_panel_row_padding(
                 &self.shards[source.shard.index() as usize],
                 source,
@@ -570,8 +586,7 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
-        for mut mapping in mappings {
-            self.resolve_read_view(&mut mapping.0)?;
+        for mapping in mappings {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
         let mut packed_sources = BTreeMap::new();
