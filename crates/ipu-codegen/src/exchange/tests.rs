@@ -4,7 +4,7 @@ use crate::estimate::Ipu21CostModel;
 use crate::exchange::diagnostic::sender_address_instruction_groups;
 use crate::exchange::patch_sender_instruction;
 use crate::planner::test_support::lower;
-use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
+use crate::{HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
 use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 
 #[test]
@@ -553,7 +553,7 @@ fn randomized_eligible_physical_pairs_use_double_width_transfers() {
 #[test]
 fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
     let tiles = 64;
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let left = graph.host_input("left", [1, 64, 64]).unwrap();
     let right = graph.parameter("right", [1, 64, 4096]).unwrap();
     let output = graph.gemm(left, right).unwrap();
@@ -594,7 +594,7 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
         let tiles = 1_u16 << random.u32(1..=3);
         let rows = u32::from(tiles) * random.u32(1..=8);
         let columns = random.u32(1..=2) * 64;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, 64]).unwrap();
         let right = graph.parameter("right", [64, columns]).unwrap();
         let output = graph.gemm(left, right).unwrap();
@@ -658,8 +658,8 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
 #[test]
 fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
     use crate::estimate::Ipu21CostModel;
-    use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat};
-    let mut graph = ComputeGraph::new();
+    use crate::{HighGraph, Layout, PipelineConfig, Precision, TensorFormat};
+    let mut graph = HighGraph::new();
     let x = graph.host_input("x", [729, 1152]).unwrap();
     let parameters = (0..27)
         .map(|i| graph.parameter(format!("bias.{i}"), [1152]).unwrap())

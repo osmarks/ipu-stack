@@ -26,10 +26,10 @@ are less clean than their names suggest:
 
 | Representation | What it contains | What remains undecided |
 | --- | --- | --- |
-| `ComputeGraph` | Shaped semantic operations, parameters, outputs and structured Repeat | Precision, distribution, kernels, movement, storage |
-| `MidProgram` | Executable whole-device `Copy`, `Compute` (including casts, products and sums), and `Repeat` | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
+| `HighGraph` | Shaped semantic operations, parameters, outputs and structured Repeat | Precision, distribution, kernels, movement, storage |
+| `MidGraph` | Executable whole-device `Copy`, `Compute` (including casts, products and sums), and `Repeat` | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
 | `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
-| `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
+| `LowGraph` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
 | `Compilation` | Driver result: low program, final placement/exchanges and application | No unresolved compilation work |
 | `Application` | Tile images, host bindings/protocol, debug/profile metadata | Loading and execution |
 
@@ -52,7 +52,7 @@ the kernel family's supported destination table. Low's root no longer imports
 and implicitly exposes every mid definition to its children.
 
 `TileGraph` owns the live operation list and finite-scratch requirement.
-`LowProgram` shares its arenas and derives per-tile indexes without changing
+`LowGraph` shares its arenas and derives per-tile indexes without changing
 execution. Padding removal runs on the graph before this projection; costing,
 inventory and emission observe the same live work.
 
@@ -92,11 +92,11 @@ again and compilation recipes do not carry a second list of entry points.
 
 ```mermaid
 flowchart TD
-  G[ComputeGraph and PipelineConfig] --> P[planner::build::select: select families and construct boundaries]
+  G[HighGraph and PipelineConfig] --> P[planner::build::select: select families and construct boundaries]
   P --> I[emit_selected: construct and bind executable family fragment]
   I --> H[Choose persistent homes; apply configured ownership and bind movement]
   H --> W[Cast ordering, copy composition, fusions, grouping and storage rewrites]
-  W --> M[Executable MidProgram: Copy / Compute / Repeat]
+  W --> M[Executable MidGraph: Copy / Compute / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
   E --> O[Low simplification, relay selection and padding removal]
   O --> T[TileGraph]
@@ -118,7 +118,7 @@ walks operations and regions, `planner/candidates.rs` supplies choices, and
 `planner/bind.rs` prepares complete input formats and commits the chosen family.
 `planner/fragments.rs` dispatches to the connected GEMM, attention and layernorm
 constructors and supplies their shared copy/cast/compute builder. The cache holds
-ordinary executable `MidProgram`s keyed by the selected plan and complete input
+ordinary executable `MidGraph`s keyed by the selected plan and complete input
 and output types. `mid/fragment.rs` substitutes those bindings; it does not resolve
 another representation. Persistent parameter-home selection belongs to
 `planner/parameter_homes.rs`, while selected executable owner rewrites remain in
@@ -129,7 +129,7 @@ Whole-program settings live in `PipelineConfig` in
 [config.rs](../crates/ipu-codegen/src/config.rs): early FP8 casts,
 cast-buffer reuse, packing row size, reduction-group limit, disjoint preparation,
 and a device tile permutation. Operator alternatives exist only while selecting
-the next operation; construction returns the executable `MidProgram` directly.
+the next operation; construction returns the executable `MidGraph` directly.
 
 [planner/build.rs](../crates/ipu-codegen/src/planner/build.rs) constructs mid,
 moves casts when enabled, composes copies, applies elementwise fusion and the

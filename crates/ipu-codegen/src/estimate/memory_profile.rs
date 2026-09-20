@@ -1,7 +1,7 @@
 //! Opt-in explanations of the planner's existing memory estimate.
 use super::*;
 use crate::mid::MidOperationKind;
-use crate::{ComputeGraph, PipelineConfig};
+use crate::{HighGraph, PipelineConfig};
 use ipu_target::ipu21::memory::{IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES};
 use serde::Serialize;
 
@@ -145,7 +145,7 @@ impl mid::MemoryObserver for Timeline {
     }
 }
 
-fn names(graph: &ComputeGraph) -> BTreeMap<u32, (String, String)> {
+fn names(graph: &HighGraph) -> BTreeMap<u32, (String, String)> {
     let mut names = graph
         .inputs()
         .iter()
@@ -165,7 +165,7 @@ fn names(graph: &ComputeGraph) -> BTreeMap<u32, (String, String)> {
     }
     fn visit(
         operations: &[crate::graph::Operation],
-        graph: &ComputeGraph,
+        graph: &HighGraph,
         names: &mut BTreeMap<u32, (String, String)>,
     ) {
         for operation in operations {
@@ -220,7 +220,7 @@ struct Profile {
 
 fn profile(
     scope: &str,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     config: &PipelineConfig,
     initial: &[MidValueId],
     operations: &[MidOperation],
@@ -291,9 +291,9 @@ fn profile(
 /// Called only for exhausted memory shortlists and selected planner finalists.
 /// Diagnostics never force every candidate to retain a detailed timeline.
 pub(crate) fn write(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     config: &PipelineConfig,
-    program: &crate::MidProgram,
+    program: &crate::MidGraph,
     scope: &str,
 ) -> crate::planner::LoweringResult<()> {
     let Some(directory) = &config.memory_profile_directory else {
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn parameters_remain_live_after_their_last_operator_use() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let weight = graph.parameter("weight", [8, 64]).unwrap();
         let input = graph.host_input("input", [8, 64]).unwrap();
         let added = graph.add(input, weight).unwrap();
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn timeline_reconstructs_estimates_with_repeat_aliases_and_padding() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("state</script>", [1, 8, 32]).unwrap();
         let weights = (0..3)
             .map(|i| graph.parameter(format!("w{i}"), [1, 32, 32]).unwrap())

@@ -380,14 +380,14 @@ pub(super) fn merge_copies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::ComputeGraph;
+    use crate::graph::HighGraph;
     use crate::low::graph::{BlockRepeat, KernelRunId};
 
     #[test]
     fn exchange_compaction_preserves_structured_execution_and_boundaries() {
         // Distinct symbolic transfers let us compare the work before and after
         // compaction without relying on the rewritten arena indices.
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [1]).unwrap();
         let first = graph.gelu(input).unwrap();
         graph.gelu(first).unwrap();

@@ -163,10 +163,6 @@ impl CopyRun {
         };
         KernelCall::new(self.symbol(), arguments, cycles)
     }
-
-    pub(crate) fn cycles(&self) -> u64 {
-        self.call().cycles
-    }
 }
 
 impl KernelCall {

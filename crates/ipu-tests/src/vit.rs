@@ -1,6 +1,6 @@
 //! ViT benchmarks and explicitly approximate model-capacity probes.
 use anyhow::{Result, ensure};
-use ipu_codegen::{AxisFactorView, ComputeGraph, GraphInput, ValueId};
+use ipu_codegen::{AxisFactorView, HighGraph, GraphInput, ValueId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Model {
@@ -27,7 +27,7 @@ pub(crate) struct Options {
     pub vit_image_size: Option<u32>,
 }
 
-pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
+pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<HighGraph> {
     let pe = options.vit_model == Model::PeCoreL14Capacity;
     let (image, patch, width, hidden, heads) = match (pe, options.vit_small) {
         (false, false) => (378, 14, 1152, 4304, 16),
@@ -52,7 +52,7 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
         .checked_mul(image / patch)
         .ok_or_else(|| anyhow::anyhow!("ViT token count overflow"))?;
     let tokens = tokens + u32::from(pe);
-    let mut g = ComputeGraph::new();
+    let mut g = HighGraph::new();
     // Nonoverlapping convolution is GEMM on host-packed NHWC image patches.
     // The host supplies every pixel, in [patch_y, patch_x, y, x, channel] order.
     let image = g.host_input(
@@ -81,7 +81,7 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     } else {
         // Build the body once, then bind each parameter to an iterated sequence.
         // Import its ordinary operations through the same checked graph API.
-        let mut template = ComputeGraph::new();
+        let mut template = HighGraph::new();
         let state = template.host_input("state", [options.vit_batch, tokens, width])?;
         let result = encoder(&mut template, state, width, hidden, heads, fuse_qkv)?;
         let parameters = &template.inputs()[1..];
@@ -145,7 +145,7 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
 }
 
 fn encoder(
-    g: &mut ComputeGraph,
+    g: &mut HighGraph,
     mut x: ValueId,
     width: u32,
     hidden: u32,
@@ -169,27 +169,27 @@ fn encoder(
     Ok(x)
 }
 
-fn dense(g: &mut ComputeGraph, x: ValueId, name: &str, input: u32, output: u32) -> Result<ValueId> {
+fn dense(g: &mut HighGraph, x: ValueId, name: &str, input: u32, output: u32) -> Result<ValueId> {
     let weight = g.parameter(format!("vit.{name}.weight"), [input, output])?;
     let bias = g.parameter(format!("vit.{name}.bias"), [1, 1, output])?;
     let x = g.gemm(x, weight)?;
     Ok(g.add(x, bias)?)
 }
 
-fn norm(g: &mut ComputeGraph, x: ValueId, name: &str, width: u32) -> Result<ValueId> {
+fn norm(g: &mut HighGraph, x: ValueId, name: &str, width: u32) -> Result<ValueId> {
     let scale = g.parameter(format!("vit.{name}.scale"), [1, 1, width])?;
     let bias = g.parameter(format!("vit.{name}.bias"), [1, 1, width])?;
     Ok(g.layer_norm(x, scale, bias)?)
 }
 
-fn mlp(g: &mut ComputeGraph, x: ValueId, name: &str, width: u32, hidden: u32) -> Result<ValueId> {
+fn mlp(g: &mut HighGraph, x: ValueId, name: &str, width: u32, hidden: u32) -> Result<ValueId> {
     let x = dense(g, x, &format!("{name}.up"), width, hidden)?;
     let x = g.gelu(x)?;
     dense(g, x, &format!("{name}.down"), hidden, width)
 }
 
 fn attention(
-    g: &mut ComputeGraph,
+    g: &mut HighGraph,
     q: ValueId,
     kv: ValueId,
     name: &str,

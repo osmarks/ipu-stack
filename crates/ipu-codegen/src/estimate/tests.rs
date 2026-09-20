@@ -297,10 +297,10 @@ fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
 #[test]
 fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidProgram, MidValue, ValueId,
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidGraph, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
-    let mut program = MidProgram {
+    let mut program = MidGraph {
         tile_count: 8,
         values: [7, 1, 3]
             .into_iter()
@@ -326,7 +326,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             results: vec![id(2)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
                 mapping: CoordinateMapping::default(),
             },
             operands: Vec::new(),
@@ -334,9 +334,9 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             output_windows: Vec::new(),
         }],
         outputs: vec![id(1), id(2)],
-        ..MidProgram::default()
+        ..MidGraph::default()
     };
-    let peak = |program: &MidProgram| {
+    let peak = |program: &MidGraph| {
         let (_, peak) = analyze_mid(program, &BTreeMap::new()).unwrap();
         peak.total
     };
@@ -395,7 +395,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
 #[test]
 fn memory_retains_repeat_yields_until_the_backedge() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidProgram, MidRegion,
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidGraph, MidRegion,
         MidRepeat, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
@@ -405,14 +405,14 @@ fn memory_retains_repeat_yields_until_the_backedge() {
         results: vec![id(output)],
         kind: MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
-            packing: crate::PackingPolicy::Automatic,
+            packing: crate::PackingPolicy::Staged,
             mapping: CoordinateMapping::default(),
         },
         operands: Vec::new(),
         output_aliases: Vec::new(),
         output_windows: Vec::new(),
     };
-    let mut program = MidProgram {
+    let mut program = MidGraph {
         tile_count: 1,
         values: (0..9)
             .map(|i| MidValue {
@@ -431,7 +431,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
             })
             .collect(),
         outputs: vec![id(7), id(8)],
-        ..MidProgram::default()
+        ..MidGraph::default()
     };
     for count in [1, 3] {
         program.operations = vec![MidOperation {
@@ -496,7 +496,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             results: vec![values[1].id],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
                 mapping: CoordinateMapping {
                     offsets,
                     view: None,

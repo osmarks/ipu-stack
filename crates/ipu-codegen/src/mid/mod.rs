@@ -26,7 +26,7 @@ pub use validate::ProgramError;
 
 #[cfg(test)]
 pub(crate) fn expand_tiles(
-    program: &MidProgram,
+    program: &MidGraph,
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
     crate::low::expand::expand_tiles(program, true)
 }
@@ -178,7 +178,7 @@ pub struct MidInput {
 /// Executable whole-device tensor program. Families append their operations
 /// directly during selection; low then enumerates the concrete shard work.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MidProgram {
+pub struct MidGraph {
     pub tile_count: u16,
     pub inputs: Vec<MidInput>,
     pub values: Vec<MidValue>,
@@ -189,7 +189,7 @@ pub struct MidProgram {
     pub peak_memory: MemoryPeaks,
 }
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn refresh_estimates(&mut self) -> Option<()> {
         self.validate().ok()?;
         let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;

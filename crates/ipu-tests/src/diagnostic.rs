@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    AttentionScale, CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOptions, Operation,
+    AttentionScale, CompiledPackage, HighGraph, DiagnosticTensor, GemmOptions, Operation,
     OperationId, OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
     logical_view_byte_spans,
 };
@@ -28,7 +28,7 @@ pub(crate) type PreparedInputs = (BTreeMap<ValueId, HostTensor>, Vec<u8>, Vec<u8
 
 pub fn run(
     runtime: &Runtime,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     package: &CompiledPackage,
     samples: usize,
     atol: f32,
@@ -339,7 +339,7 @@ pub(crate) fn decode_value(bytes: &[u8], precision: Precision) -> Result<f32> {
 }
 
 pub(crate) fn prepare_inputs(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     application: &Application,
     metadata: &[DiagnosticTensor],
     fp32: bool,
@@ -478,7 +478,7 @@ pub(crate) fn visit_binding_elements(
 }
 
 pub(crate) fn evaluate(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     mut values: BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
     multiply_precisions: &BTreeMap<OperationId, Precision>,
@@ -495,7 +495,7 @@ pub(crate) fn evaluate(
 
 fn evaluate_operations(
     operations: &[Operation],
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     values: &mut BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
     multiply_precisions: &BTreeMap<OperationId, Precision>,
@@ -596,7 +596,7 @@ fn evaluate_operations(
 fn repeat_values(
     operation: &Operation,
     repeat: &Repeat,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     values: &BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
     multiply_precisions: &BTreeMap<OperationId, Precision>,
@@ -662,7 +662,7 @@ fn repeat_values(
 
 fn evaluate_region(
     region: &Region,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     values: &mut BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
     multiply_precisions: &BTreeMap<OperationId, Precision>,
@@ -1091,7 +1091,7 @@ mod tests {
         };
         let tensor = DiagnosticTensor {
             name: None,
-            value: ipu_codegen::ComputeGraph::new().host_input("selected", [3, 5])?,
+            value: ipu_codegen::HighGraph::new().host_input("selected", [3, 5])?,
             shape: ipu_codegen::graph::TensorShape(vec![3, 5]),
             precision: Precision::F32,
             shards: vec![],
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn repeat_reference_binds_carried_invariant_and_iterated_values() -> Result<()> {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let x = graph.host_input("x", [1])?;
         let invariant = graph.parameter("bias", [1])?;
         let parameters = (0..3)
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn reference_quantizes_gemm_operands_without_changing_residuals() -> Result<()> {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let x = graph.host_input("x", [1, 2])?;
         let w = graph.parameter("w", [2, 2])?;
         let product = graph.gemm(x, w)?;

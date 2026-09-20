@@ -143,9 +143,9 @@ mod tests {
     use crate::tensor::{AmpOrder, ElementOrder, Layout, TensorTiling, TensorType};
 
     use super::*;
-    use crate::{MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing};
+    use crate::{MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing};
 
-    fn fixture(order: ElementOrder, shape: &[u32]) -> MidProgram {
+    fn fixture(order: ElementOrder, shape: &[u32]) -> MidGraph {
         let mut layout = Layout::row_major(TensorTiling::replicated(1));
         layout.order = order;
         let values = (0..3)
@@ -165,7 +165,7 @@ mod tests {
                 ),
             })
             .collect();
-        MidProgram {
+        MidGraph {
             tile_count: 1,
             values,
             inputs: vec![MidInput {
@@ -197,11 +197,11 @@ mod tests {
                     output_windows: Vec::new(),
                 },
             ],
-            ..MidProgram::default()
+            ..MidGraph::default()
         }
     }
 
-    fn expand(mid: &MidProgram, enabled: bool) -> std::sync::Arc<TileGraph> {
+    fn expand(mid: &MidGraph, enabled: bool) -> std::sync::Arc<TileGraph> {
         crate::low::expand::expand_tiles_cached(mid, false, enabled, std::sync::Arc::default())
             .unwrap()
     }
@@ -410,7 +410,7 @@ mod tests {
                     mid.operations[0].kind = MidOperationKind::Copy {
                         mapping: CoordinateMapping::default(),
                         policy: CopyPolicy::Automatic,
-                        packing: crate::PackingPolicy::Automatic,
+                        packing: crate::PackingPolicy::Staged,
                     };
                     mid.operations[0].operands.clear();
                 }
@@ -608,7 +608,7 @@ mod tests {
         mid.operations[0].kind = MidOperationKind::Copy {
             mapping: CoordinateMapping::default(),
             policy: CopyPolicy::LocalKernel,
-            packing: crate::PackingPolicy::Automatic,
+            packing: crate::PackingPolicy::Staged,
         };
         let graph = expand(&mid, true);
         let low = crate::low::lower_to_tiles(&graph, false);

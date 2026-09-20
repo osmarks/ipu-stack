@@ -1,13 +1,13 @@
 use super::program::MAX_TRANSFER_WORDS;
 use super::{ExchangeItemWidth, ExchangeLoweringError};
-use crate::{BlockValueId, LogicalExchange, LowProgram, Placement, ShardDefinition};
+use crate::{BlockValueId, LogicalExchange, LowGraph, Placement, ShardDefinition};
 use ipu_target::ipu21::memory::effective_memory_elements;
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 pub(super) fn repeat_source_bases(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
 ) -> Result<BTreeMap<BlockValueId, Vec<u32>>, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
@@ -58,7 +58,7 @@ pub(super) fn repeat_source_bases(
 }
 
 pub(super) fn prepare_phase(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     phase: &crate::low::ExchangePhase,
     repeat_inputs: &BTreeMap<BlockValueId, Vec<u32>>,
@@ -90,7 +90,7 @@ pub(super) fn prepare_phase(
     Ok(coalesce_pending_transfers(pending))
 }
 fn prepare_transfer(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     transfer: &LogicalExchange,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {

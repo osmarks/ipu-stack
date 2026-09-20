@@ -75,7 +75,7 @@ impl TileGraphBuilder {
             .layout
             .order;
         if policy == CopyPolicy::LocalKernel {
-            if !mapping.is_identity() || packing != PackingPolicy::Automatic {
+            if !mapping.is_identity() {
                 return Err(ExpansionError::InvalidCopyPlan);
             }
             return self.local_rearrangement(operation, &inputs, &outputs, body);
@@ -109,7 +109,10 @@ impl TileGraphBuilder {
                 && let Some(physical) = self.micro_panel_mappings(mappings.clone())?
             {
                 physical
-            } else if policy == CopyPolicy::DirectRetile {
+            } else if matches!(
+                policy,
+                CopyPolicy::DirectRetile | CopyPolicy::GatherThenMulticast
+            ) {
                 return Err(ExpansionError::InvalidCopyPlan);
             } else if matches!(
                 source_order,
@@ -139,7 +142,9 @@ impl TileGraphBuilder {
             (
                 mappings,
                 match policy {
-                    CopyPolicy::DirectRetile => CopyOrder::Physical,
+                    CopyPolicy::DirectRetile | CopyPolicy::GatherThenMulticast => {
+                        CopyOrder::Physical
+                    }
                     CopyPolicy::StageLogicalThenTransform => CopyOrder::Semantic,
                     CopyPolicy::Automatic if source_order == output_order => CopyOrder::Physical,
                     CopyPolicy::Automatic => CopyOrder::Semantic,
@@ -339,7 +344,7 @@ impl TileGraphBuilder {
                 copy_order,
                 crate::exchange::MAX_TRANSFER_WORDS * 4,
             )?;
-            let preparation = select_destination_packing(
+            let preparation = destination_staging(
                 &destination.tensor_type,
                 &destination.extents,
                 &geometry,
@@ -591,6 +596,7 @@ impl TileGraphBuilder {
         mut batch: MaterializationBatch,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
+        relay: bool,
     ) -> ExpansionResult<()> {
         for (source, destination, order) in batch.loopback_candidates {
             let transfers = batch.transfers.entry(order).or_default();
@@ -645,6 +651,13 @@ impl TileGraphBuilder {
                 }
             }));
         }
+        if relay {
+            transfers = super::relay::gather(
+                &mut self.program.shards,
+                self.program.tile_count,
+                &transfers,
+            )?;
+        }
         self.append_exchange_phase(transfers, provenance, tiles)?;
         for (tile, copy) in batch.after {
             self.append_local_copy(
@@ -674,9 +687,8 @@ struct CopyStaging {
     kernel: Option<MidOperationKind>,
 }
 
-/// Select destination work from measured geometry and the copy's requested
-/// policy. Geometry caches remain reusable when this policy changes.
-fn select_destination_packing(
+/// Realize the requested destination packing; no cost comparison occurs here.
+fn destination_staging(
     destination: &TensorType,
     extents: &[ShardExtent],
     geometry: &crate::storage::DestinationGeometry,
@@ -687,47 +699,14 @@ fn select_destination_packing(
             || (destination.format.layout.order != ElementOrder::RowMajor
                 && !geometry.same_element_order));
     if !transform {
-        return match policy {
-            PackingPolicy::Staged => Err(ExpansionError::InvalidCopyPlan),
-            _ => Ok(None),
-        };
-    }
-    let stage = match policy {
-        PackingPolicy::Automatic => {
-            let bytes = u64::from(geometry.bytes);
-            let clear_cycles = if geometry.padding {
-                crate::estimate::IPU21_TARGET_COSTS
-                    .kernel_launch_cycles
-                    .saturating_add(bytes.div_ceil(8 * 6))
-            } else {
-                0
-            };
-            let direct = geometry.fragments.is_some_and(|fragments| {
-                crate::estimate::exchange_work_cycles(
-                    bytes,
-                    fragments.saturating_mul(crate::estimate::EXCHANGE_FRAGMENT_CONTROLS),
-                )
-                .saturating_add(clear_cycles)
-                    < crate::kernel::rearrange::estimate(
-                        ElementOrder::RowMajor,
-                        crate::storage::TensorStorage {
-                            format: &destination.format,
-                            extents,
-                        },
-                        crate::storage::TensorStorage {
-                            format: &destination.format,
-                            extents,
-                        },
-                    )
-            });
-            !direct
-        }
-        PackingPolicy::Direct if geometry.fragments.is_some() => false,
-        PackingPolicy::Staged => true,
-        _ => return Err(ExpansionError::InvalidCopyPlan),
-    };
-    if !stage {
         return Ok(None);
+    }
+    if policy == PackingPolicy::Direct {
+        return if geometry.fragments.is_some() {
+            Ok(None)
+        } else {
+            Err(ExpansionError::InvalidCopyPlan)
+        };
     }
     let mut extents = extents.to_vec();
     for extent in &mut extents {

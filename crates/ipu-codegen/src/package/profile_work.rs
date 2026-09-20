@@ -279,7 +279,7 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
 
 pub(super) fn append_work_estimate(
     metadata: &mut Vec<ProfileMetadata>,
-    program: &LowProgram,
+    program: &LowGraph,
     works: &[crate::BlockOperation<usize>],
 ) {
     let mut useful = 0.0;

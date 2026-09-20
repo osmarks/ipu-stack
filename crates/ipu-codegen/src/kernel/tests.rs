@@ -3,13 +3,13 @@ use crate::estimate::Ipu21CostModel;
 use crate::mid::MidOperationKind;
 use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, ComputeGraph, KernelRequirements, Layout, MemoryClass, PipelineConfig,
+    AccumulationPrecision, HighGraph, KernelRequirements, Layout, MemoryClass, PipelineConfig,
     ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower_to_tiles,
 };
 
 #[test]
 fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let x = graph.host_input("x", [8, 4, 32]).unwrap();
     let bias = graph.host_input("bias", [1, 4, 32]).unwrap();
     let output = graph.add(x, bias).unwrap();
@@ -42,7 +42,7 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
 
 #[test]
 fn packed_add_keeps_padding_in_dense_operand_view() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let x = graph.host_input("x", [2, 3, 32]).unwrap();
     let y = graph.host_input("y", [2, 3, 32]).unwrap();
     let output = graph.add(x, y).unwrap();
@@ -82,7 +82,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
 #[test]
 fn fp8_gemms_repack_casts_and_keep_half_outputs() {
     let fp8 = Precision::F8F143 { scale_exponent: -4 };
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let input = graph.host_input("input", [129, 128]).unwrap();
     let weights = graph.parameter("weights", [128, 64]).unwrap();
     let output = graph.gemm(input, weights).unwrap();
@@ -243,7 +243,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
         let tiles = 1_u16 << random.u32(0..=3);
         let rows_per_tile = random.u32(1..=12);
         let batch = random.u32(1..=4);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph
             .host_input("left", [batch, u32::from(tiles) * rows_per_tile, 64])
             .unwrap();
@@ -608,7 +608,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
     let orientation = crate::planner::operator::GemmOrientation::Normal;
     {
         for rows in [17, 96, 129] {
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let left = graph.host_input("left", [1, rows, 64]).unwrap();
             let right = graph.parameter("right", [64, 80]).unwrap();
             let output = graph.gemm(left, right).unwrap();

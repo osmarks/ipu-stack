@@ -6,9 +6,9 @@ use crate::mid::MidOperationKind;
 use crate::planner::catalogue::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
 fn lower_to_tiles(
-    graph: &crate::MidProgram,
+    graph: &crate::MidGraph,
     checkpoints: bool,
-) -> super::ExpansionResult<crate::LowProgram> {
+) -> super::ExpansionResult<crate::LowGraph> {
     let mut graph = graph.clone();
     graph.compose_copies();
     let expanded = super::expand_tiles_cached(&graph, true, false, Arc::default())?;
@@ -22,7 +22,7 @@ use crate::planner::operator::{
 };
 use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GridOrder, Layout, MemoryClass,
+    AccumulationPrecision, AxisTiling, HighGraph, ElementOrder, GridOrder, Layout, MemoryClass,
     Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
 };
 use std::collections::BTreeSet;
@@ -39,7 +39,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             (1, 3, 0, false, 3, true, false), // Actual receive-copy-send dependency.
             (3, 1, 0, false, 3, false, false), // Shared reads permit keeping the copy after.
         ] {
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let input = graph.host_input("input", [16, 16]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
@@ -178,7 +178,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         (2, false, CopyOrder::Physical, true),
         (2, true, CopyOrder::Semantic, false),
     ] {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [16, 16]).unwrap();
         graph.set_outputs([input]).unwrap();
         let config = PipelineConfig::new(3).with_input(input, format(1));
@@ -208,14 +208,14 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
                 mappings,
                 CopyOrder::Physical,
                 exchange_order,
-                PackingPolicy::Automatic,
+                PackingPolicy::Staged,
                 provenance,
                 &mut batch,
                 &mut region,
             )
             .unwrap();
         builder
-            .append_materialization(batch, provenance, &mut region)
+            .append_materialization(batch, provenance, &mut region, false)
             .unwrap();
         assert_eq!(builder.program.local_copies.is_empty(), loopback);
         let self_receivers = builder
@@ -267,7 +267,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
 
 #[test]
 fn factor_mappings_keep_the_bound_source_selection() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let input = graph.host_input("input", [1, 4, 32]).unwrap();
     graph.set_outputs([input]).unwrap();
     let config = PipelineConfig::new(1).with_input(input, format(1));
@@ -311,14 +311,14 @@ fn factor_mappings_keep_the_bound_source_selection() {
             mappings,
             CopyOrder::Semantic,
             CopyOrder::Semantic,
-            PackingPolicy::Automatic,
+            PackingPolicy::Staged,
             provenance,
             &mut batch,
             &mut region,
         )
         .unwrap();
     builder
-        .append_materialization(batch, provenance, &mut region)
+        .append_materialization(batch, provenance, &mut region, false)
         .unwrap();
     assert!(!builder.program.local_copies.is_empty());
     assert!(
@@ -361,7 +361,7 @@ fn format(tiles: u16) -> TensorFormat {
 
 #[test]
 fn panel_construction_keeps_both_operand_casts_materialized() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let left = graph.host_input("left", [8, 128]).unwrap();
     let right = graph.parameter("right", [128, 64]).unwrap();
     let output = graph.gemm(left, right).unwrap();
@@ -468,7 +468,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             * 64
             * random.u32(1..=u32::from(row_partitions / inner_partitions));
         let columns = u32::from(column_partitions) * output_columns;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [1, rows, inner]).unwrap();
         let right = graph.parameter("right", [1, inner, columns]).unwrap();
         let product = graph.gemm(left, right).unwrap();
@@ -622,7 +622,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
         let compute_tiles = owner_tiles * 2;
         let inner = u32::from(owner_tiles) * 64;
         let rows = u32::from(compute_tiles) * random.u32(1..=4);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
         let right0 = graph.parameter("right.0", [inner, 64]).unwrap();
         let right1 = graph.parameter("right.1", [inner, 64]).unwrap();
@@ -699,7 +699,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let rows = random.u32(1..u32::from(tiles));
         let columns = random.u32(1..=32) * 2;
         let tensor_format = format(tiles);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
@@ -740,7 +740,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
     for case in 0..8 {
         let batch = random.u32(1..=4);
         let tokens = 16;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [batch, tokens, 64]).unwrap();
         let up = graph.parameter("up", [1, 64, 256]).unwrap();
         let down = graph.parameter("down", [1, 256, 64]).unwrap();
@@ -832,7 +832,7 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
                 crate::tensor::GridOrder::ColumnsFast,
             ),
         };
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
@@ -904,7 +904,7 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
             precision: Precision::F16,
             layout: layout(source_columns, source_rows),
         };
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
@@ -1333,7 +1333,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
         let tiles = 1_u16 << random.u32(0..=3);
         let rows = u32::from(tiles) * random.u32(1..=8) * 16;
         let columns = random.u32(1..=8) * 16;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, columns]).unwrap();
         let right = graph.host_input("right", [rows, columns]).unwrap();
         let output = graph.add(left, right).unwrap();
@@ -1386,7 +1386,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
         let tiles = 1_u16 << random.u32(1..=3);
         let rows = u32::from(tiles) * random.u32(1..=8);
         let columns = random.u32(1..=8) * 16;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let bias = graph.host_input("bias", [1, columns]).unwrap();
         let tensor = graph.host_input("tensor", [rows, columns]).unwrap();
         let output = graph.add(bias, tensor).unwrap();
@@ -1439,7 +1439,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
         let column_blocks = random.u32(1..=4);
         let inner = inner_blocks * 64;
         let columns = column_blocks * 64;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
         let right = graph.parameter("right", [inner, columns]).unwrap();
         let output = graph.gemm(left, right).unwrap();
@@ -1538,7 +1538,7 @@ fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
         let active_tiles = 1_u16 << random.u32(2..=5);
         let capacity = active_tiles + random.u16(1..active_tiles);
         let rows = u32::from(active_tiles);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, 64]).unwrap();
         let right = graph.parameter("right", [64, 64]).unwrap();
         let output = graph.gemm(left, right).unwrap();
@@ -1587,7 +1587,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
         let rows = u32::from(tiles) * random.u32(1..=4);
         let inner = 64 * random.u32(2..=4);
         let columns = 64 * random.u32(1..=4);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
         let right = graph.parameter("right", [inner, columns]).unwrap();
         let output = graph.gemm(left, right).unwrap();
@@ -1679,7 +1679,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let inner_blocks = u32::from(row_partitions) * random.u32(1..=2);
         let inner = inner_blocks * 64;
         let columns = u32::from(column_partitions) * 64;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
         let right = graph.parameter("right", [inner, columns]).unwrap();
         let output = graph.gemm(left, right).unwrap();
@@ -1755,7 +1755,7 @@ fn randomized_repeats_remain_structured_per_tile() {
         let tiles = 1_u16 << random.u32(0..=3);
         let count = random.u32(1..=8);
         let width = u32::from(tiles) * random.u32(1..=8);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let carried = graph.host_input("carried", [width, 16]).unwrap();
         // A sequence may contain more values than this invocation consumes.
         let parameters = (0..count + random.u32(0..=3))
@@ -1819,7 +1819,7 @@ fn randomized_repeats_remain_structured_per_tile() {
 
 #[test]
 fn repeat_binds_every_linear_fragment_including_rotated_owners() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let carried = graph.host_input("carried", [8, 16]).unwrap();
     let invariant = graph.parameter("invariant", [8, 16]).unwrap();
     let parameters = (0..2)
@@ -1899,7 +1899,7 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
         let tiles = 1_u16 << random.u32(0..=3);
         let count = random.u32(1..=4);
         let rows = u32::from(tiles) * random.u32(1..=4) * 8;
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let carried = graph.host_input("carried", [rows, 64]).unwrap();
         let weights = (0..count)
             .map(|index| graph.parameter(format!("weight.{index}"), [64, 64]))
@@ -1956,7 +1956,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
         output_aliases: Vec::new(),
         output_windows: Vec::new(),
     };
-    let mid = MidProgram {
+    let mid = MidGraph {
         tile_count: 1,
         values: (0..5)
             .map(|index| MidValue {
@@ -1991,7 +1991,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                             3,
                             MidOperationKind::Copy {
                                 policy: crate::CopyPolicy::Automatic,
-                                packing: crate::PackingPolicy::Automatic,
+                                packing: crate::PackingPolicy::Staged,
                                 mapping: CoordinateMapping::default(),
                             },
                         ),
@@ -1999,7 +1999,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                 },
             }),
         )],
-        ..MidProgram::default()
+        ..MidGraph::default()
     };
     let low = lower_to_tiles(&mid, false).unwrap();
     let placement = crate::place(&low).unwrap();
@@ -2022,7 +2022,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
 #[test]
 fn repeat_preserves_shared_initial_values() {
     for case in 0..6 {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = if case == 5 {
             graph.parameter("input", [8, 16]).unwrap()
         } else {
@@ -2081,7 +2081,7 @@ fn repeat_preserves_shared_initial_values() {
 
 #[test]
 fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let a = graph.host_input("a", [8, 16]).unwrap();
     let b = graph.host_input("b", [8, 16]).unwrap();
     let output = graph
@@ -2114,7 +2114,7 @@ fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
     );
 }
 
-fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhaseId) -> bool {
+fn contains_phase(program: &LowGraph, list: &TileWorkList, phase: ExchangePhaseId) -> bool {
     list.work.iter().any(|work| match work {
         BlockOperation::Exchange(candidate) => *candidate == phase,
         BlockOperation::Repeat(repeat) => {
@@ -2138,7 +2138,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                         }
                         let mut shape = vec![2; rank];
                         shape[split] = 12;
-                        let mut graph = ComputeGraph::new();
+                        let mut graph = HighGraph::new();
                         let input = graph.host_input("input", shape.clone()).unwrap();
                         let mut views = vec![AxisFactorView::new(split, merge, 3)];
                         match chain {
@@ -2369,7 +2369,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
         precision: Precision::F16,
         layout: Layout::amp_left(16, 4).with_retained_order_linear_ownership(4, 16),
     };
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let input = graph.host_input("input", [3, 17, 32]).unwrap();
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
@@ -2398,7 +2398,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
 
 #[test]
 fn local_casts_pair_corresponding_linear_fragments() {
-    let mut graph = ComputeGraph::new();
+    let mut graph = HighGraph::new();
     let input = graph.host_input("input", [8, 16]).unwrap();
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
@@ -2443,9 +2443,9 @@ fn local_casts_pair_corresponding_linear_fragments() {
 #[test]
 fn complete_panel_grid_stays_one_logical_exchange() {
     let mut state = TileGraphBuilder::new(
-        &MidProgram {
+        &MidGraph {
             tile_count: 2,
-            ..MidProgram::default()
+            ..MidGraph::default()
         },
         Arc::default(),
     )
@@ -2502,14 +2502,14 @@ fn complete_panel_grid_stays_one_logical_exchange() {
             mappings,
             order,
             order,
-            PackingPolicy::Automatic,
+            PackingPolicy::Staged,
             provenance,
             &mut batch,
             &mut body,
         )
         .unwrap();
     state
-        .append_materialization(batch, provenance, &mut body)
+        .append_materialization(batch, provenance, &mut body, false)
         .unwrap();
     assert_eq!(state.program.exchange_phases.len(), 1);
     let [transfer] = state.program.exchange_phases[0].transfers.as_slice() else {
@@ -2537,9 +2537,9 @@ fn complete_panel_grid_stays_one_logical_exchange() {
 #[test]
 fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
     let mut state = TileGraphBuilder::new(
-        &MidProgram {
+        &MidGraph {
             tile_count: 3,
-            ..MidProgram::default()
+            ..MidGraph::default()
         },
         Arc::default(),
     )
@@ -2640,14 +2640,14 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
             vec![(source, target), (clipped_source, clipped_target)],
             CopyOrder::Semantic,
             CopyOrder::Semantic,
-            PackingPolicy::Automatic,
+            PackingPolicy::Direct,
             provenance,
             &mut batch,
             &mut body,
         )
         .unwrap();
     state
-        .append_materialization(batch, provenance, &mut body)
+        .append_materialization(batch, provenance, &mut body, false)
         .unwrap();
     let regular = state
         .program

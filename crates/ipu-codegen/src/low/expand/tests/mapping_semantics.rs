@@ -114,7 +114,7 @@ fn next_mapping(
 }
 
 fn check_bytes(
-    mid: &MidProgram,
+    mid: &MidGraph,
     shapes: &[TensorShape],
     mappings: &[CoordinateMapping],
 ) -> Result<(), String> {
@@ -310,7 +310,7 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                 }
             })
             .collect();
-        let mid = MidProgram {
+        let mid = MidGraph {
             tile_count: 4,
             values,
             inputs: vec![MidInput {
@@ -327,7 +327,11 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                     inputs: vec![MidValueId::from_index(index as u32)],
                     results: vec![MidValueId::from_index(index as u32 + 1)],
                     kind: MidOperationKind::Copy {
-                        packing: crate::PackingPolicy::Automatic,
+                        packing: if case % 2 == 0 {
+                            crate::PackingPolicy::Staged
+                        } else {
+                            crate::PackingPolicy::Direct
+                        },
                         policy: match (case + index) % 3 {
                             0 => crate::CopyPolicy::Automatic,
                             1 if mapping.view.is_none() => crate::CopyPolicy::DirectRetile,
@@ -340,7 +344,7 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                     output_windows: Vec::new(),
                 })
                 .collect(),
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         for composed in [false, true] {
             let mut candidate = mid.clone();

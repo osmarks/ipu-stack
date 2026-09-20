@@ -2,14 +2,14 @@
 
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
+    CoordinateMapping, MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
     TensorTiling, TensorType,
 };
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
         let mut result = self.clone();
         if !distribute_region(
@@ -151,7 +151,7 @@ fn distribute_region(
                     source: operation.source,
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
-                        packing: crate::PackingPolicy::Automatic,
+                        packing: crate::PackingPolicy::Direct,
                         mapping: CoordinateMapping::default(),
                     },
                     operands: Vec::new(),
@@ -227,7 +227,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let program = MidProgram {
+            let program = MidGraph {
                 tile_count: 64,
                 values,
                 inputs: vec![MidInput {
@@ -242,7 +242,7 @@ mod tests {
                     results: vec![MidValueId(1)],
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
-                        packing: crate::PackingPolicy::Automatic,
+                        packing: crate::PackingPolicy::Staged,
                         mapping: CoordinateMapping {
                             offsets: vec![],
                             view: view.then_some(AxisFactorView::new(2, 0, 2)),
@@ -252,7 +252,7 @@ mod tests {
                     output_aliases: Vec::new(),
                     output_windows: Vec::new(),
                 }],
-                ..MidProgram::default()
+                ..MidGraph::default()
             };
             let candidates = [32, 64, 128, 256]
                 .into_iter()

@@ -27,7 +27,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 .collect();
             let input = MidValueId::from_index(0);
             let output = MidValueId::from_index(1);
-            let mid = MidProgram {
+            let mid = MidGraph {
                 tile_count: tiles,
                 values,
                 inputs: vec![MidInput {
@@ -48,7 +48,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     output_aliases: vec![],
                     output_windows: Vec::new(),
                 }],
-                ..MidProgram::default()
+                ..MidGraph::default()
             };
             let expanded = expand_tiles(&mid, false).unwrap();
             assert!(expanded.kernel_runs.len() > usize::from(tiles));

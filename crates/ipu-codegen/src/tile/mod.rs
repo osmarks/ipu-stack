@@ -10,7 +10,7 @@ mod iterated_aliases;
 
 use crate::{
     BlockOperation, BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
-    LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
+    LowGraph, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
     RepeatStep, StepProfile, TileAddress, TileProgram, TileStep, TileWorkList,
     materialize_kernel_run,
 };
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Package generation uses this to emit and discard each logical tile program
 /// instead of retaining every tile's expanded instruction steps at once.
 pub struct TileProgramLowering<'a> {
-    program: &'a LowProgram,
+    program: &'a LowGraph,
     placement: &'a Placement,
     exchanges: &'a [PhysicalExchangePhase],
     phases: BTreeMap<ExchangePhaseId, &'a PhysicalExchangePhase>,
@@ -78,7 +78,7 @@ struct PlacedExchange {
 
 impl<'a> TileProgramLowering<'a> {
     pub fn new(
-        program: &'a LowProgram,
+        program: &'a LowGraph,
         placement: &'a Placement,
         exchanges: &'a [PhysicalExchangePhase],
         exchange_code_base: u32,
@@ -171,7 +171,7 @@ impl<'a> TileProgramLowering<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn lower_work(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: &TileWorkList,
     placement: &Placement,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
@@ -269,7 +269,7 @@ fn lower_work(
 }
 
 fn lower_repeat(
-    program: &LowProgram,
+    program: &LowGraph,
     repeat: &RepeatRun,
     placement: &Placement,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
@@ -312,7 +312,7 @@ fn lower_repeat(
 }
 
 fn lower_inactive_work(
-    program: &LowProgram,
+    program: &LowGraph,
     work: &TileWorkList,
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
@@ -586,7 +586,7 @@ mod tests {
     use crate::estimate::Ipu21CostModel;
     use crate::planner::test_support::lower;
     use crate::{
-        ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_exchanges,
+        HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_exchanges,
         lower_to_tiles, place,
     };
 
@@ -676,7 +676,7 @@ mod tests {
             logical_values: vec![],
             checkpoints: vec![],
         };
-        let program = LowProgram {
+        let program = LowGraph {
             program: std::sync::Arc::new(graph),
             repeat_runs: vec![],
             tiles: vec![TileWorkList {
@@ -730,7 +730,7 @@ mod tests {
             let tiles = 1_u16 << random.u32(0..=3);
             let rows = u32::from(tiles) * random.u32(1..=8);
             let columns = random.u32(1..=2) * 64;
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let left = graph.host_input("left", [rows, 64]).unwrap();
             let right = graph.parameter("right", [64, columns]).unwrap();
             let output = graph.gemm(left, right).unwrap();

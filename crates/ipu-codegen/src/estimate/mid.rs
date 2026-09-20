@@ -4,7 +4,7 @@
 use super::*;
 use crate::mid::MidOperationKind;
 
-use crate::MidProgram;
+use crate::MidGraph;
 
 /// Price complete replacement sequences with the same overflow and missing-cost rules.
 pub(crate) fn operation_cycles<'a>(
@@ -17,7 +17,7 @@ pub(crate) fn operation_cycles<'a>(
 }
 
 pub(crate) fn analyze(
-    program: &MidProgram,
+    program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
     analyze_observed(program, copies, &mut ())
@@ -54,7 +54,7 @@ pub(super) trait MemoryObserver {
 impl MemoryObserver for () {}
 
 pub(super) fn analyze_observed(
-    program: &MidProgram,
+    program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
@@ -64,7 +64,7 @@ pub(super) fn analyze_observed(
 /// A fitting upper bound needs no refinement. Every failed capacity screen is
 /// checked on actual owners before it can discard a candidate.
 pub(crate) fn analyze_with_budget(
-    program: &MidProgram,
+    program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     config: &crate::PipelineConfig,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
@@ -80,7 +80,7 @@ pub(crate) fn analyze_with_budget(
 }
 
 fn analyze_storage<const PER_TILE: bool>(
-    program: &MidProgram,
+    program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
@@ -393,7 +393,14 @@ pub(crate) fn operation_cost(
     let mut rows = 0;
     let mut price = ProgramCycles::default();
     match &operation.kind {
-        MidOperationKind::Copy { policy, .. } => {
+        MidOperationKind::Copy {
+            policy, packing, ..
+        } => {
+            // Relay scratch and its two transfer legs require concrete geometry.
+            // Do not rank this explicit strategy with the direct-copy estimate.
+            if *policy == crate::CopyPolicy::GatherThenMulticast {
+                return None;
+            }
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
             let local_conversion = *policy == crate::CopyPolicy::LocalKernel;
@@ -434,9 +441,9 @@ pub(crate) fn operation_cost(
                 .exchange
                 .saturating_add(bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
                 .saturating_add(IPU21_TARGET_COSTS.local_copy_call_cycles);
-            if input.format.precision == output.format.precision
+            if *packing == crate::PackingPolicy::Staged
+                && input.format.precision == output.format.precision
                 && input.format.layout.order != output.format.layout.order
-                && !input.format.supports_micro_panel_exchange(&output.format)
             {
                 scratch.standard = bytes;
                 // Packed destinations are populated from row-major staging.
@@ -544,8 +551,8 @@ pub(crate) fn region_program(
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
-) -> MidProgram {
-    crate::MidProgram {
+) -> MidGraph {
+    crate::MidGraph {
         tile_count,
         inputs: initial
             .iter()
@@ -558,6 +565,6 @@ pub(crate) fn region_program(
         values: values.to_vec(),
         operations: operations.to_vec(),
         outputs: outputs.to_vec(),
-        ..crate::MidProgram::default()
+        ..crate::MidGraph::default()
     }
 }

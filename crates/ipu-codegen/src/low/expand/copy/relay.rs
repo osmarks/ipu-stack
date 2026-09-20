@@ -1,62 +1,9 @@
-//! Direct multicast versus gathering native panels once and forwarding them.
-//! Both use the same exchange phase; scratch is visible to normal placement.
+//! Realize an explicitly requested gather-and-multicast copy.
+//! Relays stay in the same exchange phase; scratch uses normal placement.
 use crate::low::storage::storage_root;
 use crate::low::*;
 use crate::{AmpOrder, CopyOrder, ElementOrder, MemoryClass, ShardExtent};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[tracing::instrument(name = "select_relays", skip_all)]
-pub(super) fn select(
-    program: &mut TileGraph,
-    analysis: &crate::storage::GeometryCache,
-) -> ExpansionResult<()> {
-    for index in 0..program.exchange_phases.len() {
-        if !program.exchange_phases[index]
-            .transfers
-            .iter()
-            .any(|t| t.destinations.len() > 1)
-        {
-            continue;
-        }
-        let original = &program.exchange_phases[index];
-        let start = program.shards.len();
-        let Some(candidate) = candidate(&mut program.shards, program.tile_count, original)? else {
-            program.shards.truncate(start);
-            continue;
-        };
-        let before = crate::estimate::exchange_phase_estimate(program, original, analysis)?;
-        let after = crate::estimate::exchange_phase_estimate(program, &candidate, analysis)?;
-        let mut scratch = vec![0u64; usize::from(program.tile_count)];
-        for shard in &program.shards[start..] {
-            scratch[usize::from(shard.tile)] += u64::from(shard_storage_bytes(shard)?);
-        }
-        let peak = |bytes: &[u64]| bytes.iter().copied().max().unwrap_or(0);
-        let with_scratch = after
-            .1
-            .iter()
-            .zip(&scratch)
-            .map(|(row, buffer)| row + buffer)
-            .max()
-            .unwrap_or(0);
-        // Do not trade modeled speed for rows, or hide scratch behind a sum of
-        // phase-wide bytes. Complete-plan liveness/placement accounts it again.
-        if after.0 <= before.0 && with_scratch < peak(&before.1) {
-            tracing::debug!(
-                phase = index,
-                relays = program.shards.len() - start,
-                before_cycles = before.0,
-                after_cycles = after.0,
-                before_bytes = peak(&before.1),
-                after_bytes = with_scratch,
-                "selected packed multicast relays"
-            );
-            program.exchange_phases[index] = candidate;
-        } else {
-            program.shards.truncate(start);
-        }
-    }
-    Ok(())
-}
 
 fn panel_views(shard: &BlockValue) -> Option<Vec<Vec<ShardExtent>>> {
     let rank = shard.extents.len();
@@ -117,23 +64,22 @@ fn intersection(a: &[ShardExtent], b: &[ShardExtent]) -> Option<Vec<ShardExtent>
     Some(result)
 }
 
-fn candidate(
+pub(super) fn gather(
     shards: &mut Vec<BlockValue>,
     tile_count: u16,
-    phase: &ExchangePhase,
-) -> ExpansionResult<Option<ExchangePhase>> {
+    transfers: &[LogicalExchange],
+) -> ExpansionResult<Vec<LogicalExchange>> {
     let roots = |view: &ShardView| storage_root(shards, view.shard);
-    let reads: BTreeSet<_> = phase.transfers.iter().map(|t| roots(&t.source)).collect();
-    if phase
-        .transfers
+    let reads: BTreeSet<_> = transfers.iter().map(|t| roots(&t.source)).collect();
+    if transfers
         .iter()
         .flat_map(|t| &t.destinations)
         .any(|v| reads.contains(&roots(v)))
     {
-        return Ok(None); // Preserve existing receive/forward or alias ordering.
+        return Err(ExpansionError::InvalidCopyPlan); // Preserve existing receive/forward or alias ordering.
     }
     let mut groups = BTreeMap::<Vec<BlockValueId>, Vec<usize>>::new();
-    for (index, transfer) in phase.transfers.iter().enumerate() {
+    for (index, transfer) in transfers.iter().enumerate() {
         if transfer.destinations.len() < 2 || transfer.order == CopyOrder::Panels {
             continue;
         }
@@ -170,27 +116,27 @@ fn candidate(
         };
         count += panels.len();
         if count > usize::from(tile_count) {
-            return Ok(None);
+            return Err(ExpansionError::InvalidCopyPlan);
         }
         plans.push((destinations, transfers, panels));
     }
     if plans.is_empty() {
-        return Ok(None);
+        return Err(ExpansionError::InvalidCopyPlan);
     }
     let mut used = BTreeSet::new();
     let mut removed = BTreeSet::new();
     let mut gather = Vec::new();
     let mut forward = Vec::new();
-    for (destinations, transfers, panels) in plans {
+    for (destinations, indices, panels) in plans {
         let mut tensor_type = shards[destinations[0].index() as usize].tensor_type.clone();
         tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
         let excluded = destinations
             .iter()
             .map(|id| shards[id.index() as usize].tile)
             .chain(
-                transfers
+                indices
                     .iter()
-                    .map(|&i| shards[phase.transfers[i].source.shard.index() as usize].tile),
+                    .map(|&i| shards[transfers[i].source.shard.index() as usize].tile),
             )
             .collect::<BTreeSet<_>>();
         for extents in panels {
@@ -198,7 +144,7 @@ fn candidate(
                 .rev()
                 .find(|t| !used.contains(t) && !excluded.contains(t))
             else {
-                return Ok(None);
+                return Err(ExpansionError::InvalidCopyPlan);
             };
             let id = BlockValueId(
                 shards
@@ -216,8 +162,8 @@ fn candidate(
             let expected = u64::from(shard_storage_bytes(&relay)?);
             let mut covered = 0u64;
             let mut parts = Vec::new();
-            for &index in &transfers {
-                let original = &phase.transfers[index];
+            for &index in &indices {
+                let original = &transfers[index];
                 if let Some(part) = intersection(&original.source.extents, &extents) {
                     let bytes = part
                         .iter()
@@ -250,7 +196,7 @@ fn candidate(
                 adjacent
             }) && end == extents[row].physical_end;
             if covered != expected || !complete {
-                return Ok(None);
+                return Err(ExpansionError::InvalidCopyPlan);
             }
             shards.push(relay);
             used.insert(tile);
@@ -270,10 +216,9 @@ fn candidate(
                 order: CopyOrder::Physical,
             });
         }
-        removed.extend(transfers);
+        removed.extend(indices);
     }
-    let mut transfers = phase
-        .transfers
+    let mut transfers = transfers
         .iter()
         .enumerate()
         .filter(|(i, _)| !removed.contains(i))
@@ -281,10 +226,7 @@ fn candidate(
         .collect::<Vec<_>>();
     transfers.extend(gather);
     transfers.extend(forward);
-    Ok(Some(ExchangePhase {
-        transfers,
-        ..*phase
-    }))
+    Ok(transfers)
 }
 
 #[cfg(test)]
@@ -292,89 +234,63 @@ mod tests {
     use super::*;
     use crate::{Layout, MidValueId, Precision, TensorTiling, TensorType};
 
-    fn fixture() -> TileGraph {
-        let mut tensor = TensorType {
-            shape: crate::TensorShape(vec![2, 32, 64]),
-            format: crate::TensorFormat {
-                precision: Precision::F8F143 { scale_exponent: -4 },
-                layout: Layout::row_major(TensorTiling::replicated(1)),
-            },
+    fn fixture(policy: crate::CopyPolicy) -> TileGraph {
+        let mut source = Layout::amp_left(32, 64);
+        source.tiling = TensorTiling {
+            tile_count: 32,
+            replicas: 1,
+            axes: vec![crate::AxisTiling::new(
+                crate::TensorAxis::FromStart(1),
+                32,
+                1,
+                crate::Padding::Reject,
+            )],
         };
-        tensor.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
-        let extents = |row, end| {
-            vec![
-                ShardExtent {
-                    axis: 0,
-                    start: 0,
-                    logical_end: 2,
-                    physical_end: 2,
-                },
-                ShardExtent {
-                    axis: 1,
-                    start: row,
-                    logical_end: end,
-                    physical_end: end,
-                },
-                ShardExtent {
-                    axis: 2,
-                    start: 0,
-                    logical_end: 64,
-                    physical_end: 64,
-                },
-            ]
-        };
-        let shards = (0..48u32)
-            .map(|i| BlockValue {
-                id: BlockValueId(i),
-                tile: if i < 32 { i as u16 } else { i as u16 + 8 },
-                tensor_type: tensor.clone(),
-                extents: if i < 32 {
-                    extents(i, i + 1)
-                } else {
-                    extents(0, 32)
-                },
-                definition: ShardDefinition::Value(MidValueId::from_index(i)),
+        let mut destination = source.clone();
+        destination.tiling = TensorTiling::replicated(16);
+        let values = [source, destination]
+            .into_iter()
+            .enumerate()
+            .map(|(index, layout)| {
+                let id = MidValueId::from_index(index as u32);
+                crate::MidValue {
+                    id,
+                    tensor_type: TensorType::new(
+                        [2, 32, 64],
+                        Precision::F8F143 { scale_exponent: -4 },
+                        layout,
+                    ),
+                    owners: crate::tensor::OwnerMap::rotated(if index == 0 { 0 } else { 40 }),
+                    origin: crate::ValueId::from_index(0),
+                    storage_group: id,
+                }
             })
             .collect();
-        let phase = ExchangePhase {
-            id: ExchangePhaseId(0),
-            provenance: WorkProvenance {
-                operation: None,
-                value: None,
-                reason: WorkReason::LayoutRearrangement,
-            },
-            transfers: (0..32)
-                .map(|i| LogicalExchange {
-                    source: ShardView {
-                        shard: BlockValueId(i),
-                        extents: extents(i, i + 1),
-                    },
-                    destinations: (32..48)
-                        .map(|d| ShardView {
-                            shard: BlockValueId(d),
-                            extents: extents(i, i + 1),
-                        })
-                        .collect(),
-                    order: CopyOrder::Physical,
-                })
-                .collect(),
-        };
-        TileGraph {
+        let program = crate::MidGraph {
             tile_count: 64,
-            requires_finite_scratch: false,
-            shards,
-            exchange_phases: vec![phase],
-            body: BlockRegion {
-                operations: vec![BlockOperation::Exchange(ExchangePhaseId(0))],
-            },
-            kernel_runs: vec![],
-            local_copies: vec![],
-            inputs: vec![],
-            outputs: vec![],
-            value_views: vec![],
-            logical_values: vec![],
-            checkpoints: vec![],
-        }
+            values,
+            inputs: vec![crate::MidInput {
+                name: "input".into(),
+                kind: crate::GraphInputKind::Host,
+                value: MidValueId::from_index(0),
+            }],
+            outputs: vec![MidValueId::from_index(1)],
+            operations: vec![crate::MidOperation {
+                source: None,
+                inputs: vec![MidValueId::from_index(0)],
+                results: vec![MidValueId::from_index(1)],
+                kind: crate::mid::MidOperationKind::Copy {
+                    mapping: crate::CoordinateMapping::default(),
+                    packing: crate::PackingPolicy::Direct,
+                    policy,
+                },
+                operands: vec![],
+                output_aliases: vec![],
+                output_windows: vec![],
+            }],
+            ..Default::default()
+        };
+        (*crate::low::expand::expand_tiles(&program, false).unwrap()).clone()
     }
 
     fn execute(program: &TileGraph) -> BTreeMap<(BlockValueId, u32), (BlockValueId, u32)> {
@@ -408,9 +324,10 @@ mod tests {
 
     #[test]
     fn relays_preserve_native_bytes_and_enter_normal_costing() {
-        let mut program = fixture();
-        let expected = execute(&program);
-        select(&mut program, &crate::storage::GeometryCache::default()).unwrap();
+        let direct = fixture(crate::CopyPolicy::DirectRetile);
+        let expected = execute(&direct);
+        let program = fixture(crate::CopyPolicy::GatherThenMulticast);
+        assert_eq!(direct.shards.len(), 48);
         assert_eq!(program.shards.len(), 52);
         assert_eq!(program.exchange_phases.len(), 1);
         assert_eq!(execute(&program), expected);
@@ -422,9 +339,9 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_overlapping_or_dependent_materializations_stay_direct() {
+    fn incomplete_overlapping_or_dependent_materializations_are_rejected() {
         for mode in 0..3 {
-            let mut program = fixture();
+            let mut program = fixture(crate::CopyPolicy::DirectRetile);
             match mode {
                 0 => {
                     program.exchange_phases[0].transfers.pop();
@@ -437,9 +354,14 @@ mod tests {
                     program.shards[32].definition = ShardDefinition::Alias(BlockValueId(0));
                 }
             }
-            let before = program.clone();
-            select(&mut program, &crate::storage::GeometryCache::default()).unwrap();
-            assert_eq!(program, before);
+            assert!(
+                gather(
+                    &mut program.shards,
+                    program.tile_count,
+                    &program.exchange_phases[0].transfers,
+                )
+                .is_err()
+            );
         }
     }
 }

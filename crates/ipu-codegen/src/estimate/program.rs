@@ -27,10 +27,10 @@ fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> 
     });
     if let Some((_, cycles)) = found {
         #[cfg(test)]
-        assert_eq!(*cycles, run.cycles());
+        assert_eq!(*cycles, run.call(None).map_or(u64::MAX, |call| call.cycles));
         return *cycles;
     }
-    let cycles = run.cycles();
+    let cycles = run.call(None).map_or(u64::MAX, |call| call.cycles);
     variants.push((run, cycles));
     cycles
 }
@@ -174,7 +174,7 @@ pub(crate) fn program_cycles(
                 ),
                 BlockOperation::Copy { tile, copy } => timeline.local(
                     usize::from(*tile),
-                    program.local_copies[copy.0 as usize].cycles(),
+                    program.local_copies[copy.0 as usize].call().cycles,
                 ),
                 BlockOperation::Exchange(phase) => {
                     let cycles = phases[phase.index() as usize];
@@ -196,21 +196,6 @@ pub(crate) fn program_cycles(
         &mut std::collections::HashMap::new(),
     )
     .cycles())
-}
-
-/// Compare transport realizations with the same geometry and row accounting
-/// used by complete-plan costing. Row storage is per tile, before row sharing.
-pub(crate) fn exchange_phase_estimate(
-    program: &TileGraph,
-    phase: &crate::ExchangePhase,
-    geometry: &GeometryCache,
-) -> ExpansionResult<(u64, Vec<u64>)> {
-    let mut storage = ExchangeStoragePhase::new(program.tile_count);
-    let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
-    Ok((
-        super::cycles::exchange_endpoint_cycles(&traffic, 1),
-        storage.row_bytes().collect(),
-    ))
 }
 
 fn geometry_traffic(
@@ -298,6 +283,7 @@ pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<Exchange
     program_footprint_analyzed(program, &GeometryCache::default())
 }
 
+#[cfg(test)]
 pub(crate) fn program_footprint_analyzed(
     program: &TileGraph,
     geometry: &GeometryCache,

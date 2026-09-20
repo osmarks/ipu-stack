@@ -2,15 +2,14 @@
 //! place storage, schedule exchanges, and emit the application.
 mod config;
 
-use crate::estimate::Ipu21CostModel;
 use crate::estimate::memory_profile::write as memory_profile;
 use crate::kernel::KernelObjects;
-use crate::low::LowProgram;
+use crate::low::LowGraph;
 use crate::package::{
     DiagnosticCheckpoint, PackageBuildResult, active_topology, diagnostic_tensor, package_inputs,
     package_multiply_precisions, package_precisions, validate_tile_count,
 };
-use crate::planner::build;
+use crate::planner;
 use ipu_elf::Toolchain;
 use std::{path::PathBuf, sync::Arc};
 
@@ -25,7 +24,7 @@ pub struct PackageConfig {
 }
 
 struct Compilation {
-    program: LowProgram,
+    program: LowGraph,
     placement: crate::Placement,
     exchanges: Vec<crate::exchange::PhysicalExchangePhase>,
     application: ipu_package::Application,
@@ -40,7 +39,7 @@ struct Compilation {
     fields(tile_count = config.pipeline.tile_count, operations = graph.operations().len())
 )]
 pub fn build_package(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
     build_package_with_checkpoints(graph, config, false)
@@ -50,14 +49,14 @@ pub fn build_package(
 /// top-level operator and returns the storage map needed for non-invasive
 /// numerical inspection.
 pub fn build_diagnostic_package(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
     build_package_with_checkpoints(graph, config, true)
 }
 
 fn build_package_with_checkpoints(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     config: &PackageConfig,
     diagnostic: bool,
 ) -> PackageBuildResult<CompiledPackage> {
@@ -127,7 +126,7 @@ fn build_package_with_checkpoints(
     })
 }
 
-fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildResult<Compilation> {
+fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResult<Compilation> {
     let config = &package.pipeline;
     validate_tile_count(u32::from(config.tile_count))?;
     let runtime =
@@ -138,14 +137,11 @@ fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildR
                     .compile(&package.runtime_source, "static_runtime", &[])?;
             Ok(std::fs::read(artifact.object)?)
         })?;
-    let mid = tracing::info_span!("build_baseline").in_scope(|| {
-        build::baseline(
-            graph,
-            config,
-            &crate::estimate::MemoizedCostModel::new(&Ipu21CostModel),
-            &crate::planner::cache::FragmentCache::default(),
-        )
-    })?;
+    let layouts = planner::boundary_layouts(graph, config);
+    let budgets = std::collections::BTreeMap::new();
+    // Planning will assign boundary layouts and operator budgets before construction.
+    let mid = tracing::info_span!("construct_mid")
+        .in_scope(|| planner::plan(graph, &layouts, &budgets, config))?;
     memory_profile(graph, config, &mid, "baseline")?;
     let mut cache = crate::ExchangeScheduleCache::default();
     let expansions = Arc::new(crate::storage::GeometryCache::default());
@@ -270,8 +266,8 @@ pub use exchange::{
     ExchangeActivity, ExchangeActivityKind, ExchangeScheduleCache, PhysicalExchangePhase,
 };
 pub use graph::{
-    AttentionOptions, AttentionScale, AxisFactorView, AxisSlice, ComputeGraph, GemmOptions,
-    GraphError, GraphInput, GraphInputKind, Operation, OperationId, OperationKind, Region, Repeat,
+    AttentionOptions, AttentionScale, AxisFactorView, AxisSlice, GemmOptions, GraphError,
+    GraphInput, GraphInputKind, HighGraph, Operation, OperationId, OperationKind, Region, Repeat,
     ValueId,
 };
 pub(crate) use kernel::*;

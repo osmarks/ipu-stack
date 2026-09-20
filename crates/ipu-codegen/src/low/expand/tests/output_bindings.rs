@@ -5,7 +5,7 @@ use crate::{
     CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandIndexing, TensorAxis, ValueId,
 };
 
-fn copied_columns(columns: u32) -> MidProgram {
+fn copied_columns(columns: u32) -> MidGraph {
     let values = [[4, 16], [4, columns]]
         .into_iter()
         .enumerate()
@@ -24,7 +24,7 @@ fn copied_columns(columns: u32) -> MidProgram {
             }
         })
         .collect();
-    MidProgram {
+    MidGraph {
         tile_count: 1,
         values,
         inputs: vec![MidInput {
@@ -39,14 +39,14 @@ fn copied_columns(columns: u32) -> MidProgram {
             results: vec![MidValueId::from_index(1)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
                 mapping: CoordinateMapping::default(),
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         }],
-        ..MidProgram::default()
+        ..MidGraph::default()
     }
 }
 
@@ -240,7 +240,7 @@ fn grouping_moves_complete_reductions_and_their_preparation() {
             kind: MidOperationKind::Copy {
                 mapping: CoordinateMapping::default(),
                 policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
             },
             operands: vec![],
             output_aliases: vec![],
@@ -407,7 +407,7 @@ fn intersection_conversions_read_materialized_crops() {
             kind: MidOperationKind::Copy {
                 mapping: CoordinateMapping::default(),
                 policy: CopyPolicy::DirectRetile,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
             },
             operands: Vec::new(),
             output_aliases: Vec::new(),
@@ -563,7 +563,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 }
             })
             .collect();
-        let mid = MidProgram {
+        let mid = MidGraph {
             values,
             tile_count: tiles,
             inputs: (0..2)
@@ -583,7 +583,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 output_windows: Vec::new(),
             }],
             outputs: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         mid.validate().unwrap();
         let graph = expand_tiles(&mid, false).unwrap();

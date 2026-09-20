@@ -1,7 +1,7 @@
 //! Check executable bindings at construction and rewrite boundaries. Physical
 //! address/access legality is checked later, against concrete kernel calls.
 
-use super::{MidOperation, MidProgram, MidValueId};
+use super::{MidOperation, MidGraph, MidValueId};
 use crate::OperandIndexing;
 use crate::mid::MidOperationKind;
 use std::collections::BTreeSet;
@@ -16,7 +16,7 @@ pub enum ProgramError {
 
 type ProgramResult<T> = Result<T, ProgramError>;
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn validate(&self) -> ProgramResult<()> {
         let invalid = |message| ProgramError::Invalid(message);
         for (index, value) in self.values.iter().enumerate() {
@@ -218,10 +218,10 @@ impl MidProgram {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
-    use crate::{ComputeGraph, PipelineConfig, Precision};
+    use crate::{HighGraph, PipelineConfig, Precision};
 
-    fn program(repeated: bool) -> MidProgram {
-        let mut graph = ComputeGraph::new();
+    fn program(repeated: bool) -> MidGraph {
+        let mut graph = HighGraph::new();
         let x = graph.host_input("x", [4, 16]).unwrap();
         let y = if repeated {
             graph

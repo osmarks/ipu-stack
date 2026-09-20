@@ -26,7 +26,7 @@ impl TensorStorage<'_> {
             .checked_sub(if columns { 1 } else { 2 })
             .ok_or(KernelError::RequirementMismatch)?;
         Ok(if logical {
-            self.logical_dimension(axis)
+            self.extents[axis].logical_end - self.extents[axis].start
         } else {
             self.dimension(axis)
         })
@@ -34,21 +34,12 @@ impl TensorStorage<'_> {
     pub(crate) fn dimension(self, axis: usize) -> u32 {
         self.extents[axis].physical_end - self.extents[axis].start
     }
-    pub(crate) fn trailing_dimension(self, offset: usize) -> Option<u32> {
-        self.extents
-            .len()
-            .checked_sub(offset + 1)
-            .map(|axis| self.dimension(axis))
-    }
     pub(crate) fn widths(self) -> impl DoubleEndedIterator<Item = u32> + ExactSizeIterator {
         self.extents.iter().map(|e| e.physical_end - e.start)
     }
     pub(crate) fn elements(self) -> u64 {
         self.widths()
             .fold(1u64, |n, width| n.saturating_mul(u64::from(width)))
-    }
-    pub(super) fn logical_dimension(self, axis: usize) -> u32 {
-        self.extents[axis].logical_end - self.extents[axis].start
     }
     pub(super) fn rows(self) -> u64 {
         self.widths()
@@ -116,10 +107,6 @@ impl KernelRun {
                     .map(|(i, view)| (MemoryOperand::Output(i as u16), view)),
             )
             .map(move |(operand, view)| (view.shard, self.kernel.access(operand, output).0))
-    }
-
-    pub(crate) fn cycles(&self) -> u64 {
-        self.call(None).map_or(u64::MAX, |call| call.cycles)
     }
 
     pub(super) fn geometry(&self, operand: MemoryOperand) -> TensorStorage<'_> {

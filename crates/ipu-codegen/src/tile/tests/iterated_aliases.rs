@@ -4,7 +4,7 @@ use crate::mid::MidOperationKind;
 
 use crate::*;
 
-fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
+fn iterated_sum(partials: u16) -> (LowGraph, Placement) {
     let id = MidValueId::from_index;
     let values = (0..7)
         .map(|i| {
@@ -30,7 +30,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
             }
         })
         .collect();
-    let mut mid = MidProgram {
+    let mut mid = MidGraph {
         tile_count: partials,
         values,
         outputs: vec![id(6)],
@@ -64,7 +64,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         }],
-        ..MidProgram::default()
+        ..MidGraph::default()
     };
     let outer = std::mem::take(&mut mid.operations);
     let output = mid.values[5].tensor_type.clone();

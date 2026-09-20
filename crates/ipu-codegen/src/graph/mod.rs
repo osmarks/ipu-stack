@@ -5,15 +5,15 @@
 //! residual and branching connections without making the dataflow a tree.
 //! Region-internal values cannot escape except through explicit yields.
 //!
-//! [`ComputeGraph::repeat`] separates loop-carried state, loop invariants, and
+//! [`HighGraph::repeat`] separates loop-carried state, loop invariants, and
 //! iterated value sequences. The latter allow one shared body to use different
 //! layer parameters on each iteration without unrolling it.
 //!
 //! ```
-//! use ipu_codegen::{ComputeGraph, GraphError};
+//! use ipu_codegen::{HighGraph, GraphError};
 //!
 //! # fn build() -> Result<(), GraphError> {
-//! let mut graph = ComputeGraph::new();
+//! let mut graph = HighGraph::new();
 //! let input = graph.host_input("input", [1, 1024])?;
 //! let layer_weights = (0..12)
 //!     .map(|layer| graph.parameter(format!("layer.{layer}.weight"), [1024, 1024]))
@@ -205,7 +205,7 @@ pub struct RepeatArguments {
 /// represented explicitly with `ValueId`. Nested regions provide structured
 /// control flow without turning residual and branching dataflow into a tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ComputeGraph {
+pub struct HighGraph {
     inputs: Vec<GraphInput>,
     sequences: Vec<ValueSequence>,
     operations: Vec<Operation>,
@@ -243,7 +243,7 @@ pub enum GraphError {
 
 pub type GraphResult<T> = std::result::Result<T, GraphError>;
 
-impl ComputeGraph {
+impl HighGraph {
     pub fn new() -> Self {
         Self::default()
     }
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn slices_validate_bounds_and_preserve_other_axes() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("qkv", [2, 17, 144]).unwrap();
         let key = graph.slice(input, 2, 48, 48).unwrap();
         assert_eq!(graph.value_shape(key), Some(&TensorShape(vec![2, 17, 48])));
@@ -716,7 +716,7 @@ mod tests {
             });
             expected.extend([rows, columns]);
 
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let left = graph.host_input("left", left_shape).unwrap();
             let right = graph.parameter("right", right_shape).unwrap();
             let output = graph.gemm_with_options(left, right, options).unwrap();
@@ -746,7 +746,7 @@ mod tests {
             value_shape.extend([key_rows, value_columns]);
             expected.extend([query_rows, value_columns]);
 
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let query = graph.host_input("q", query_shape).unwrap();
             let key = graph.host_input("k", key_shape).unwrap();
             let value = graph.host_input("v", value_shape).unwrap();
@@ -778,7 +778,7 @@ mod tests {
             let rows = random.u32(1..=256);
             let heads = random.u32(1..=32);
             let head_width = random.u32(1..=128);
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let input = graph
                 .host_input("projection", [batch, rows, heads * head_width])
                 .unwrap();
@@ -806,7 +806,7 @@ mod tests {
                 2 => f32::INFINITY,
                 _ => f32::NAN,
             };
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let query = graph.host_input("q", [4, 8]).unwrap();
             let key = graph.host_input("k", [4, 8]).unwrap();
             let value = graph.host_input("v", [4, 8]).unwrap();

@@ -29,18 +29,18 @@ pub struct RepeatRun {
 pub struct TileWorkList {
     pub tile: u16,
     /// Same operations as the device-wide graph; Repeat holds an index into
-    /// LowProgram::repeat_runs. Exchanges remain present on idle tiles for sync.
+    /// LowGraph::repeat_runs. Exchanges remain present on idle tiles for sync.
     pub work: Vec<BlockOperation<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LowProgram {
+pub struct LowGraph {
     pub program: Arc<TileGraph>,
     pub tiles: Vec<TileWorkList>,
     pub repeat_runs: Vec<RepeatRun>,
 }
 
-impl std::ops::Deref for LowProgram {
+impl std::ops::Deref for LowGraph {
     type Target = TileGraph;
     fn deref(&self) -> &Self::Target {
         &self.program
@@ -49,7 +49,7 @@ impl std::ops::Deref for LowProgram {
 
 /// Derive per-tile indexes from the executable graph without changing its work.
 /// Run low transformations before projection so costing and emission agree.
-pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) -> LowProgram {
+pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) -> LowGraph {
     fn project(
         region: &BlockRegion,
         program: &TileGraph,
@@ -116,7 +116,7 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
         &mut repeat_runs,
         diagnostic_checkpoints,
     );
-    LowProgram {
+    LowGraph {
         program: Arc::clone(program),
         tiles,
         repeat_runs,

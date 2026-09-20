@@ -10,7 +10,7 @@ use super::{
 };
 use crate::host;
 use crate::kernel::KernelObjects;
-use crate::low::LowProgram;
+use crate::low::LowGraph;
 use crate::memory::{
     MemoryAllocation, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, TileMemoryMap,
 };
@@ -42,7 +42,7 @@ pub(crate) struct PackageSupport {
 }
 
 pub(crate) fn size_support(
-    program: &LowProgram,
+    program: &LowGraph,
     provisional_placement: &crate::Placement,
     provisional_exchanges: &[crate::PhysicalExchangePhase],
     config: &PipelineConfig,

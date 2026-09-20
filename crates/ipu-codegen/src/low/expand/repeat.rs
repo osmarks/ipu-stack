@@ -200,7 +200,7 @@ mod tests {
                     2,
                     MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
-                        packing: crate::PackingPolicy::Automatic,
+                        packing: crate::PackingPolicy::Staged,
                         mapping: CoordinateMapping::default(),
                     },
                 ),

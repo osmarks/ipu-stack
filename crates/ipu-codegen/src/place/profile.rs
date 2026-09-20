@@ -54,7 +54,7 @@ impl Labels {
 }
 
 fn collect(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     support: &TileMemoryMap,
     application: &Application,
@@ -269,7 +269,7 @@ fn collect(
 
 pub(crate) fn write(
     directory: &Path,
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     support: &TileMemoryMap,
     application: &Application,
@@ -362,7 +362,7 @@ fn write_html(profile: &Profile, output: &Path) -> PackageBuildResult<()> {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
-    use crate::{ComputeGraph, PipelineConfig};
+    use crate::{HighGraph, PipelineConfig};
 
     #[test]
     fn rendering_splits_tiles_and_retains_reuse_geometry() {
@@ -415,7 +415,7 @@ mod tests {
     }
     #[test]
     fn report_covers_placed_aliases_and_reused_requests_exactly() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let x = graph.host_input("input</script>", [8, 64]).unwrap();
         let weights = (0..3)
             .map(|i| graph.parameter(format!("weights.{i}"), [64, 64]).unwrap())

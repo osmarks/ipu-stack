@@ -17,7 +17,7 @@ pub use tile_program::build_tile_program_package;
 use crate::exchange::ExchangeError;
 use crate::graph::{OperationId, ValueId};
 use crate::host;
-use crate::low::LowProgram;
+use crate::low::LowGraph;
 use crate::memory::{
     MemoryAllocation, MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE,
     TileMemoryMap,
@@ -80,7 +80,7 @@ pub enum PackageBuildError {
     #[error("invalid package build: {0}")]
     Invalid(String),
     #[error("planning failed: {0}")]
-    Planning(#[from] crate::planner::LoweringError),
+    Planning(#[from] crate::planner::PlanningError),
     #[error(transparent)]
     Program(#[from] crate::mid::ProgramError),
     #[error("tile scheduling failed: {0}")]
@@ -185,7 +185,7 @@ pub(crate) fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision
 }
 
 pub(crate) fn package_inputs(
-    low: &LowProgram,
+    low: &LowGraph,
     placement: &crate::Placement,
     topology: &Topology,
 ) -> PackageBuildResult<Vec<DiagnosticTensor>> {
@@ -204,7 +204,7 @@ pub(crate) fn package_inputs(
 }
 
 pub(crate) fn emit_package(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &crate::Placement,
     exchanges: &[crate::PhysicalExchangePhase],
     support: &PackageSupport,
@@ -439,7 +439,7 @@ fn reserve_exchange_setup(steps: &mut [crate::TileStep]) {
 }
 
 pub(crate) fn diagnostic_tensor(
-    low: &LowProgram,
+    low: &LowGraph,
     placement: &crate::Placement,
     topology: &Topology,
     value: crate::MidValueId,
@@ -729,7 +729,7 @@ fn link_runtime(
     )?)
 }
 
-fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Vec<&'static str> {
+fn runtime_retained_symbols(program: &LowGraph, config: &PipelineConfig) -> Vec<&'static str> {
     let mut symbols = vec![COMPLETE_SYMBOL];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL);
@@ -824,7 +824,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ComputeGraph;
+    use crate::HighGraph;
     use crate::estimate::Ipu21CostModel;
 
     #[test]
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn attention_scratch_does_not_override_result_precision() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let q = graph.host_input("q", [2, 17, 72]).unwrap();
         let k = graph.host_input("k", [2, 73, 72]).unwrap();
         let v = graph.host_input("v", [2, 73, 72]).unwrap();

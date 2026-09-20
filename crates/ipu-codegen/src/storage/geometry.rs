@@ -129,7 +129,6 @@ pub(crate) struct DestinationGeometry {
     pub semantic: bool,
     pub destination_word_aligned: bool,
     pub same_element_order: bool,
-    pub padding: bool,
 }
 impl DestinationGeometry {
     pub(crate) fn uncovered(&self) -> StorageResult<&[ByteSpan]> {
@@ -261,10 +260,6 @@ impl GeometryCache {
                 semantic: order == CopyOrder::Semantic,
                 destination_word_aligned: !destination_unaligned,
                 same_element_order,
-                padding: destination
-                    .extents
-                    .iter()
-                    .any(|e| e.physical_end > e.logical_end),
             })
         })
     }

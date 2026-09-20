@@ -1,11 +1,11 @@
 //! Relabel device tiles and bind compute operands to their result ownership.
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
+    CoordinateMapping, MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing,
     ProgramError,
 };
 use crate::tensor::OwnerMap;
-impl MidProgram {
+impl MidGraph {
     /// Relabel an already constructed program before expansion, for explicit
     /// transfer captures and the global recipe mapping.
     pub(crate) fn remap_tiles(&mut self, mapping: &[u16]) -> Result<(), ProgramError> {
@@ -147,7 +147,7 @@ fn append_owner_copy(
         results: vec![id],
         kind: MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
-            packing: crate::PackingPolicy::Automatic,
+            packing: crate::PackingPolicy::Staged,
             mapping: CoordinateMapping::default(),
         },
         operands: Vec::new(),

@@ -29,7 +29,7 @@ operator implementations live in `ipu-codegen`.
 
 ## Compilation
 
-`ipu-codegen::build_package` accepts a `ComputeGraph` and `PackageConfig`.
+`ipu-codegen::build_package` accepts a `HighGraph` and `PackageConfig`.
 High-level graphs describe tensor operations and structured repeats. Mid-level
 plans select whole-device implementations, precisions, and layouts, with
 explicit conversions and reductions. Low-level expansion produces per-tile

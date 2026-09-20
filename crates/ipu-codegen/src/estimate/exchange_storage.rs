@@ -4,10 +4,9 @@
 //! changes independently. Delays, bidi fusion and final row compatibility remain
 //! scheduler-dependent, so this is a ranking estimate, never a feasibility bound.
 
-use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// An ordered sequence fingerprint with associative concatenation. Unlike
 /// streaming a hasher, repeated subsequences can be composed in logarithmic time.
@@ -173,6 +172,7 @@ impl ExchangeStoragePhase {
             Some(address + u64::from(rows - 1) * u64::from(stride) + u64::from(bytes));
     }
 
+    #[cfg(test)]
     pub(crate) fn disable_sharing(&mut self, tile: u16) {
         self.shareable[usize::from(tile)] = false;
     }
@@ -185,11 +185,13 @@ impl ExchangeStoragePhase {
 /// Accumulate estimated table storage across static phases, sharing compatible
 /// address-independent transfer signatures. Hash matches predict sharing; only
 /// final encoded rows establish that sharing is actually possible.
+#[cfg(test)]
 pub struct ExchangeStorageEstimator {
     bytes: Vec<u64>,
     rows: Vec<HashMap<(u64, u64, u64), bool>>,
 }
 
+#[cfg(test)]
 impl ExchangeStorageEstimator {
     pub fn new(tiles: u16) -> Self {
         Self {

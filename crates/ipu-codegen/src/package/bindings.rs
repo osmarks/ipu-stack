@@ -10,7 +10,7 @@ pub(super) struct PackageBindings {
 
 impl PackageBindings {
     pub(super) fn new(
-        program: &LowProgram,
+        program: &LowGraph,
         placement: &crate::Placement,
         topology: &Topology,
         physical_to_logical: &[u16],
@@ -102,7 +102,7 @@ fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology)
 }
 
 fn binding(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &crate::Placement,
     topology: &Topology,
     name: String,

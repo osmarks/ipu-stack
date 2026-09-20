@@ -3,17 +3,11 @@
 mod cast;
 pub(super) mod movement;
 mod padding;
-mod relay;
 
 use super::{ExpansionResult, TileGraph};
 use crate::low::storage::storage_root;
-use crate::storage::GeometryCache;
 
-pub(super) fn run(
-    program: &mut TileGraph,
-    geometry: &GeometryCache,
-    reuse_cast_inputs: bool,
-) -> ExpansionResult<()> {
+pub(super) fn run(program: &mut TileGraph, reuse_cast_inputs: bool) -> ExpansionResult<()> {
     movement::eliminate_copies(program)?;
     let grouped = movement::group_exchanges(
         &mut program.body,
@@ -42,9 +36,6 @@ pub(super) fn run(
     }
     drop(old);
     drop(roots);
-    // Relay selection must see the merged exchanges. Padding analysis must
-    // then see every reader and scratch allocation introduced by that choice.
-    relay::select(program, geometry)?;
     if reuse_cast_inputs {
         cast::donate(program)?;
     }

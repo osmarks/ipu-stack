@@ -1,13 +1,13 @@
 //! Group independent reductions and distribute their preparation across tiles.
 //! These whole-program passes choose groups directly within each Repeat region.
 use super::{
-    MidOperation, MidProgram, MidValue, MidValueId, ProgramError, independent_copy_prefix,
+    MidOperation, MidGraph, MidValue, MidValueId, ProgramError, independent_copy_prefix,
 };
 use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, OwnerMap};
 use std::collections::{BTreeMap, BTreeSet};
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn group_reductions(&mut self, limit: usize) -> Result<(), ProgramError> {
         if limit < 2 {
             return Ok(());
@@ -364,12 +364,12 @@ fn separate_homes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{ComputeGraph, ValueId};
+    use crate::graph::{HighGraph, ValueId};
 
     use crate::mid::{CoordinateMapping, MidRegion, MidRepeat};
     use crate::tensor::{AxisFactorView, Layout, Precision, TensorType};
 
-    impl MidProgram {
+    impl MidGraph {
         fn separate_preparation(&self, checkpoints: bool) -> Option<Self> {
             let mut program = self.clone();
             program.distribute_preparation(checkpoints).unwrap();
@@ -384,13 +384,13 @@ mod tests {
 
     #[test]
     fn independent_copy_roots_rotate_without_moving_partials_or_shared_results() {
-        let mut provenance = ComputeGraph::new();
+        let mut provenance = HighGraph::new();
         let input = provenance.host_input("x", [16]).unwrap();
         provenance.gelu(input).unwrap();
         let source = provenance.operations()[0].id;
-        let mut program = MidProgram {
+        let mut program = MidGraph {
             tile_count: 16,
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         let mut layout = Layout::row_sharded(4);
         layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
@@ -418,7 +418,7 @@ mod tests {
                 output,
                 MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
-                    packing: crate::PackingPolicy::Automatic,
+                    packing: crate::PackingPolicy::Staged,
                     mapping: CoordinateMapping {
                         offsets: vec![],
                         view: Some(AxisFactorView {
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(overlapped.values[1].owners.rotation(), 4);
         // The same transformations must work in the repeated encoder, while
         // treating its yields as externally live values.
-        let wrap = |mut body: MidProgram, yields: Vec<MidValueId>| {
+        let wrap = |mut body: MidGraph, yields: Vec<MidValueId>| {
             let operations = std::mem::take(&mut body.operations);
             body.outputs.clear();
             body.operations.push(MidOperation {
@@ -566,7 +566,7 @@ mod tests {
             1
         );
         let mut boundary = copy(1, 3);
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("x", [16]).unwrap();
         let first = graph.gelu(input).unwrap();
         graph.gelu(first).unwrap();

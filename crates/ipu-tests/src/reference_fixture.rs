@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, ensure};
-use ipu_codegen::{CompiledPackage, ComputeGraph, GraphInputKind};
+use ipu_codegen::{CompiledPackage, HighGraph, GraphInputKind};
 use ipu_package::Application;
 use ipu_runtime::Runtime;
 use serde_json::Value;
@@ -51,7 +51,7 @@ fn tensor(root: &Path, entry: &Value, shape: &[u32]) -> Result<HostTensor> {
 }
 
 /// Fail before planning if the checkpoint does not match this graph.
-pub(crate) fn validate(root: &Path, graph: &ComputeGraph, count: u32) -> Result<()> {
+pub(crate) fn validate(root: &Path, graph: &HighGraph, count: u32) -> Result<()> {
     let manifest: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
     let cases = manifest["cases"]
         .as_array()
@@ -89,7 +89,7 @@ pub(crate) fn validate(root: &Path, graph: &ComputeGraph, count: u32) -> Result<
 pub(crate) fn run(
     runtime: &Runtime,
     application: &Application,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     package: &CompiledPackage,
     root: &Path,
     timeout: u64,
@@ -192,7 +192,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ipu-fixture-{}", fastrand::u64(..)));
         fs::create_dir(&root)?;
         let result = (|| -> Result<()> {
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let x = graph.host_input("image", [1, 2])?;
             let w = graph.parameter("weight", [1, 2])?;
             let output = graph.add(x, w)?;
@@ -229,7 +229,7 @@ mod tests {
 /// Apply calibrated fixed scales to graph parameters and their GEMM consumers.
 /// Repeat binds parameter sequences to body arguments; every instance must agree.
 pub(crate) fn configure(
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     pipeline: &mut ipu_codegen::PipelineConfig,
     path: &Path,
 ) -> Result<()> {
@@ -281,7 +281,7 @@ pub(crate) fn configure(
     }
     fn visit(
         operations: &[Operation],
-        graph: &ComputeGraph,
+        graph: &HighGraph,
         parameters: &mut BTreeMap<ValueId, Precision>,
         choices: &mut BTreeMap<ipu_codegen::OperationId, Precision>,
     ) -> Result<()> {

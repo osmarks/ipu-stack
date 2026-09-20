@@ -204,7 +204,7 @@ fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32
     if input.extents.len() < 2 {
         return Err(KernelError::RequirementMismatch);
     }
-    let columns = u64::from(output.trailing_dimension(0).unwrap());
+    let columns = u64::from(output.matrix_extent(false, true)?);
     if columns == 0
         || (row_pack
             && (!columns.is_multiple_of(32)
@@ -217,8 +217,9 @@ fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32
     if order == ElementOrder::Amp(AmpOrder::Left)
         && rows == 1
         && input.elements() == count
-        && (input.extents.len() - 2..input.extents.len())
-            .all(|axis| input.logical_dimension(axis) == input.dimension(axis))
+        && input.extents[input.extents.len() - 2..]
+            .iter()
+            .all(|extent| extent.logical_end == extent.physical_end)
     {
         return Ok(0);
     }

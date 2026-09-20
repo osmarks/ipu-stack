@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionProducts, AttentionStrategy, AxisFactorView, BlockMajorOrder,
-    CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
+    CompiledPackage, HighGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
     MemoryClass, OperatorFamily, PackageConfig, PipelineConfig, Precision, ReductionStaging,
     TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
     build_package,
@@ -659,7 +659,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut graph = ComputeGraph::default();
+    let mut graph = HighGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     if let Some(width) = arguments.operator_candidate_limit {
         pipeline = pipeline.with_operator_candidate_limit(width);
@@ -1407,7 +1407,7 @@ fn run_gemm(
 fn run_reference(
     runtime: &Runtime,
     application: &Application,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     package: &CompiledPackage,
     timeout_seconds: u64,
     check: ReferenceCheck,
@@ -1865,7 +1865,7 @@ fn run_gemm_benchmark(
 fn run_siglip_mlp_benchmark(
     runtime: &Runtime,
     application: &Application,
-    graph: &ComputeGraph,
+    graph: &HighGraph,
     package: &CompiledPackage,
     execution_tiles: u16,
     batch: u32,
@@ -2530,7 +2530,7 @@ mod tests {
                 Precision::F32
             };
             let tensor_type = TensorType::new(shape, precision, layout);
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let value = graph.host_input("output.0", shape)?;
             let mut tensor = DiagnosticTensor {
                 name: Some("output.0".into()),

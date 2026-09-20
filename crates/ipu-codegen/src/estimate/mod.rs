@@ -3,9 +3,12 @@
 
 use crate::storage::GeometryCache;
 mod cycles;
+#[cfg(test)]
+use cycles::ExchangeFootprint;
 use cycles::exchange_fragment_price;
 mod exchange_storage;
-pub(crate) use exchange_storage::ExchangeStorageEstimator;
+#[cfg(test)]
+use exchange_storage::ExchangeStorageEstimator;
 use exchange_storage::ExchangeStoragePhase;
 mod memory;
 pub(crate) mod memory_profile;
@@ -18,9 +21,7 @@ pub(crate) use mid::{
 };
 #[cfg(test)]
 pub(crate) use program::program_cycles;
-pub(crate) use program::{
-    ProgramCycles, exchange_phase_estimate, program_footprint_analyzed, scheduled_program_cycles,
-};
+pub(crate) use program::{ProgramCycles, scheduled_program_cycles};
 mod movement;
 mod tensor;
 mod traffic;
@@ -29,10 +30,12 @@ use crate::graph::TensorShape;
 use crate::{
     ElementOrder, Layout, MemoryClass, MidOperation, MidValue, MidValueId, Precision, TensorType,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
-pub use cycles::{CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel};
-pub(crate) use cycles::{EXCHANGE_FRAGMENT_CONTROLS, MemoizedCostModel, exchange_work_cycles};
+pub(crate) use cycles::MemoizedCostModel;
+pub use cycles::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel};
 pub(crate) use memory::*;
 pub use memory::{MemoryPeaks, MemoryUsage};
 pub(crate) use tensor::*;

@@ -1,7 +1,7 @@
 //! Coordinate-copy semantics and composition before tile expansion.
 
 use crate::mid::MidOperationKind;
-use crate::mid::{MidOperation, MidProgram, MidValue, MidValueId};
+use crate::mid::{MidOperation, MidGraph, MidValue, MidValueId};
 use crate::tensor::{AxisFactorView, TensorShape};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,6 +27,9 @@ pub enum CopyPolicy {
     LocalKernel,
     /// Transfer compatible physical spans directly to their destination.
     DirectRetile,
+    /// Gather complete native panels on relay tiles, then multicast them.
+    /// Requires compatible physical order and complete, unpadded panels.
+    GatherThenMulticast,
     /// Transfer logical values through row-major staging, then pack locally.
     StageLogicalThenTransform,
 }
@@ -55,11 +58,11 @@ pub(crate) fn default_copy_policy(from: &crate::Layout, to: &crate::Layout) -> C
     serde::Deserialize,
 )]
 pub enum PackingPolicy {
-    #[default]
-    Automatic,
     /// Use direct word movement without destination packing scratch.
     Direct,
-    /// Populate row-major scratch, then pack into the destination.
+    /// For a format conversion, populate row-major scratch and pack locally.
+    /// Copies already in their destination order need no packing scratch.
+    #[default]
     Staged,
 }
 
@@ -203,7 +206,7 @@ impl CoordinateMapping {
     }
 }
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn compose_copies(&mut self) {
         compose_region(&mut self.operations, &self.values, &self.outputs);
     }
@@ -243,15 +246,21 @@ pub(crate) fn independent_copy_prefix(
         .count()
 }
 
-// Forced packing belongs to the present source/destination pair. Composition
-// preserves that boundary until it can prove the requested realization survives.
+// Direct packing and relay requests belong to the present source/destination
+// pair. Preserve those boundaries until composition can prove them realizable.
 fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, CopyPolicy)> {
     match &operation.kind {
         MidOperationKind::Copy {
             mapping,
             policy,
-            packing: crate::PackingPolicy::Automatic,
-        } if *policy != CopyPolicy::LocalKernel => Some((mapping.clone(), *policy)),
+            packing: crate::PackingPolicy::Staged,
+        } if !matches!(
+            policy,
+            CopyPolicy::LocalKernel | CopyPolicy::GatherThenMulticast
+        ) =>
+        {
+            Some((mapping.clone(), *policy))
+        }
         _ => None,
     }
 }
@@ -363,7 +372,7 @@ pub(super) fn compose(
             operations[index].inputs[0] = input;
             operations[index].kind = MidOperationKind::Copy {
                 policy,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
                 mapping: next,
             };
         }
@@ -492,7 +501,7 @@ mod tests {
                 results: vec![MidValueId(index)],
                 kind: MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
-                    packing: crate::PackingPolicy::Automatic,
+                    packing: crate::PackingPolicy::Staged,
                     mapping: CoordinateMapping::default(),
                 },
                 operands: Vec::new(),

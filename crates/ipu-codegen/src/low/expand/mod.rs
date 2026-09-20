@@ -20,7 +20,7 @@ use crate::storage::ByteSpan;
 use crate::storage::StorageError;
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
-    LayoutError, MemoryClass, MidOperation, MidProgram, MidRepeat, MidValueId, PackingPolicy,
+    LayoutError, MemoryClass, MidOperation, MidGraph, MidRepeat, MidValueId, PackingPolicy,
     Precision, ShardExtent, TensorTiling, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,7 +57,7 @@ pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
 #[cfg(test)]
 pub(crate) fn expand_tiles(
-    graph: &MidProgram,
+    graph: &MidGraph,
     checkpoints: bool,
 ) -> ExpansionResult<Arc<TileGraph>> {
     expand_tiles_cached(
@@ -69,7 +69,7 @@ pub(crate) fn expand_tiles(
 }
 
 pub(crate) fn expand_tiles_cached(
-    graph: &MidProgram,
+    graph: &MidGraph,
     checkpoints: bool,
     reuse_cast_inputs: bool,
     cache: Arc<GeometryCache>,
@@ -88,7 +88,7 @@ pub(crate) fn expand_tiles_cached(
         state.value_views(value)?;
     }
     let mut program = state.program;
-    crate::low::passes::run(&mut program, &cache, reuse_cast_inputs)?;
+    crate::low::passes::run(&mut program, reuse_cast_inputs)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),
@@ -105,7 +105,7 @@ struct TileGraphBuilder {
 }
 
 impl TileGraphBuilder {
-    fn new(graph: &MidProgram, cache: Arc<GeometryCache>) -> ExpansionResult<Self> {
+    fn new(graph: &MidGraph, cache: Arc<GeometryCache>) -> ExpansionResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
             cache,

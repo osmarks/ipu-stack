@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn profile_binding(
-    program: &LowProgram,
+    program: &LowGraph,
     physical_to_logical: &[u16],
     addresses: &[u32],
 ) -> PackageBuildResult<Binding> {
@@ -48,7 +48,7 @@ pub(super) fn profile_binding(
 }
 
 pub(super) fn instrument_profile(
-    program: &LowProgram,
+    program: &LowGraph,
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     physical_tile: u32,
@@ -123,7 +123,7 @@ pub(super) fn instrument_profile(
 
 #[allow(clippy::too_many_arguments)]
 fn instrument_active_steps(
-    program: &LowProgram,
+    program: &LowGraph,
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     schedule: &[crate::BlockOperation<usize>],
@@ -243,7 +243,7 @@ fn instrument_active_steps(
     Ok(())
 }
 
-pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<&crate::BlockOperation<usize>> {
+pub(super) fn inactive_profile_work(program: &LowGraph) -> Vec<&crate::BlockOperation<usize>> {
     program
         .tiles
         .first()
@@ -260,7 +260,7 @@ pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<&crate::BlockOp
         .collect()
 }
 
-pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkList) -> usize {
+pub(super) fn profile_step_count(program: &LowGraph, tile: &crate::TileWorkList) -> usize {
     let mut previous = None;
     let mut count = 0;
     for work in tile.work.iter() {
@@ -283,7 +283,7 @@ pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkLis
 }
 
 fn profile_work_can_merge(
-    program: &LowProgram,
+    program: &LowGraph,
     previous: &crate::BlockOperation<usize>,
     current: &crate::BlockOperation<usize>,
 ) -> bool {
@@ -316,7 +316,7 @@ fn profile_work_can_merge(
 
 #[allow(clippy::too_many_arguments)]
 fn profile_step(
-    program: &LowProgram,
+    program: &LowGraph,
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     index: usize,
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn active_tiles_with_empty_repeat_bodies_have_complete_samples() {
         for count in [1, 3] {
-            let mut graph = crate::ComputeGraph::new();
+            let mut graph = crate::HighGraph::new();
             let input = graph.host_input("input", [8, 16]).unwrap();
             let output = graph
                 .repeat(count, [input], [], [], |body, args| {
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn repeat_profiles_first_iteration_and_aggregates_remainder() {
-        let mut graph = crate::ComputeGraph::new();
+        let mut graph = crate::HighGraph::new();
         let input = graph.host_input("input", [8, 16]).unwrap();
         let output = graph
             .repeat(3, [input], [], [], |body, arguments| {

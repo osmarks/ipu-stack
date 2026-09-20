@@ -2,7 +2,7 @@
 
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidOperation, MidProgram, MidValue, MidValueId, OperandIndexing,
+    CoordinateMapping, MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -91,7 +91,7 @@ pub(crate) fn cast_layout(input: &TensorType) -> Option<Layout> {
     valid.then_some(layout)
 }
 
-impl MidProgram {
+impl MidGraph {
     pub(crate) fn reorder_casts(&mut self) {
         reorder_region(&mut self.operations, &mut self.values, &self.outputs);
     }
@@ -216,7 +216,7 @@ fn reorder_region(
         copy.inputs = vec![id];
         copy.kind = MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
-            packing: crate::PackingPolicy::Automatic,
+            packing: crate::PackingPolicy::Direct,
             mapping: CoordinateMapping::default(),
         };
         before.entry(index).or_default().push(copy);
@@ -239,8 +239,8 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> MidProgram {
-        let mut graph = crate::ComputeGraph::new();
+    fn fixture() -> MidGraph {
+        let mut graph = crate::HighGraph::new();
         let input = graph.host_input("x", [16, 64]).unwrap();
         graph.gelu(input).unwrap();
         let source = graph.operations()[0].id;
@@ -267,14 +267,14 @@ mod tests {
             MidOperationKind::Copy {
                 mapping: CoordinateMapping::default(),
                 policy: CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
+                packing: crate::PackingPolicy::Staged,
             },
             MidOperationKind::Cast {
                 from: Precision::F16,
                 to: Precision::F8F143 { scale_exponent: -4 },
             },
         ];
-        MidProgram {
+        MidGraph {
             tile_count: 4,
             inputs: vec![MidInput {
                 name: "input".into(),
@@ -300,7 +300,7 @@ mod tests {
                 })
                 .collect(),
             outputs: vec![MidValueId(2)],
-            ..MidProgram::default()
+            ..MidGraph::default()
         }
     }
 
@@ -382,7 +382,7 @@ mod tests {
                 results: vec![source],
                 kind: MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
-                    packing: crate::PackingPolicy::Automatic,
+                    packing: crate::PackingPolicy::Staged,
                     mapping: CoordinateMapping::default(),
                 },
                 operands: Vec::new(),

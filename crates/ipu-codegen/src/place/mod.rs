@@ -8,7 +8,7 @@ mod search;
 
 use crate::MemoryClass;
 use crate::low::storage::StorageAccess;
-use crate::low::{BlockOperation, LowProgram, TileWorkList};
+use crate::low::{BlockOperation, LowGraph, TileWorkList};
 use crate::{BlockValueId, ShardDefinition};
 use crate::{StorageError, shard_storage_bytes};
 use ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT;
@@ -103,7 +103,7 @@ pub(crate) const HOST_SCRATCH_RANGE: (u32, u32) = (
         + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES,
 );
 
-pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
+pub fn place(program: &LowGraph) -> Result<Placement, PlacementError> {
     place_with_ranges(
         program,
         &[
@@ -114,14 +114,14 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
 }
 
 pub(crate) fn place_with_ranges(
-    program: &LowProgram,
+    program: &LowGraph,
     available_ranges: &[(u32, u32)],
 ) -> Result<Placement, PlacementError> {
     place_with_offset(program, available_ranges, 0)
 }
 
 pub(crate) fn place_with_offset(
-    program: &LowProgram,
+    program: &LowGraph,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
 ) -> Result<Placement, PlacementError> {
@@ -129,7 +129,7 @@ pub(crate) fn place_with_offset(
 }
 
 pub(crate) fn place_with_auxiliary(
-    program: &LowProgram,
+    program: &LowGraph,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
     auxiliary: &[Vec<AuxiliaryRequest>],
@@ -217,7 +217,7 @@ struct TileAllocations {
     members: BTreeMap<usize, Vec<usize>>,
 }
 
-fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, PlacementError> {
+fn analyze_allocations(program: &LowGraph) -> Result<AllocationAnalysis, PlacementError> {
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
         let (target, offset) = match shard.definition {
@@ -336,7 +336,7 @@ struct TilePlacement {
 }
 
 fn place_tile(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: u16,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
@@ -408,7 +408,7 @@ fn place_tile(
 }
 
 fn shards_by_tile(
-    program: &LowProgram,
+    program: &LowGraph,
     shards: impl IntoIterator<Item = BlockValueId>,
 ) -> Vec<Vec<BlockValueId>> {
     let mut tiles = vec![Vec::new(); usize::from(program.tile_count)];
@@ -422,7 +422,7 @@ fn shards_by_tile(
     tiles
 }
 
-fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
+fn collect_lifetimes(program: &LowGraph) -> Vec<Lifetime> {
     // Each global phase appears in every tile's projection. Index its touched
     // blocks once instead of scanning all device transfers once per tile.
     let exchanges = program
@@ -476,7 +476,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
 }
 
 fn touch_work(
-    program: &LowProgram,
+    program: &LowGraph,
     work: &BlockOperation<usize>,
     tile: u16,
     event: &mut u32,
@@ -524,7 +524,7 @@ fn touch_work(
 }
 
 fn collect_repeat_constraints(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: &TileWorkList,
     sets: &mut DisjointSets,
     iterated: &mut Vec<IteratedGroup>,
@@ -557,7 +557,7 @@ fn collect_repeat_constraints(
 }
 
 fn collect_requirements(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: &TileWorkList,
     requirements: &mut [StorageAccess],
     pairs: &mut Vec<(usize, usize)>,
@@ -603,7 +603,7 @@ fn collect_requirements(
 }
 
 fn checked_union(
-    program: &LowProgram,
+    program: &LowGraph,
     sets: &mut DisjointSets,
     left: BlockValueId,
     right: BlockValueId,
@@ -621,7 +621,7 @@ fn checked_union(
 }
 
 fn validate_alias_groups(
-    program: &LowProgram,
+    program: &LowGraph,
     members: &BTreeMap<usize, Vec<usize>>,
 ) -> Result<(), PlacementError> {
     for group in members.values() {
@@ -639,7 +639,7 @@ fn validate_alias_groups(
 }
 
 fn allocation_bytes(
-    program: &LowProgram,
+    program: &LowGraph,
     members: &[usize],
     member_offsets: &[u32],
     requirement: StorageAccess,
@@ -653,7 +653,7 @@ fn allocation_bytes(
     })
 }
 
-fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
+fn memory_element_size(program: &LowGraph, members: &[usize]) -> u32 {
     match program.shards[members[0]]
         .tensor_type
         .format
@@ -683,7 +683,7 @@ fn assign_members(
 }
 
 fn allocation_requests(
-    program: &LowProgram,
+    program: &LowGraph,
     analysis: &AllocationAnalysis,
     tile: u16,
 ) -> Result<Vec<AllocationRequest>, PlacementError> {
@@ -812,7 +812,7 @@ fn allocation_requests(
 }
 
 fn allocate_tile(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: u16,
     analysis: &AllocationAnalysis,
     arena: &mut Arena,
@@ -913,7 +913,7 @@ fn allocate_tile(
 }
 
 fn allocate_requests(
-    program: &LowProgram,
+    program: &LowGraph,
     tile: u16,
     requests: &[AllocationRequest],
     members: &BTreeMap<usize, Vec<usize>>,
@@ -1207,7 +1207,7 @@ mod tests {
     use crate::estimate::Ipu21CostModel;
     use crate::planner::test_support::lower;
     use crate::{
-        ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles,
+        HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles,
         materialize_kernel_run,
     };
 
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn auxiliary_storage_joins_tensor_placement_and_survives_readback() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let parameter = graph.parameter("p", [1, 128]).unwrap();
         let output = graph.gelu(parameter).unwrap();
         graph.set_outputs([output]).unwrap();
@@ -1323,7 +1323,7 @@ mod tests {
     #[test]
     fn pointwise_parameter_input_is_never_overwritten() {
         for case in 0..3 {
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let parameter = graph.parameter("p", [8, 64]).unwrap();
             let output = match case {
                 0 => graph.gelu(parameter).unwrap(),
@@ -1405,7 +1405,7 @@ mod tests {
         let start = IPU21_INTERLEAVED_MEMORY_BASE + 4096;
         let available = [(start, start + 4096)];
         for class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let input = graph.host_input("x", [1, 128]).unwrap();
             graph.set_outputs([input]).unwrap();
             let mut layout = Layout::row_sharded(1);
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[test]
     fn repeat_bank_separation_reserves_the_sequence_without_padding_each_member() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let carried = graph.host_input("carried", [8, 16]).unwrap();
         let parameters = (0..3)
             .map(|index| {
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[test]
     fn output_lifetimes_follow_ownership_not_output_list_order() {
-        let mut graph = ComputeGraph::new();
+        let mut graph = HighGraph::new();
         let input = graph.host_input("input", [8, 16]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
@@ -1847,7 +1847,7 @@ mod tests {
             let tiles = 1_u16 << random.u32(0..=3);
             let rows = u32::from(tiles) * random.u32(1..=8);
             let columns = random.u32(1..=2) * 64;
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let left = graph.host_input("left", [rows, 64]).unwrap();
             let right = graph.parameter("right", [64, columns]).unwrap();
             let output = graph.gemm(left, right).unwrap();
@@ -1948,7 +1948,7 @@ mod tests {
         for _ in 0..48 {
             let tiles = 1_u16 << random.u32(0..=3);
             let rows = u32::from(tiles) * random.u32(1..=8);
-            let mut graph = ComputeGraph::new();
+            let mut graph = HighGraph::new();
             let left = graph.host_input("left", [rows, 64]).unwrap();
             let right = graph.host_input("right", [rows, 64]).unwrap();
             let sum = graph.add(left, right).unwrap();

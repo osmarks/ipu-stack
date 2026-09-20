@@ -1,5 +1,5 @@
 //! Bind executable work to enclosing inputs and return its actual result values.
-use super::{MidOperation, MidProgram, MidValue, MidValueId};
+use super::{MidOperation, MidGraph, MidValue, MidValueId};
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidOperationKind;
 use crate::tensor::OwnerMap;
@@ -10,7 +10,7 @@ use crate::tensor::OwnerMap;
 /// Returning an input or returning one value twice needs no extra operation.
 /// Failure leaves both caller vectors unchanged.
 pub(crate) fn append_fragment(
-    fragment: &MidProgram,
+    fragment: &MidGraph,
     inputs: &[MidValueId],
     working: &OwnerMap,
     source: Option<OperationId>,
@@ -158,7 +158,7 @@ mod tests {
             value: id(i),
         }
     }
-    fn repeated_add() -> MidProgram {
+    fn repeated_add() -> MidGraph {
         let mut values = (0..7).map(value).collect::<Vec<_>>();
         for i in [0, 3, 4, 6] {
             values[i].storage_group = id(0);
@@ -176,7 +176,7 @@ mod tests {
             output_aliases: vec![(0, 0)],
             output_windows: Vec::new(),
         };
-        let mut program = MidProgram {
+        let mut program = MidGraph {
             tile_count: 4,
             values,
             inputs: (0..3).map(input).collect(),
@@ -200,12 +200,12 @@ mod tests {
                 output_aliases: Vec::new(),
                 output_windows: Vec::new(),
             }],
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         crate::mid::ownership::bind_owners(&mut program.operations, &mut program.values).unwrap();
         program
     }
-    fn caller() -> MidProgram {
+    fn caller() -> MidGraph {
         let mut values = (0..5).map(value).collect::<Vec<_>>();
         for i in [2] {
             values[i].storage_group = id(2);
@@ -215,11 +215,11 @@ mod tests {
             values[i].storage_group = id(3);
             values[i].owners = crate::tensor::OwnerMap::rotated(9);
         }
-        MidProgram {
+        MidGraph {
             tile_count: 16,
             inputs: (0..5).map(input).collect(),
             values,
-            ..MidProgram::default()
+            ..MidGraph::default()
         }
     }
 
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn repeat_copies_a_moved_body_result_back_to_its_carried_home() {
         let mut program = repeated_add();
-        let mut graph = crate::ComputeGraph::new();
+        let mut graph = crate::HighGraph::new();
         let input = graph.host_input("x", [1, 16]).unwrap();
         graph.add(input, input).unwrap();
         let source = graph.operations()[0].id;
@@ -307,15 +307,15 @@ mod tests {
 
     #[test]
     fn small_result_home_does_not_restrict_working_owners() {
-        let mut graph = crate::ComputeGraph::new();
+        let mut graph = crate::HighGraph::new();
         let input_value = graph.host_input("x", [4, 16]).unwrap();
         graph.gelu(input_value).unwrap();
-        let mut fragment = MidProgram {
+        let mut fragment = MidGraph {
             tile_count: 4,
             inputs: vec![input(0)],
             outputs: vec![id(2)],
             values: (0..3).map(value).collect(),
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         for index in 0..3 {
             fragment.values[index].tensor_type = TensorType::new(
@@ -332,18 +332,18 @@ mod tests {
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
                     policy: CopyPolicy::Automatic,
-                    packing: PackingPolicy::Automatic,
+                    packing: PackingPolicy::Staged,
                 },
                 operands: Vec::new(),
                 output_aliases: Vec::new(),
                 output_windows: Vec::new(),
             });
         }
-        let mut bound = MidProgram {
+        let mut bound = MidGraph {
             tile_count: 16,
             inputs: vec![input(0)],
             values: vec![fragment.values[0].clone()],
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         bound.values[0].owners = OwnerMap::embedded(vec![1, 4, 7, 9]);
         let original = bound.clone();
@@ -484,18 +484,18 @@ mod tests {
 
     #[test]
     fn returning_an_input_reuses_the_value_in_every_result_slot() {
-        let fragment = MidProgram {
+        let fragment = MidGraph {
             tile_count: 1,
             inputs: vec![input(0)],
             values: vec![value(0)],
             outputs: vec![id(0), id(0)],
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
-        let mut bound = MidProgram {
+        let mut bound = MidGraph {
             tile_count: 1,
             inputs: vec![input(1)],
             values: (0..2).map(value).collect(),
-            ..MidProgram::default()
+            ..MidGraph::default()
         };
         bound.outputs = append_fragment(
             &fragment,

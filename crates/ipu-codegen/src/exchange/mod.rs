@@ -49,7 +49,7 @@ mod relocation;
 mod reuse;
 pub use reuse::ExchangeScheduleCache;
 
-use crate::{BlockValueId, ExchangePhaseId, LowProgram, Placement};
+use crate::{BlockValueId, ExchangePhaseId, LowGraph, Placement};
 
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -190,7 +190,7 @@ pub enum ExchangeLoweringError {
 
 #[cfg(test)]
 pub(crate) fn lower_exchanges(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     topology: &Topology,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
@@ -204,7 +204,7 @@ pub(crate) fn lower_exchanges(
 }
 
 pub(crate) fn lower_exchanges_cached(
-    program: &LowProgram,
+    program: &LowGraph,
     placement: &Placement,
     topology: &Topology,
     stream_words: Option<std::num::NonZeroU32>,

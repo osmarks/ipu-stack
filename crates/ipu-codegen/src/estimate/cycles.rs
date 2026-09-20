@@ -213,6 +213,12 @@ impl CostModel for Ipu21CostModel {
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
+        if strategy == CopyPolicy::GatherThenMulticast {
+            return RearrangementCost {
+                cycles: u64::MAX / 8,
+                exchange_cycles: u64::MAX / 8,
+            };
+        }
         let strategy = if strategy == CopyPolicy::Automatic {
             crate::default_copy_policy(from, to)
         } else {

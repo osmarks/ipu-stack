@@ -36,7 +36,7 @@ assume that today's crate boundaries are the intended final ones.
 
 ## Representation invariants worth preserving
 
-`ComputeGraph` is shaped structured SSA. Add uses NumPy-style broadcasting;
+`HighGraph` is shaped structured SSA. Add uses NumPy-style broadcasting;
 GEMM contracts its final matrix axes and broadcasts leading axes. Implementation
 support is narrower than semantic shape support in some cases. Repeat retains a
 shared body with carried values, invariants and parameter sequences.
