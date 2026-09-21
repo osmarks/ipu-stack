@@ -4,6 +4,7 @@
 
 pub(crate) mod budget;
 mod candidates;
+mod elementwise;
 mod search;
 
 use crate::Layout;
