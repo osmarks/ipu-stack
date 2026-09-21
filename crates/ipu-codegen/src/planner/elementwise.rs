@@ -145,11 +145,17 @@ fn build(
             continue;
         }
         let original = candidate.bindings[&input];
-        let value = candidate.copy(op.id, original, tensor.clone(), Vec::new());
+        let value = super::construction::copy(
+            &mut candidate.graph,
+            op.id,
+            original,
+            tensor.clone(),
+            Vec::new(),
+        );
         inputs.push(value);
         prepared.insert(input, value);
     }
-    let value = candidate.value(output, tensor, owners);
+    let value = super::construction::value(&mut candidate.graph, output, tensor, owners);
     candidate.graph.operations.push(MidOperation {
         source: Some(high.operations()[end - 1].id),
         operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],

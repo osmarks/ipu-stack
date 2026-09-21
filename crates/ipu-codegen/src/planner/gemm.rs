@@ -2,6 +2,7 @@
 //! products, and their reduction are emitted here, before costing or lowering.
 
 use super::candidates::{Candidate, LiveValues};
+use super::construction::{copy, value};
 use super::{BoundaryLayouts, PlanningError, PlanningResult};
 use crate::graph::{GemmOptions, HighGraph, ValueId};
 use crate::kernel::{AccumulationPrecision, GemmAxes, GemmKernelMode, GemmWeightLoad};
@@ -117,13 +118,77 @@ pub(super) fn generate(
     high: &HighGraph,
     position: usize,
     live: &LiveValues,
-    choices: &BoundaryLayouts,
+    layouts: &BoundaryLayouts,
     config: &PipelineConfig,
     selectable: &[ValueId],
     options: GemmOptions,
 ) -> PlanningResult<Vec<Candidate>> {
     let op = &high.operations()[position];
+    let origin = op.results[0];
+    let shape = high.value_shape(origin).unwrap();
     let sources = [&live[&op.inputs[0]].tensor, &live[&op.inputs[1]].tensor];
+    let mut candidates = Vec::new();
+    for choice in choices(sources, shape, options, config.tile_count)? {
+        let mut homes = vec![Vec::new()];
+        for (i, &id) in op.inputs.iter().enumerate() {
+            if !selectable.contains(&id)
+                || op.inputs[..i].contains(&id)
+                || sources[i] == &choice.operands[i]
+            {
+                continue;
+            }
+            for j in 0..homes.len() {
+                let mut home = homes[j].clone();
+                let mut resident = choice.operands[i].clone();
+                resident.format.precision = sources[i].format.precision;
+                home.push((id, resident));
+                homes.push(home);
+            }
+        }
+        for home in homes {
+            let mut candidate = Candidate::inputs(high, live, config.tile_count, position + 1);
+            for (id, tensor) in home {
+                let input = candidate.bindings[&id];
+                candidate.graph.values[input.index() as usize].tensor_type = tensor;
+            }
+            let inputs = [
+                candidate.bindings[&op.inputs[0]],
+                candidate.bindings[&op.inputs[1]],
+            ];
+            let result = append(
+                &mut candidate.graph,
+                inputs,
+                &choice,
+                options,
+                shape,
+                op.id,
+                origin,
+                layouts.get(&origin).and_then(Option::as_ref),
+            );
+            candidate.bindings.insert(origin, result);
+            if candidate.graph.validate().is_ok() {
+                candidates.push(candidate);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// One enumerated distributed GEMM assignment; no high bindings or search state.
+pub(super) struct GemmChoice {
+    pub operands: [TensorType; 2],
+    grid: [u16; 3],
+    inner_block: u32,
+    output_columns: u32,
+}
+
+/// Enumerate assignments only. Callers decide which ones to construct and cost.
+pub(super) fn choices(
+    sources: [&TensorType; 2],
+    shape: &TensorShape,
+    options: GemmOptions,
+    tile_count: u16,
+) -> PlanningResult<Vec<GemmChoice>> {
     let precision = match (sources[0].format.precision, sources[1].format.precision) {
         (Precision::F16, p) | (p, Precision::F16) if p != Precision::F32 => p,
         (a @ Precision::F8F143 { .. }, b) if a == b => a,
@@ -133,7 +198,6 @@ pub(super) fn generate(
             ));
         }
     };
-    let shape = high.value_shape(op.results[0]).unwrap();
     let rank = shape.0.len();
     let m = shape.0[rank - 2];
     let n = shape.0[rank - 1];
@@ -141,9 +205,9 @@ pub(super) fn generate(
         sources[0].shape.0[sources[0].shape.0.len() - if options.transpose_left { 2 } else { 1 }];
     let grain = if precision == Precision::F16 { 16 } else { 32 };
     let mut candidates = Vec::new();
-    for rows in partitions(m, config.tile_count) {
-        for columns in partitions(n.div_ceil(16), config.tile_count / rows) {
-            for inner in partitions(k.div_ceil(grain), config.tile_count / rows / columns) {
+    for rows in partitions(m, tile_count) {
+        for columns in partitions(n.div_ceil(16), tile_count / rows) {
+            for inner in partitions(k.div_ceil(grain), tile_count / rows / columns) {
                 let tiles = rows * columns * inner;
                 let kw = k.div_ceil(grain).div_ceil(u32::from(inner)) * grain;
                 let nw = n.div_ceil(16).div_ceil(u32::from(columns)) * 16;
@@ -184,75 +248,44 @@ pub(super) fn generate(
                         },
                     },
                 ];
-                let mut homes = vec![Vec::new()];
-                for (i, &id) in op.inputs.iter().enumerate() {
-                    if !selectable.contains(&id)
-                        || op.inputs[..i].contains(&id)
-                        || sources[i] == &operands[i]
-                    {
-                        continue;
-                    }
-                    for j in 0..homes.len() {
-                        let mut home = homes[j].clone();
-                        let mut resident = operands[i].clone();
-                        resident.format.precision = sources[i].format.precision;
-                        home.push((id, resident));
-                        homes.push(home);
-                    }
-                }
-                for home in homes {
-                    let candidate = build(
-                        high,
-                        position,
-                        live,
-                        config.tile_count,
-                        options,
-                        &operands,
-                        [rows, columns, inner],
-                        kw,
-                        nw,
-                        &home,
-                        choices.get(&op.results[0]).and_then(Option::as_ref),
-                    );
-                    if candidate.graph.validate().is_ok() {
-                        candidates.push(candidate);
-                    }
-                }
+                candidates.push(GemmChoice {
+                    operands,
+                    grid: [rows, columns, inner],
+                    inner_block: kw,
+                    output_columns: nw,
+                });
             }
         }
     }
     Ok(candidates)
 }
 
-fn build(
-    high: &HighGraph,
-    position: usize,
-    live: &LiveValues,
-    tile_count: u16,
+/// Append one assignment to a caller's mid graph. Inputs may be temporaries
+/// from earlier work; only provenance refers to a high operation/value.
+pub(super) fn append(
+    graph: &mut crate::MidGraph,
+    inputs: [crate::MidValueId; 2],
+    choice: &GemmChoice,
     options: GemmOptions,
-    operands: &[TensorType; 2],
-    [rows, columns, inner]: [u16; 3],
-    kw: u32,
-    nw: u32,
-    homes: &[(ValueId, TensorType)],
+    shape: &TensorShape,
+    source: crate::OperationId,
+    origin: ValueId,
     output_layout: Option<&Layout>,
-) -> Candidate {
-    let op = &high.operations()[position];
-    let origin = op.results[0];
-    let shape = high.value_shape(origin).unwrap();
-    let mut candidate = Candidate::inputs(high, live, tile_count, position + 1);
-    for (id, tensor) in homes {
-        let input = candidate.bindings[id];
-        candidate.graph.values[input.index() as usize].tensor_type = tensor.clone();
-    }
-    let inputs = op
-        .inputs
+) -> crate::MidValueId {
+    let GemmChoice {
+        operands,
+        grid: [rows, columns, inner],
+        inner_block: kw,
+        output_columns: nw,
+    } = choice;
+    let (rows, columns, inner, kw, nw) = (*rows, *columns, *inner, *kw, *nw);
+    let inputs = inputs
         .iter()
         .zip(operands)
         .enumerate()
         .map(|(operand, (id, tensor))| {
-            let mut input = candidate.bindings[id];
-            let from = candidate.graph.values[input.index() as usize]
+            let mut input = *id;
+            let from = graph.values[input.index() as usize]
                 .tensor_type
                 .format
                 .precision;
@@ -263,7 +296,7 @@ fn build(
             if ((operand == 0 && options.transpose_left)
                 || !(tensor.shape.0.last().unwrap() * tensor.format.precision.bytes() as u32)
                     .is_multiple_of(4))
-                && candidate.graph.values[input.index() as usize]
+                && graph.values[input.index() as usize]
                     .tensor_type
                     .format
                     .layout
@@ -277,13 +310,18 @@ fn build(
                     axis.partitions = 1;
                     axis.tile_stride = Some(1);
                 }
-                input = candidate.copy(op.id, input, packed, Vec::new());
+                input = copy(graph, source, input, packed, Vec::new());
             }
-            input = candidate.copy(op.id, input, preparation, Vec::new());
+            input = copy(graph, source, input, preparation, Vec::new());
             if from != tensor.format.precision {
-                let output = candidate.value(*id, tensor.clone(), OwnerMap::default());
-                candidate.graph.operations.push(MidOperation {
-                    source: Some(op.id),
+                let output = value(
+                    graph,
+                    graph.values[id.index() as usize].origin,
+                    tensor.clone(),
+                    OwnerMap::default(),
+                );
+                graph.operations.push(MidOperation {
+                    source: Some(source),
                     inputs: vec![input],
                     results: vec![output],
                     kind: MidOperationKind::Cast {
@@ -334,9 +372,9 @@ fn build(
         valid_inner: None,
         valid_columns: None,
     };
-    let mut result = candidate.value(origin, partial_type, OwnerMap::default());
-    candidate.graph.operations.push(MidOperation {
-        source: Some(op.id),
+    let mut result = value(graph, origin, partial_type, OwnerMap::default());
+    graph.operations.push(MidOperation {
+        source: Some(source),
         inputs,
         results: vec![result],
         kind: MidOperationKind::Gemm {
@@ -363,14 +401,14 @@ fn build(
         result_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
         let mut receive = result_type.clone();
         receive.shape.0.insert(0, 1);
-        let seed = candidate.copy(op.id, result, receive.clone(), Vec::new());
+        let seed = copy(graph, source, result, receive.clone(), Vec::new());
         receive.shape.0[0] = u32::from(inner - 1);
         let mut offsets = vec![0; rank + 1];
         offsets[0] = 1;
-        let rest = candidate.copy(op.id, result, receive, offsets);
-        let reduced = candidate.value(origin, result_type.clone(), OwnerMap::default());
-        candidate.graph.operations.push(MidOperation {
-            source: Some(op.id),
+        let rest = copy(graph, source, result, receive, offsets);
+        let reduced = value(graph, origin, result_type.clone(), OwnerMap::default());
+        graph.operations.push(MidOperation {
+            source: Some(source),
             inputs: vec![seed, rest],
             results: vec![reduced],
             kind: MidOperationKind::ReductionSum { partials: inner },
@@ -382,10 +420,9 @@ fn build(
     }
     if let Some(layout) = output_layout {
         result_type.format.layout = layout.clone();
-        result = candidate.copy(op.id, result, result_type, Vec::new());
+        result = copy(graph, source, result, result_type, Vec::new());
     }
-    candidate.bindings.insert(origin, result);
-    candidate
+    result
 }
 
 #[cfg(test)]

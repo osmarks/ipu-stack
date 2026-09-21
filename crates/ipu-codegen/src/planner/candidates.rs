@@ -5,7 +5,7 @@
 use super::{BoundaryLayouts, PlanningError, PlanningResult, elementwise};
 use crate::config::PipelineConfig;
 use crate::graph::{GraphInputKind, HighGraph, OperationKind, ValueId};
-use crate::mid::{MidGraph, MidInput, MidOperationKind, MidValue, MidValueId};
+use crate::mid::{MidGraph, MidInput, MidOperationKind, MidValueId};
 use crate::tensor::{OwnerMap, TensorType};
 use std::collections::BTreeMap;
 
@@ -30,56 +30,6 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
-    /// Materialize a selected representation or slice; identical resident
-    /// operands need no copy. This does not change the high-value binding.
-    pub fn copy(
-        &mut self,
-        source: crate::OperationId,
-        input: MidValueId,
-        tensor: TensorType,
-        offsets: Vec<u32>,
-    ) -> MidValueId {
-        let from = &self.graph.values[input.index() as usize];
-        let owners = OwnerMap::default();
-        if from.tensor_type == tensor && from.owners == owners && offsets.iter().all(|&n| n == 0) {
-            return input;
-        }
-        let policy =
-            crate::default_copy_policy(&from.tensor_type.format.layout, &tensor.format.layout);
-        let packing = if from
-            .tensor_type
-            .format
-            .layout
-            .order
-            .micro_panel_order()
-            .is_some()
-            && from.tensor_type.format.layout.order.micro_panel_order()
-                == tensor.format.layout.order.micro_panel_order()
-        {
-            crate::PackingPolicy::Direct
-        } else {
-            crate::PackingPolicy::Staged
-        };
-        let output = self.value(from.origin, tensor, owners);
-        self.graph.operations.push(crate::MidOperation {
-            source: Some(source),
-            inputs: vec![input],
-            results: vec![output],
-            kind: MidOperationKind::Copy {
-                mapping: crate::CoordinateMapping {
-                    offsets,
-                    view: None,
-                },
-                policy,
-                packing,
-            },
-            operands: Vec::new(),
-            output_aliases: Vec::new(),
-            output_windows: Vec::new(),
-        });
-        output
-    }
-
     /// Import the whole live boundary. Unrelated activations become pass-through
     /// outputs when extending the path, so ordinary mid liveness accounts for
     /// residual storage without a separate approximation of its lifetime.
@@ -93,7 +43,12 @@ impl Candidate {
             bindings: BTreeMap::new(),
         };
         for (&origin, boundary) in live {
-            let id = candidate.value(origin, boundary.tensor.clone(), boundary.owners.clone());
+            let id = super::construction::value(
+                &mut candidate.graph,
+                origin,
+                boundary.tensor.clone(),
+                boundary.owners.clone(),
+            );
             let input = high.inputs().iter().find(|input| input.value == origin);
             candidate.graph.inputs.push(MidInput {
                 name: input.map_or_else(|| format!("value.{}", origin.index()), |i| i.name.clone()),
@@ -103,24 +58,6 @@ impl Candidate {
             candidate.bindings.insert(origin, id);
         }
         candidate
-    }
-
-    pub(super) fn value(
-        &mut self,
-        origin: ValueId,
-        tensor_type: TensorType,
-        owners: OwnerMap,
-    ) -> MidValueId {
-        let id =
-            MidValueId::from_index(self.graph.values.len().try_into().expect("mid value count"));
-        self.graph.values.push(MidValue {
-            id,
-            origin,
-            tensor_type,
-            owners,
-            storage_group: id,
-        });
-        id
     }
 }
 

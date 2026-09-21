@@ -2,6 +2,105 @@ use super::super::{SearchLimits, boundary_layouts, plan};
 use super::*;
 use ipu_target::Target;
 
+#[test]
+fn gemm_construction_accepts_private_mid_results_without_high_nodes() {
+    let mut rng = fastrand::Rng::with_seed(0x1a7e_24ed);
+    for _ in 0..24 {
+        let (m, k) = (rng.u32(1..=8), rng.u32(1..=2) * 16);
+        let mut high = HighGraph::new();
+        let a = high.host_input("a", [m, k]).unwrap();
+        let b = high.parameter("b", [k, k]).unwrap();
+        let output = high.gemm(a, b).unwrap();
+        let source = high.operations()[0].id;
+        let options = GemmOptions::default();
+        let shape = TensorShape(vec![m, k]);
+        let live = [a, b]
+            .into_iter()
+            .zip([[m, k], [k, k]])
+            .map(|(id, shape)| {
+                (
+                    id,
+                    super::super::candidates::BoundaryValue {
+                        tensor: TensorType::new(shape, Precision::F16, Layout::row_sharded(1)),
+                        owners: OwnerMap::default(),
+                    },
+                )
+            })
+            .collect();
+        let mut prefix = Candidate::inputs(&high, &live, 4, 1);
+        let inputs = [prefix.bindings[&a], prefix.bindings[&b]];
+        let first = choices([&live[&a].tensor, &live[&b].tensor], &shape, options, 4).unwrap();
+        let private = append(
+            &mut prefix.graph,
+            inputs,
+            &first[rng.usize(..first.len())],
+            options,
+            &shape,
+            source,
+            output,
+            None,
+        );
+        assert!(!prefix.bindings.values().any(|&id| id == private));
+        let second = choices(
+            [
+                &prefix.graph.values[private.index() as usize].tensor_type,
+                &prefix.graph.values[inputs[1].index() as usize].tensor_type,
+            ],
+            &shape,
+            options,
+            4,
+        )
+        .unwrap();
+        let data = [m * k, k * k].map(|count| {
+            (0..count)
+                .map(|_| f64::from(rng.i32(-8..=8)) / 16.0)
+                .collect::<Vec<_>>()
+        });
+        let dense = |input: &[f64]| {
+            (0..m * k)
+                .map(|i| {
+                    (0..k)
+                        .map(|j| {
+                            input[((i / k) * k + j) as usize] * data[1][(j * k + i % k) as usize]
+                        })
+                        .sum::<f64>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = dense(&dense(&data[0]));
+        for choice in second {
+            let mut candidate = Candidate {
+                graph: prefix.graph.clone(),
+                bindings: prefix.bindings.clone(),
+                end: 1,
+            };
+            let result = append(
+                &mut candidate.graph,
+                [private, inputs[1]],
+                &choice,
+                options,
+                &shape,
+                source,
+                output,
+                Some(&Layout::row_sharded(1)),
+            );
+            candidate.graph.outputs = vec![result];
+            candidate.graph.validate().unwrap();
+            let actual = evaluate(&candidate, &data, &[a, b]);
+            assert_eq!(actual[result.index() as usize], expected);
+            crate::low::expand::expand_tiles(Target::Ipu21, &candidate.graph, false).unwrap();
+            assert_eq!(
+                &candidate.graph.operations[..prefix.graph.operations.len()],
+                prefix.graph.operations
+            );
+            assert_eq!(
+                &candidate.graph.values[..prefix.graph.values.len()],
+                prefix.graph.values
+            );
+        }
+    }
+}
+
 fn index(shape: &[u32], coordinates: &[u32]) -> usize {
     shape
         .iter()

@@ -4,6 +4,7 @@
 
 pub(crate) mod budget;
 mod candidates;
+mod construction;
 mod elementwise;
 mod gemm;
 mod parameters;
