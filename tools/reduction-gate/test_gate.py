@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,21 +17,6 @@ BINARY = ROOT.parent.parent / "target/reduction-gate/release/ipu-reduction-metri
 
 
 class Rules(unittest.TestCase):
-    def test_generator_detection_does_not_match_planner_module(self):
-        self.assertTrue(gate.protected("crates/ipu-codegen/build.rs"))
-        self.assertFalse(gate.protected("crates/ipu-codegen/src/planner/build.rs"))
-
-    def test_all_inequalities(self):
-        before = dict.fromkeys(gate.METRICS, 10)
-        self.assertTrue(gate.violations(before, before))
-        for reduced in gate.METRICS[1:]:
-            after = before | {"lines": 9, reduced: 9}
-            self.assertFalse(gate.violations(before, after))
-            self.assertFalse(gate.violations(before, after | {"lines": 10}))
-            self.assertTrue(gate.violations(before, after | {"lines": 11}))
-            for increased in gate.METRICS[1:]:
-                self.assertTrue(gate.violations(before, after | {increased: 11}))
-
     def test_ast_counts_ignore_tests_but_keep_platform_code(self):
         source = '''
 struct Pair(u32, u32);
@@ -89,7 +75,7 @@ class IndexChecks(unittest.TestCase):
         result = subprocess.run(["python3", str(ROOT / "check.py"), *args],
                                 cwd=self.repo, env=self.env, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-        return result.stdout
+        return result.stdout + result.stderr
 
     def test_staged_reduction_ignores_unstaged_growth_and_rename(self):
         self.write("crates/demo/src/lib.rs", "fn retained() {}\n")
@@ -100,40 +86,35 @@ class IndexChecks(unittest.TestCase):
         self.git("mv", "crates/demo/src/lib.rs", "crates/demo/src/renamed.rs")
         self.check(0)
 
-    def test_unstaged_reduction_does_not_pass(self):
+    def test_unstaged_reduction_reports_no_change(self):
         self.write("crates/demo/src/lib.rs", "")
-        self.check(1)
+        self.assertEqual(self.check(0).count("(+0)"), len(gate.METRICS))
 
-    def test_installed_hook_blocks_commit(self):
+    def test_installed_hook_allows_growth_and_reports_it(self):
         (self.repo / "tools").mkdir()
         (self.repo / "tools/reduction-gate").symlink_to(ROOT, target_is_directory=True)
+        (self.repo / "scripts").mkdir()
+        scripts = ROOT.parent.parent / "scripts"
+        shutil.copy(scripts / "module-map.py", self.repo / "scripts")
+        shutil.copytree(scripts / "module-map", self.repo / "scripts/module-map")
         self.git("config", "core.hooksPath", str(ROOT.parent.parent / ".githooks"))
-        result = subprocess.run(["git", "commit", "--allow-empty", "-m", "must fail"],
+        self.write("crates/demo/src/lib.rs", "struct Removed;\nfn retained() {}\nstruct Added { value: u32 }\n")
+        self.git("add", "crates")
+        result = subprocess.run(["git", "commit", "-m", "growth is advisory"],
                                 cwd=self.repo, env=self.env, text=True, capture_output=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Commit blocked", result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Advisory only", result.stdout + result.stderr)
+        self.assertIn("(+1)", result.stdout + result.stderr)
 
-    def test_approval_is_bound_to_tree_and_parent(self):
-        self.check(1)
-        self.check(0, "--approve", "Explicit approval in isolated test fixture")
-        self.check(0)
-        self.write("notes.md", "Another snapshot\n")
-        self.git("add", "notes.md")
-        self.check(1)
-        self.git("reset", "-q", "HEAD", "notes.md")
-        self.check(0)
-        self.git("commit", "--allow-empty", "-qm", "new parent")
-        self.check(1)
-
-    def test_invalid_rust_fails_closed(self):
+    def test_invalid_rust_warns_without_blocking(self):
         self.write("crates/demo/src/lib.rs", "fn incomplete(\n")
         self.git("add", "crates")
-        self.check(1)
+        self.assertIn("advisory source metrics unavailable", self.check(0))
 
-    def test_macro_change_requires_review_even_with_reduction(self):
+    def test_macro_change_reports_measurement_limit(self):
         self.write("crates/demo/src/lib.rs", "macro_rules! hidden { () => { struct New; } }\n")
         self.git("add", "crates")
-        self.assertIn("macro definitions/includes changed", self.check(1))
+        self.assertIn("macro definitions/includes changed", self.check(0))
 
 
 if __name__ == "__main__":

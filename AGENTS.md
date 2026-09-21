@@ -1,5 +1,7 @@
 When migrating/refactoring something, DO NOT add extra adapters to the old behaviour; fully rewrite dependents. Do not e.g. rearrange things into callbacks. Why would you do that? Aim for simplification and code reduction. Code should generally be straight-line and have an obvious hierarchical structure. If what I specify has unexpected architectural consequences, tell me before doing it.
 
+Use comprehensive randomized property-based tests rather than hardcoded special cases, where possible.
+
 Unless they're complex/long automations (e.g. bulk renames), in which case they should have a dedicated, reviewable script, do edits with your native edit tool and not Python scripts.
 
 Read all of AGENTS.md after each compaction.
@@ -104,25 +106,17 @@ of a request, including callers the user has not explicitly mentioned.
   Inspect the resulting implementation for those separately, without requiring
   the user to prompt another audit to discover known unfinished work.
 
-# Commit reduction rule
+# Commits and advisory metrics
 
-Every commit must not increase production code size and must reduce at least one of:
-type count, enum variant count, field count, or function count. None of those
-four counts may increase. This includes documentation and tooling commits:
-zero change does not satisfy the rule.
+Commit after major changes. Keep commits coherent and validate the affected behavior.
 
-Run `python3 tools/reduction-gate/check.py` on the staged changes before
-committing. Install the tracked hook with `git config core.hooksPath .githooks`.
-Measurement definitions and the exception procedure are in
-[tools/reduction-gate/README.md](tools/reduction-gate/README.md).
+The pre-commit hook reports production code size and type, variant, field and
+function counts. These metrics are advisory: increases or unchanged counts do
+not block commits or require exceptions. Inspect the deltas as evidence when
+evaluating a change, not as a substitute for judging its structure.
 
-Exceptions require explicit user review of the concrete changes. Do not
-self-approve an exception, disable the hook, alter the measurement scope to
-make a commit pass, or compress formatting/move code into excluded files to
-satisfy the counters. Gate changes and changes to generated declarations or
-macro-generated structure also require user review; the source counters are
-not a proof of simplification.
-
-After the user approves a specific exception, record it using the documented
-approval command, including their reason/reference. Approval applies only to
-that exact staged tree and parent commit; further changes need fresh review.
+Install the tracked hook with `git config core.hooksPath .githooks`. Run the
+counter manually with `python3 tools/reduction-gate/check.py`; measurement
+definitions are in [tools/reduction-gate/README.md](tools/reduction-gate/README.md).
+Preserve normal formatting and measurement scope; do not optimize code to game
+the counters.

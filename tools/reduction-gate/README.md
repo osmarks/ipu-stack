@@ -1,4 +1,4 @@
-# Commit reduction gate
+# Advisory commit metrics
 
 Install once per checkout:
 
@@ -7,10 +7,10 @@ git config core.hooksPath .githooks
 ```
 
 The pre-commit hook compares HEAD with `git write-tree` (the index). Unstaged
-edits do not affect the measurements. It requires no increase in production code lines,
-no increase in types, variants, fields, or functions, and a decrease in at
-least one of those four declaration counts. Even documentation-only commits
-need an exception. Missing dependencies and parse errors block commits.
+edits do not affect the measurements. It reports production code lines and
+type, variant, field and function counts before and after each commit.
+All deltas are advisory; there are no thresholds or approval exceptions.
+Missing dependencies and parse errors produce a warning without blocking a commit.
 
 Run manually with `python3 tools/reduction-gate/check.py`. Python 3, Cargo,
 and the locked Rust dependencies are required. The counter builds under
@@ -38,27 +38,11 @@ The four declaration counts cover handwritten Rust syntax:
   foreign declarations. Closures and function-pointer types do not count.
 
 Test-only items, fields, and variants are excluded. Macro expansions and
-generated code are not counted; changes to macro definitions, includes,
-crate-root `build.rs`, `.capnp`, or `.def` inputs require review. Third-party procedural
+generated code are not counted. Changes to macro definitions, includes,
+crate-root `build.rs`, `.capnp`, or `.def` inputs can change generated structure
+without appearing in these counts. Third-party procedural
 macros are not expanded. The metric does not count C++ declarations or
 assembly entry points, HTML/JS, `.hpp` files, documentation, or Python tools.
 These limits preserve the existing audit scope; moving code outside that
 scope is not a valid reduction. Numerical compliance does not prove improved
-design. Changes to the gate or its rules also require explicit review.
-
-## User-reviewed exceptions
-
-Prepare and stage the complete change, run the check, and present its changes
-and failing metrics to the user. Only after explicit approval, record their
-review/reason and commit:
-
-```sh
-python3 tools/reduction-gate/check.py --approve 'User approved <change>: <reason/reference>'
-git commit
-```
-
-The local approval records the exact parent and staged tree, and cannot
-authorize another snapshot. It is a workflow record, not authentication:
-agents must never self-approve, use `--no-verify`, or disable the hook. Git
-hooks are local; other checkouts must install this hook too. Amended commits
-are checked against current HEAD, so a message-only amend needs an exception.
+design. Git hooks are local; other checkouts must install the hook too.
