@@ -20,7 +20,7 @@ Export the fixture with `scripts/siglip-pretrained-fixture.py DIRECTORY`. Depend
 
 ```sh
 source .env
-RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-e2e-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" \
   --runtime-source artifacts/attention-residual-20260911/source/static_runtime.S \
   --workload siglip-vit-benchmark --vit-layers 27 --vit-batch 1 \

@@ -16,12 +16,12 @@ Optional variables:
 
 - `IPU_DEVICE` selects the device node and defaults to `/dev/ipu0`.
 - `IPU_TEST_PACKAGE` selects the generated package path and defaults to
-  `/tmp/ipu-trivial.ipuexe`.
+  `/tmp/ipu-e2e.ipuexe`.
 
 Numerical GEMM smoke (64 active tiles):
 
 ```sh
-cargo run --release -p ipu-tests --bin ipu-trivial-test -- \
+cargo run --release -p ipu-tests --bin ipu-e2e-test -- \
   "$IPU_CONFIG" --sdk "$POPLAR_SDK_ENABLED" --workload gemm-smoke --tiles 64
 ```
 

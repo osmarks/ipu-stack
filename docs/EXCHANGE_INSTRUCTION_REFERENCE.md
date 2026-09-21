@@ -32,7 +32,7 @@ arrangements, not arbitrary overlapping or same-bank transfers.
 Reproduce with:
 
 ```sh
-target/release/ipu-trivial-test c600-init.ipucfg \
+target/release/ipu-e2e-test c600-init.ipucfg \
   --workload exchange-stress --exchange-pattern loopback \
   --tiles 1472 --exchange-cases 18 --exchange-max-words 512 \
   --exchange-max-transfers 1 --exchange-compute-delay 1 \
@@ -93,7 +93,7 @@ Unused deltas remain 8. The received words are contiguous. These registers are
 mutable address offsets/cursors, not configurable per-word increments in this
 mode. Snapshots happen inside the tile program before host exchange alters state.
 
-Run `ipu-trivial-test c600-init.ipucfg --workload exchange-stress
+Run `ipu-e2e-test c600-init.ipucfg --workload exchange-stress
 --exchange-pattern delta --device-lock artifacts/layout-sweep/device.lock
 --package /tmp/exchange-delta.ipuexe`. The test checks both payload and CSR
 snapshots through host readback. Its source is

@@ -56,7 +56,7 @@ two additional three-partial FP16 tensors represents about 9.6 MiB of logical
 data across the device (about 6.7 KiB per tile on average), before physical
 padding and placement effects. The experiments below implement this reduction-overlap alternative.
 
-`ipu-trivial-test --reference-run` validates Gaussian final outputs while
+`ipu-e2e-test --reference-run` validates Gaussian final outputs while
 retaining normal optimization and profiling. Unlike `--diagnostic-run`, it
 does not insert operator checkpoints, so it can test cross-operator batching.
 It reuses the existing host reference and logical output verifier.

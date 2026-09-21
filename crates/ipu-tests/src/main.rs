@@ -25,7 +25,10 @@ mod reference_fixture;
 mod vit;
 
 #[derive(Parser)]
-#[command(version, about = "Build, load, and diagnose the trivial IPU21 package")]
+#[command(
+    version,
+    about = "Build and run IPU workloads for end-to-end validation"
+)]
 struct Arguments {
     /// Captured IPUCFG1 device configuration.
     configuration: PathBuf,
@@ -38,7 +41,7 @@ struct Arguments {
     /// Serialize hardware access after compilation using this advisory lock.
     #[arg(long)]
     device_lock: Option<PathBuf>,
-    #[arg(long, default_value = "/tmp/ipu-trivial.ipuexe")]
+    #[arg(long, default_value = "/tmp/ipu-e2e.ipuexe")]
     package: PathBuf,
     /// Load an existing --package without rebuilding it.
     #[arg(long)]

@@ -26,8 +26,8 @@ Captured full So400m/14, 378×378, one-layer FP8 ViT candidates:
 Example commands, from the repository root:
 
 ```sh
-cargo build --release -p ipu-tests --bin ipu-trivial-test --bin ipu-exchange-schedule-bench
-RAYON_NUM_THREADS=12 target/release/ipu-trivial-test c600-init.ipucfg \
+cargo build --release -p ipu-tests --bin ipu-e2e-test --bin ipu-exchange-schedule-bench
+RAYON_NUM_THREADS=12 target/release/ipu-e2e-test c600-init.ipucfg \
   --workload siglip-vit-benchmark --vit-batch 4 --fp8-scale=-4 \
   --capture-finalist 2 \
   --capture-exchange-schedule artifacts/exchange-redesign-20260908/vit-b4-f2.json

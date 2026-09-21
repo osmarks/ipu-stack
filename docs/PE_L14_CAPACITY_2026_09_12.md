@@ -100,7 +100,7 @@ No runtime timing for the probe is presented as PE inference performance.
 ```sh
 source .env
 RAYON_NUM_THREADS=16 RUST_LOG=info,ipu_codegen::place=debug \
-  target/release/ipu-trivial-test "$IPU_CONFIG" --sdk "$POPLAR_SDK_ENABLED" \
+  target/release/ipu-e2e-test "$IPU_CONFIG" --sdk "$POPLAR_SDK_ENABLED" \
   --runtime-source artifacts/attention-residual-20260911/source/static_runtime.S \
   --workload siglip-vit-benchmark --vit-model pe-core-l14-capacity \
   --vit-layers 24 --vit-batch 2 --fuse-qkv --fp8-scale=-4 \

@@ -94,7 +94,7 @@ were measured once. An initial MLP build used the benchmark's batch-4 default an
 was stopped during CPU exchange-placement work; its log is retained under
 `artifacts/useful-work/mlp-b4-build/`.
 
-Reproduce the MLP case with `ipu-trivial-test c600-init.ipucfg --workload
+Reproduce the MLP case with `ipu-e2e-test c600-init.ipucfg --workload
 siglip-mlp-benchmark --mlp-batch 1 --package model.ipuexe --profile-output
 execution.ipuprofile`; the attention case uses `--workload
 siglip-attention-benchmark --attention-strategy flash` instead.

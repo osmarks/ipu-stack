@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--sdk", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", default="c600-init.ipucfg")
-    parser.add_argument("--binary", default="target/release/ipu-trivial-test")
+    parser.add_argument("--binary", default="target/release/ipu-e2e-test")
     parser.add_argument("--cli", default="target/release/ipu-stack")
     parser.add_argument("--jobs", type=int, default=16)
     parser.add_argument("--timeout", type=int, default=1800)

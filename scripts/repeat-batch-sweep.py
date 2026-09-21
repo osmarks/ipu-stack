@@ -49,7 +49,7 @@ def run_case(args, family, batch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("artifacts/repeat-sweep"))
-    parser.add_argument("--binary", type=Path, default=Path("target/release/ipu-trivial-test"))
+    parser.add_argument("--binary", type=Path, default=Path("target/release/ipu-e2e-test"))
     parser.add_argument("--cli", type=Path, default=Path("target/release/ipu-stack"))
     parser.add_argument("--configuration", type=Path, default=Path("c600-init.ipucfg"))
     parser.add_argument("--device-lock", type=Path, default=Path("artifacts/layout-sweep/device.lock"))

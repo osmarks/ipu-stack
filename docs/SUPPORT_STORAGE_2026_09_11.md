@@ -686,7 +686,7 @@ Thus this particular placement is 948 bytes short even without contiguity;
 these numbers do not establish that a different placement or layout cannot fit.
 
 Validation after the resolver fix: 228 codegen tests passed (four ignored), all
-10 `ipu-trivial-test` tests passed, and the workspace all-targets check passed.
+10 `ipu-e2e-test` tests passed, and the workspace all-targets check passed.
 
 
 ### Final optimized resident 27-layer run

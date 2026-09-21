@@ -5,8 +5,8 @@ set -euo pipefail
 : "${POPLAR_SDK_ENABLED:?set POPLAR_SDK_ENABLED to the Poplar SDK root}"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-cargo run --manifest-path "$root/Cargo.toml" -p ipu-tests --bin ipu-trivial-test -- \
+cargo run --manifest-path "$root/Cargo.toml" -p ipu-tests --bin ipu-e2e-test -- \
   "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" \
   --device "${IPU_DEVICE:-/dev/ipu0}" \
-  --package "${IPU_TEST_PACKAGE:-/tmp/ipu-trivial.ipuexe}"
+  --package "${IPU_TEST_PACKAGE:-/tmp/ipu-e2e.ipuexe}"

@@ -33,7 +33,7 @@ run_gemm() {
   local columns=$3
   local profile="$calibration_dir/gemm-${rows}-${inner}-${columns}.ipuprofile"
   reset_device
-  target/release/ipu-trivial-test "$configuration" \
+  target/release/ipu-e2e-test "$configuration" \
     --workload gemm-benchmark \
     --benchmark-rows "$rows" \
     --benchmark-inner "$inner" \
@@ -52,7 +52,7 @@ run_gemm 2048 256 64
 
 mlp_profile="$calibration_dir/siglip-mlp-b1.ipuprofile"
 reset_device
-target/release/ipu-trivial-test "$configuration" \
+target/release/ipu-e2e-test "$configuration" \
   --workload siglip-mlp-benchmark \
   --mlp-batch 1 \
   --tiles 1472 \

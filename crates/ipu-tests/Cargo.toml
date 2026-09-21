@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "ipu-trivial-test"
+name = "ipu-e2e-test"
 path = "src/main.rs"
 
 [[bin]]

@@ -113,7 +113,7 @@ run against all three profiles and its JSON parsed directly.
 ## Controlled historical-grid experiment
 
 The reconstructed GEMM grids are supported by the current planner. Force them
-with these arguments to `ipu-trivial-test --workload siglip-mlp-benchmark
+with these arguments to `ipu-e2e-test --workload siglip-mlp-benchmark
 --mlp-batch 1`:
 
 ```text

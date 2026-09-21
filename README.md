@@ -116,7 +116,7 @@ Resizing directly to 378×378 would change the input.
 Build and run all six images with the weights resident:
 
 ```sh
-RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-e2e-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
   --workload siglip-vit-benchmark --vit-layers 27 --vit-batch 1 \
   --fuse-qkv --exchange-stream-words 1024 \

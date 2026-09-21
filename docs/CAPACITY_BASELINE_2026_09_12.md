@@ -95,7 +95,7 @@ experiments rather than being overwritten.
 
 ```sh
 source .env
-RAYON_NUM_THREADS=12 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+RAYON_NUM_THREADS=12 RUST_LOG=info target/release/ipu-e2e-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
   --workload siglip-vit-benchmark --vit-model pe-core-l14-capacity \
   --vit-layers 24 --vit-batch 2 --fuse-qkv --fp8-scale=-4 \

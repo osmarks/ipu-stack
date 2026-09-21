@@ -33,7 +33,7 @@ be wrong. The exchange decoder now recognizes these instructions and includes
 those costs. Including entry/alignment instructions, the two-section join adds
 46 cycles to the sum of the separately scheduled horizons.
 
-`ipu-trivial-test --workload exchange-stress --exchange-pattern base` exercises
+`ipu-e2e-test --workload exchange-stress --exchange-pattern base` exercises
 moving -> fixed -> moving sections over three Repeat iterations, standard and
 interleaved SRAM, point-to-point, multicast, paired transfers, and self-receive.
 It also changes the point receivers' incoming base between sections. Each

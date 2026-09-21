@@ -222,7 +222,7 @@ SigLIP; `LAYERS=24`, `MODEL=(--vit-model pe-core-l14-capacity)` for PE):
 ```bash
 out=artifacts/relay-big-recheck/siglip-b2
 mkdir -p "$out"
-RAYON_NUM_THREADS=12 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+RAYON_NUM_THREADS=12 RUST_LOG=info target/release/ipu-e2e-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
   --workload siglip-vit-benchmark "${MODEL[@]}" --vit-layers "$LAYERS" \
   --vit-batch 2 --fuse-qkv --fp8-scale=-4 --capacity-baseline \

@@ -1,6 +1,6 @@
 # Planner memory profiles
 
-Pass `--memory-profile-directory PATH` to `ipu-trivial-test`, or set
+Pass `--memory-profile-directory PATH` to `ipu-e2e-test`, or set
 `PipelineConfig::memory_profile_directory`. Each planner finalist and the
 smallest rejected candidate of an exhausted memory shortlist produces a JSON
 report and a standalone HTML report. Filenames include the scope, process ID,

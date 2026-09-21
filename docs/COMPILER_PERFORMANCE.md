@@ -68,11 +68,11 @@ comparisons in `artifacts/compiler-perf/comparison.json`. `baseline/self.txt` an
 available unchanged until perf has collected its build ID; rebuilding it during
 recording can prevent symbol resolution (this happened to the intermediate run).
 
-After enabling the local Poplar SDK and building `ipu-trivial-test` in release mode:
+After enabling the local Poplar SDK and building `ipu-e2e-test` in release mode:
 
 ```bash
 mkdir -p artifacts/compiler-perf/new
-cp target/release/ipu-trivial-test artifacts/compiler-perf/new/compiler
+cp target/release/ipu-e2e-test artifacts/compiler-perf/new/compiler
 RAYON_NUM_THREADS=16 perf record -F 99 -g --call-graph dwarf,8192 \
   -o artifacts/compiler-perf/new/perf.data -- \
   artifacts/compiler-perf/new/compiler c600-init.ipucfg \

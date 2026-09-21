@@ -31,7 +31,7 @@ memory. Automatic planning also retains a complete shared-row baseline through
 shortlisting, rather than requiring its locally ranked attention candidate to
 survive a bounded beam.
 
-Diagnostic controls on `ipu-trivial-test`:
+Diagnostic controls on `ipu-e2e-test`:
 
 ```
 --workload siglip-attention-benchmark --attention-batch 1

@@ -28,7 +28,7 @@ host descriptors were 2,236 bytes per tile.
 
 ```sh
 source .env
-RAYON_NUM_THREADS=32 target/release/ipu-trivial-test "$IPU_CONFIG" \
+RAYON_NUM_THREADS=32 target/release/ipu-e2e-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" --workload siglip-vit-benchmark \
   --vit-batch 1 --vit-layers 2 --planning-beam-width 8 \
   --fuse-qkv --fp8-scale=-4 --reference-run \

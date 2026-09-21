@@ -61,7 +61,7 @@ interprets unsupported storage as a compatible layout.
 Example (native FP8 weights, F16 normalization and residuals):
 
 ```sh
-RAYON_NUM_THREADS=24 target/release/ipu-trivial-test c600-init.ipucfg \
+RAYON_NUM_THREADS=24 target/release/ipu-e2e-test c600-init.ipucfg \
   --workload siglip-vit-benchmark --fp8-scale=-4 \
   --diagnostic-atol 0.2 --diagnostic-rtol 0.05 \
   --device-lock artifacts/layout-sweep/device.lock \

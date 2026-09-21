@@ -2,7 +2,7 @@
 """Export official SigLIP vision weights, real images and independent FP32 embeddings.
 
 Dependencies: torch, transformers, safetensors, huggingface_hub, Pillow, numpy.
-The output is consumed by ipu-trivial-test --reference-fixture DIRECTORY.
+The output is consumed by ipu-e2e-test --reference-fixture DIRECTORY.
 """
 
 import argparse

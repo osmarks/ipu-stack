@@ -167,7 +167,7 @@ kernel has been introduced by this analysis.
 
 ## Reproduction
 
-Capture with the existing `ipu-trivial-test --capture-exchange-schedule PATH`
+Capture with the existing `ipu-e2e-test --capture-exchange-schedule PATH`
 entry point and the desired model/planning flags. Captures now carry optional
 phase provenance; older snapshots remain readable. The capture entry point now
 uses the same memoized operator cost model as ordinary baseline construction.

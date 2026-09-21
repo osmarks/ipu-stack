@@ -50,7 +50,7 @@ available through `exchange-live-state --workers`.
 
 ## Reproduction and artifacts
 
-Build `ipu-trivial-test` and the `ipu-stack` profile CLI in release mode, then run:
+Build `ipu-e2e-test` and the `ipu-stack` profile CLI in release mode, then run:
 
 ```sh
 python3 scripts/repeat-batch-sweep.py --output artifacts/repeat-sweep
