@@ -4,7 +4,7 @@
 use super::candidates::{Candidate, LiveValues};
 use super::{BoundaryLayouts, PlanningError, PlanningResult};
 use crate::config::PipelineConfig;
-use crate::graph::{GraphInputKind, HighGraph, OperationKind};
+use crate::graph::{HighGraph, OperationKind, ValueId};
 use crate::mid::{
     CoordinateMapping, MidOperation, MidOperationKind, OperandIndexing, PackingPolicy,
     default_copy_policy,
@@ -19,6 +19,7 @@ pub(super) fn generate(
     choices: &BoundaryLayouts,
     settings: &PipelineConfig,
     kind: MidOperationKind,
+    selectable_parameters: &[ValueId],
 ) -> PlanningResult<Vec<Candidate>> {
     let op = &high.operations()[position];
     let result = op.results[0];
@@ -71,84 +72,105 @@ pub(super) fn generate(
             {
                 continue;
             }
-            let mut homes = vec![live.clone()];
-            for input in high.inputs().iter().filter(|input| {
-                input.kind == GraphInputKind::Parameter
-                    && op.inputs.contains(&input.value)
-                    && choices.get(&input.value).and_then(Option::as_ref).is_none()
-                    && !high.operations()[..position]
-                        .iter()
-                        .any(|op| high.operation_inputs(op).any(|id| id == input.value))
-            }) {
-                let mut alternatives = Vec::new();
-                for home in &homes {
-                    if home[&input.value].tensor.format.layout != layout {
-                        let mut home = home.clone();
-                        home.get_mut(&input.value).unwrap().tensor.format.layout = layout.clone();
-                        alternatives.push(home);
-                    }
+            let mut homes = vec![Vec::new()];
+            for &input in selectable_parameters {
+                if !op.inputs.contains(&input) || live[&input].tensor.format.layout == layout {
+                    continue;
                 }
-                homes.extend(alternatives);
+                for index in 0..homes.len() {
+                    let mut home = homes[index].clone();
+                    home.push((input, layout.clone()));
+                    homes.push(home);
+                }
             }
             for home in homes {
-                let mut candidate = Candidate::inputs(high, &home, settings.tile_count, end);
-                let tensor = TensorType {
-                    shape: shape.clone(),
-                    format: crate::TensorFormat {
-                        precision: Precision::F16,
-                        layout: layout.clone(),
+                candidates.push(build(
+                    high,
+                    live,
+                    settings.tile_count,
+                    position..end,
+                    kind.clone(),
+                    TensorType {
+                        shape: shape.clone(),
+                        format: crate::TensorFormat {
+                            precision: Precision::F16,
+                            layout: layout.clone(),
+                        },
                     },
-                };
-                let owners = OwnerMap::default();
-                let mut inputs = Vec::new();
-                let mut prepared = BTreeMap::new();
-                for &input in &op.inputs {
-                    if let Some(&value) = prepared.get(&input) {
-                        inputs.push(value);
-                        continue;
-                    }
-                    let original = candidate.bindings[&input];
-                    let from = &candidate.graph.values[original.index() as usize];
-                    let value = if from.tensor_type == tensor && from.owners == owners {
-                        original
-                    } else {
-                        let policy = default_copy_policy(
-                            &from.tensor_type.format.layout,
-                            &tensor.format.layout,
-                        );
-                        let copied = candidate.value(input, tensor.clone(), owners.clone());
-                        candidate.graph.operations.push(MidOperation {
-                            source: Some(op.id),
-                            inputs: vec![original],
-                            results: vec![copied],
-                            kind: MidOperationKind::Copy {
-                                mapping: CoordinateMapping::default(),
-                                policy,
-                                packing: PackingPolicy::Staged,
-                            },
-                            operands: Vec::new(),
-                            output_aliases: Vec::new(),
-                            output_windows: Vec::new(),
-                        });
-                        copied
-                    };
-                    inputs.push(value);
-                    prepared.insert(input, value);
-                }
-                let value = candidate.value(output, tensor, owners);
-                candidate.graph.operations.push(MidOperation {
-                    source: Some(high.operations()[end - 1].id),
-                    operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
-                    inputs,
-                    results: vec![value],
-                    kind: kind.clone(),
-                    output_aliases: Vec::new(),
-                    output_windows: Vec::new(),
-                });
-                candidate.bindings.insert(output, value);
-                candidates.push(candidate);
+                    &home,
+                ));
             }
         }
     }
     Ok(candidates)
+}
+
+/// Construct one assigned alternative. Resident inputs keep their identity;
+/// preparation copies are private values, never replacement resident bindings.
+fn build(
+    high: &HighGraph,
+    live: &LiveValues,
+    tile_count: u16,
+    operations: std::ops::Range<usize>,
+    kind: MidOperationKind,
+    tensor: TensorType,
+    resident_layouts: &[(ValueId, Layout)],
+) -> Candidate {
+    let op = &high.operations()[operations.start];
+    let end = operations.end;
+    let output = high.operations()[end - 1].results[0];
+    let mut candidate = Candidate::inputs(high, live, tile_count, end);
+    for (input, layout) in resident_layouts {
+        let id = candidate.bindings[input];
+        candidate.graph.values[id.index() as usize]
+            .tensor_type
+            .format
+            .layout = layout.clone();
+    }
+    let owners = OwnerMap::default();
+    let mut inputs = Vec::new();
+    let mut prepared = BTreeMap::new();
+    for &input in &op.inputs {
+        if let Some(&value) = prepared.get(&input) {
+            inputs.push(value);
+            continue;
+        }
+        let original = candidate.bindings[&input];
+        let from = &candidate.graph.values[original.index() as usize];
+        let value = if from.tensor_type == tensor && from.owners == owners {
+            original
+        } else {
+            let policy =
+                default_copy_policy(&from.tensor_type.format.layout, &tensor.format.layout);
+            let copied = candidate.value(input, tensor.clone(), owners.clone());
+            candidate.graph.operations.push(MidOperation {
+                source: Some(op.id),
+                inputs: vec![original],
+                results: vec![copied],
+                kind: MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    policy,
+                    packing: PackingPolicy::Staged,
+                },
+                operands: Vec::new(),
+                output_aliases: Vec::new(),
+                output_windows: Vec::new(),
+            });
+            copied
+        };
+        inputs.push(value);
+        prepared.insert(input, value);
+    }
+    let value = candidate.value(output, tensor, owners);
+    candidate.graph.operations.push(MidOperation {
+        source: Some(high.operations()[end - 1].id),
+        operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
+        inputs,
+        results: vec![value],
+        kind,
+        output_aliases: Vec::new(),
+        output_windows: Vec::new(),
+    });
+    candidate.bindings.insert(output, value);
+    candidate
 }

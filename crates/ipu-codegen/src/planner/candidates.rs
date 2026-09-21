@@ -80,6 +80,7 @@ pub(super) fn generate(
     live: &LiveValues,
     choices: &BoundaryLayouts,
     settings: &PipelineConfig,
+    selectable_parameters: &[ValueId],
 ) -> PlanningResult<Vec<Candidate>> {
     match high.operations()[position].kind {
         OperationKind::Add => elementwise::generate(
@@ -89,6 +90,7 @@ pub(super) fn generate(
             choices,
             settings,
             MidOperationKind::Add,
+            selectable_parameters,
         ),
         OperationKind::Gelu => elementwise::generate(
             high,
@@ -97,6 +99,7 @@ pub(super) fn generate(
             choices,
             settings,
             MidOperationKind::Gelu,
+            selectable_parameters,
         ),
         OperationKind::Gemm(_) => Err(PlanningError::Unimplemented("GEMM candidates")),
         OperationKind::LayerNorm => Err(PlanningError::Unimplemented("layernorm candidates")),

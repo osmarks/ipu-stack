@@ -166,6 +166,13 @@ impl<'a> Search<'a> {
         })
     }
 
+    pub fn selectable_parameters(&self, position: usize) -> Vec<ValueId> {
+        self.first_use
+            .iter()
+            .filter_map(|(&id, &first)| (first == position).then_some(id))
+            .collect()
+    }
+
     pub fn take_states(&mut self, position: usize) -> Vec<State> {
         let mut states = std::mem::take(&mut self.states[position])
             .into_iter()

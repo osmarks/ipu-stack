@@ -104,7 +104,24 @@ fn edges(
     config: &PipelineConfig,
     scratch: &[ScratchChoice],
 ) -> Vec<Candidate> {
-    let candidates = candidates::generate(high, position, live, choices, config).unwrap();
+    // Independently derive first-use eligibility for the exhaustive oracle.
+    let selectable = high
+        .inputs()
+        .iter()
+        .filter(|input| {
+            input.kind == GraphInputKind::Parameter
+                && choices.get(&input.value).and_then(Option::as_ref).is_none()
+                && high
+                    .operation_inputs(&high.operations()[position])
+                    .any(|id| id == input.value)
+                && !high.operations()[..position]
+                    .iter()
+                    .any(|op| high.operation_inputs(op).any(|id| id == input.value))
+        })
+        .map(|input| input.value)
+        .collect::<Vec<_>>();
+    let candidates =
+        candidates::generate(high, position, live, choices, config, &selectable).unwrap();
     if scratch.is_empty() {
         return candidates;
     }

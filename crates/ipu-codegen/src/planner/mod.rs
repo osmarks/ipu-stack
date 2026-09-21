@@ -82,10 +82,17 @@ pub(crate) fn plan(
 ) -> PlanningResult<MidGraph> {
     let mut search = Search::new(graph, layouts, settings, limits)?;
     for position in 0..graph.operations().len() {
+        let selectable_parameters = search.selectable_parameters(position);
         for state in search.take_states(position) {
             // Once per boundary state, not once per time/memory alternative.
-            for candidate in candidates::generate(graph, position, &state.live, layouts, settings)?
-            {
+            for candidate in candidates::generate(
+                graph,
+                position,
+                &state.live,
+                layouts,
+                settings,
+                &selectable_parameters,
+            )? {
                 search.extend(position, &state, candidate)?;
             }
         }
