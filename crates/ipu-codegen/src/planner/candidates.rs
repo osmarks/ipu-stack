@@ -1,6 +1,6 @@
-//! Search edges are complete local mid graphs. Operator families choose their
-//! layouts, algorithms and conversions; this module owns the common boundary
-//! representation and dispatches construction.
+//! A catalogue of implementations, independent of search histories. Inputs name
+//! required operand representations; outputs name produced representations.
+//! Search supplies boundary conversions and accounts for unrelated live values.
 
 use super::{BoundaryLayouts, PlanningError, PlanningResult, elementwise};
 use crate::config::PipelineConfig;
@@ -20,7 +20,7 @@ pub(super) struct BoundaryValue {
 
 pub(super) type LiveValues = BTreeMap<ValueId, BoundaryValue>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Candidate {
     /// First high operation not implemented by this fragment.
     pub end: usize,
@@ -30,9 +30,8 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
-    /// Import the whole live boundary. Unrelated activations become pass-through
-    /// outputs when extending the path, so ordinary mid liveness accounts for
-    /// residual storage without a separate approximation of its lifetime.
+    /// Import exactly the supplied representations. Generators supply operands;
+    /// search supplies its live boundary when connecting an implementation.
     pub fn inputs(high: &HighGraph, live: &LiveValues, tile_count: u16, end: usize) -> Self {
         let mut candidate = Self {
             end,
@@ -61,49 +60,124 @@ impl Candidate {
     }
 }
 
-pub(super) fn generate(
+pub(super) fn catalogue(
     high: &HighGraph,
-    position: usize,
-    live: &LiveValues,
     choices: &BoundaryLayouts,
     settings: &PipelineConfig,
-    selectable_parameters: &[ValueId],
-) -> PlanningResult<Vec<Candidate>> {
-    match high.operations()[position].kind {
-        OperationKind::Add => elementwise::generate(
-            high,
-            position,
-            live,
-            choices,
-            settings,
-            MidOperationKind::Add,
-            selectable_parameters,
-        ),
-        OperationKind::Gelu => elementwise::generate(
-            high,
-            position,
-            live,
-            choices,
-            settings,
-            MidOperationKind::Gelu,
-            selectable_parameters,
-        ),
-        OperationKind::Gemm(options) => super::gemm::generate(
-            high,
-            position,
-            live,
-            choices,
-            settings,
-            selectable_parameters,
-            options,
-        ),
-        OperationKind::LayerNorm => Err(PlanningError::Unimplemented("layernorm candidates")),
-        OperationKind::View(_) | OperationKind::Slice(_) => {
-            Err(PlanningError::Unimplemented("view/slice candidates"))
+) -> PlanningResult<Vec<Vec<Candidate>>> {
+    let mut tensors = BTreeMap::new();
+    let mut offers = BTreeMap::<ValueId, std::collections::BTreeSet<crate::Layout>>::new();
+    for input in high.inputs() {
+        if input.kind == GraphInputKind::Host
+            && !high.outputs().contains(&input.value)
+            && !high
+                .operations()
+                .iter()
+                .any(|op| high.operation_inputs(op).any(|id| id == input.value))
+        {
+            continue;
         }
-        OperationKind::FlashAttention(_) => {
-            Err(PlanningError::Unimplemented("attention candidates"))
-        }
-        OperationKind::Repeat(_) => Err(PlanningError::Unimplemented("Repeat candidates")),
+        let format = super::parameters::initial_format(
+            high,
+            input,
+            choices.get(&input.value).and_then(Option::as_ref),
+            settings,
+        )?;
+        offers
+            .entry(input.value)
+            .or_default()
+            .insert(format.layout.clone());
+        tensors.insert(
+            input.value,
+            TensorType {
+                shape: input.shape.clone(),
+                format,
+            },
+        );
     }
+    let mut catalogue = vec![Vec::new(); high.operations().len()];
+    // Candidate ports supply a finite vocabulary of boundary layouts. Revisit
+    // construction when a new port layout becomes available; each family adds
+    // only implementations it has not already offered. No search state is used.
+    loop {
+        let mut changed = false;
+        for (position, alternatives) in catalogue.iter_mut().enumerate() {
+            let additions = match high.operations()[position].kind {
+                OperationKind::Add => elementwise::generate(
+                    high,
+                    position,
+                    &tensors,
+                    choices,
+                    settings,
+                    MidOperationKind::Add,
+                    &offers,
+                    alternatives,
+                )?,
+                OperationKind::Gelu => elementwise::generate(
+                    high,
+                    position,
+                    &tensors,
+                    choices,
+                    settings,
+                    MidOperationKind::Gelu,
+                    &offers,
+                    alternatives,
+                )?,
+                OperationKind::Gemm(options) => super::gemm::generate(
+                    high,
+                    position,
+                    &tensors,
+                    choices,
+                    settings,
+                    options,
+                    alternatives,
+                )?,
+                _ => return Err(PlanningError::Unimplemented("operator candidates")),
+            };
+            for candidate in additions {
+                for id in candidate
+                    .graph
+                    .inputs
+                    .iter()
+                    .map(|i| i.value)
+                    .chain(candidate.graph.outputs.iter().copied())
+                {
+                    let value = &candidate.graph.values[id.index() as usize];
+                    changed |= offers
+                        .entry(value.origin)
+                        .or_default()
+                        .insert(value.tensor_type.format.layout.clone());
+                    tensors
+                        .entry(value.origin)
+                        .or_insert_with(|| value.tensor_type.clone());
+                }
+                alternatives.push(candidate);
+            }
+            if alternatives.is_empty() {
+                return Err(PlanningError::NoPlan(position + 1));
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for alternatives in &mut catalogue {
+        let mut retained = Vec::new();
+        for mut candidate in alternatives.drain(..) {
+            // Check kernel/cost-model support once, before search. Memory
+            // dominance is evaluated after connection: an imported parameter
+            // requirement may become either resident storage or scratch.
+            if candidate.graph.refresh_estimates(settings.target).is_none() {
+                continue;
+            }
+            if !retained
+                .iter()
+                .any(|old: &Candidate| old.end == candidate.end && old.graph == candidate.graph)
+            {
+                retained.push(candidate);
+            }
+        }
+        *alternatives = retained;
+    }
+    Ok(catalogue)
 }

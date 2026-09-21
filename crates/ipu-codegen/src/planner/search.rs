@@ -14,6 +14,112 @@ use crate::tensor::{OwnerMap, TensorType};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
+/// Connect one implementation to a live boundary. At first use a parameter may
+/// keep its baseline home or adopt the required representation. A preparation
+/// copy does not replace that home. Unrelated live values pass through the
+/// connected fragment so mid liveness counts residuals during its scratch peak.
+pub(super) fn connect(
+    high: &HighGraph,
+    position: usize,
+    live: &LiveValues,
+    implementation: &Candidate,
+    selectable: &[ValueId],
+    settings: &PipelineConfig,
+) -> PlanningResult<Vec<Candidate>> {
+    let mut homes = vec![live.clone()];
+    for input in &implementation.graph.inputs {
+        let required = &implementation.graph.values[input.value.index() as usize];
+        let current = live
+            .get(&required.origin)
+            .ok_or(PlanningError::InvalidFragment("unavailable operand"))?;
+        if current.tensor.shape != required.tensor_type.shape
+            || current.tensor.format.precision != required.tensor_type.format.precision
+            || required.owners != OwnerMap::default()
+        {
+            return Err(PlanningError::InvalidFragment(
+                "incompatible operand requirement",
+            ));
+        }
+        let desired = BoundaryValue {
+            tensor: required.tensor_type.clone(),
+            owners: required.owners.clone(),
+        };
+        if selectable.contains(&required.origin) {
+            let mut compact = current.clone();
+            compact.tensor.format.layout =
+                super::parameters::compact_format(&current.tensor.shape, settings).layout;
+            let mut alternatives = vec![desired];
+            // Compact homes currently support word-aligned, same-order retile.
+            // Native packing needs rectangular shards, not flat row fragments.
+            let row_bytes = u64::from(*current.tensor.shape.0.last().unwrap())
+                * current.tensor.format.precision.bytes();
+            if row_bytes.is_multiple_of(4)
+                && compact.tensor.format.layout.order == required.tensor_type.format.layout.order
+                && !alternatives.contains(&compact)
+            {
+                alternatives.push(compact);
+            }
+            let count = homes.len();
+            for desired in alternatives
+                .into_iter()
+                .filter(|desired| desired != current)
+            {
+                for i in 0..count {
+                    let mut home = homes[i].clone();
+                    home.insert(required.origin, desired.clone());
+                    homes.push(home);
+                }
+            }
+        }
+    }
+    homes
+        .into_iter()
+        .map(|home| {
+            let mut connected = Candidate::inputs(
+                high,
+                &home,
+                implementation.graph.tile_count,
+                implementation.end,
+            );
+            let imports = implementation
+                .graph
+                .inputs
+                .iter()
+                .map(|input| {
+                    let required = &implementation.graph.values[input.value.index() as usize];
+                    let original = connected.bindings[&required.origin];
+                    super::construction::copy(
+                        &mut connected.graph,
+                        high.operations()[position].id,
+                        original,
+                        required.tensor_type.clone(),
+                        Vec::new(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let outputs = crate::mid::append_fragment(
+                &implementation.graph,
+                &imports,
+                &OwnerMap::default(),
+                None,
+                None,
+                connected.graph.tile_count,
+                &mut connected.graph.values,
+                &mut connected.graph.operations,
+            )
+            .ok_or(PlanningError::InvalidFragment("connecting implementation"))?;
+            for (&local, &output) in implementation.graph.outputs.iter().zip(&outputs) {
+                connected.bindings.insert(
+                    implementation.graph.values[local.index() as usize].origin,
+                    output,
+                );
+            }
+            connected.graph.outputs = outputs;
+            Ok(connected)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[path = "property_tests.rs"]
 mod property_tests;
@@ -108,16 +214,12 @@ impl<'a> Search<'a> {
             .iter()
             .filter(|input| lifetimes[&input.value].1 > 0)
         {
-            let mut format = match settings.inputs.get(&input.value) {
-                Some(format) => format.clone(),
-                None if input.kind == GraphInputKind::Parameter => {
-                    super::parameters::default_format(high, input.value, settings)?
-                }
-                None => return Err(PlanningError::UnassignedLayout(input.value)),
-            };
-            if let Some(layout) = layouts.get(&input.value).and_then(Option::as_ref) {
-                format.layout = layout.clone();
-            }
+            let format = super::parameters::initial_format(
+                high,
+                input,
+                layouts.get(&input.value).and_then(Option::as_ref),
+                settings,
+            )?;
             live.insert(
                 input.value,
                 BoundaryValue {
@@ -196,6 +298,25 @@ impl<'a> Search<'a> {
         &mut self,
         position: usize,
         state: &State,
+        implementation: &Candidate,
+    ) -> PlanningResult<()> {
+        for candidate in connect(
+            self.high,
+            position,
+            &state.live,
+            implementation,
+            &self.selectable_parameters(position),
+            self.settings,
+        )? {
+            self.record(position, state, candidate)?;
+        }
+        Ok(())
+    }
+
+    fn record(
+        &mut self,
+        position: usize,
+        state: &State,
         mut candidate: Candidate,
     ) -> PlanningResult<()> {
         if candidate.end <= position || candidate.end > self.high.operations().len() {
@@ -212,30 +333,6 @@ impl<'a> Search<'a> {
             .any(|op| !op.output_aliases.is_empty())
         {
             return Err(PlanningError::Unimplemented("aliased DP fragments"));
-        }
-        let imports = candidate
-            .graph
-            .inputs
-            .iter()
-            .map(|input| {
-                let value = &candidate.graph.values[input.value.index() as usize];
-                (
-                    value.origin,
-                    BoundaryValue {
-                        tensor: value.tensor_type.clone(),
-                        owners: value.owners.clone(),
-                    },
-                )
-            })
-            .collect::<LiveValues>();
-        if imports.keys().ne(state.live.keys())
-            || state.live.iter().any(|(id, value)| {
-                imports.get(id) != Some(value) && self.first_use.get(id) != Some(&position)
-            })
-        {
-            return Err(PlanningError::InvalidFragment(
-                "fragment imports differ from boundary state",
-            ));
         }
         let mut live = LiveValues::new();
         for (&origin, &(birth, death)) in &self.lifetimes {

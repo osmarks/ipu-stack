@@ -1,7 +1,7 @@
 //! GEMM alternatives are explicit M/N/K grids. Preparation, independent partial
 //! products, and their reduction are emitted here, before costing or lowering.
 
-use super::candidates::{Candidate, LiveValues};
+use super::candidates::{BoundaryValue, Candidate};
 use super::construction::{copy, value};
 use super::{BoundaryLayouts, PlanningError, PlanningResult};
 use crate::graph::{GemmOptions, HighGraph, ValueId};
@@ -117,58 +117,53 @@ fn operand_layout(
 pub(super) fn generate(
     high: &HighGraph,
     position: usize,
-    live: &LiveValues,
+    tensors: &std::collections::BTreeMap<ValueId, TensorType>,
     layouts: &BoundaryLayouts,
     config: &PipelineConfig,
-    selectable: &[ValueId],
     options: GemmOptions,
+    existing: &[Candidate],
 ) -> PlanningResult<Vec<Candidate>> {
+    // The grid enumeration is intrinsic to this GEMM. Neighbour layouts do
+    // not yet introduce additional direct-output implementations.
+    if !existing.is_empty() {
+        return Ok(Vec::new());
+    }
     let op = &high.operations()[position];
     let origin = op.results[0];
     let shape = high.value_shape(origin).unwrap();
-    let sources = [&live[&op.inputs[0]].tensor, &live[&op.inputs[1]].tensor];
+    let sources = [&tensors[&op.inputs[0]], &tensors[&op.inputs[1]]];
     let mut candidates = Vec::new();
     for choice in choices(sources, shape, options, config.tile_count)? {
-        let mut homes = vec![Vec::new()];
+        let mut operands = super::candidates::LiveValues::new();
         for (i, &id) in op.inputs.iter().enumerate() {
-            if !selectable.contains(&id)
-                || op.inputs[..i].contains(&id)
-                || sources[i] == &choice.operands[i]
-            {
-                continue;
-            }
-            for j in 0..homes.len() {
-                let mut home = homes[j].clone();
-                let mut resident = choice.operands[i].clone();
-                resident.format.precision = sources[i].format.precision;
-                home.push((id, resident));
-                homes.push(home);
-            }
+            let mut tensor = choice.operands[i].clone();
+            tensor.format.precision = sources[i].format.precision;
+            // A repeated high operand imports one representation; append
+            // prepares the second role internally when its layout differs.
+            operands.entry(id).or_insert(BoundaryValue {
+                tensor,
+                owners: OwnerMap::default(),
+            });
         }
-        for home in homes {
-            let mut candidate = Candidate::inputs(high, live, config.tile_count, position + 1);
-            for (id, tensor) in home {
-                let input = candidate.bindings[&id];
-                candidate.graph.values[input.index() as usize].tensor_type = tensor;
-            }
-            let inputs = [
-                candidate.bindings[&op.inputs[0]],
-                candidate.bindings[&op.inputs[1]],
-            ];
-            let result = append(
-                &mut candidate.graph,
-                inputs,
-                &choice,
-                options,
-                shape,
-                op.id,
-                origin,
-                layouts.get(&origin).and_then(Option::as_ref),
-            );
-            candidate.bindings.insert(origin, result);
-            if candidate.graph.validate().is_ok() {
-                candidates.push(candidate);
-            }
+        let mut candidate = Candidate::inputs(high, &operands, config.tile_count, position + 1);
+        let inputs = [
+            candidate.bindings[&op.inputs[0]],
+            candidate.bindings[&op.inputs[1]],
+        ];
+        let result = append(
+            &mut candidate.graph,
+            inputs,
+            &choice,
+            options,
+            shape,
+            op.id,
+            origin,
+            layouts.get(&origin).and_then(Option::as_ref),
+        );
+        candidate.bindings.insert(origin, result);
+        candidate.graph.outputs = vec![result];
+        if candidate.graph.validate().is_ok() {
+            candidates.push(candidate);
         }
     }
     Ok(candidates)
@@ -214,7 +209,7 @@ pub(super) fn choices(
                 if kw > u32::from(u16::MAX) {
                     continue;
                 }
-                let operands = [
+                let mut operands = [
                     TensorType {
                         shape: sources[0].shape.clone(),
                         format: TensorFormat {
@@ -248,12 +243,15 @@ pub(super) fn choices(
                         },
                     },
                 ];
-                candidates.push(GemmChoice {
-                    operands,
-                    grid: [rows, columns, inner],
-                    inner_block: kw,
-                    output_columns: nw,
-                });
+                for class in [MemoryClass::Ipu21Interleaved, MemoryClass::Ipu21Standard] {
+                    operands[1].format.layout.memory_class = class;
+                    candidates.push(GemmChoice {
+                        operands: operands.clone(),
+                        grid: [rows, columns, inner],
+                        inner_block: kw,
+                        output_columns: nw,
+                    });
+                }
             }
         }
     }
@@ -282,8 +280,7 @@ pub(super) fn append(
     let inputs = inputs
         .iter()
         .zip(operands)
-        .enumerate()
-        .map(|(operand, (id, tensor))| {
+        .map(|(id, tensor)| {
             let mut input = *id;
             let from = graph.values[input.index() as usize]
                 .tensor_type
@@ -291,27 +288,6 @@ pub(super) fn append(
                 .precision;
             let mut preparation = tensor.clone();
             preparation.format.precision = from;
-            // Pack before distribution when logical cuts are not word-aligned.
-            // Exchange then moves complete native panels.
-            if ((operand == 0 && options.transpose_left)
-                || !(tensor.shape.0.last().unwrap() * tensor.format.precision.bytes() as u32)
-                    .is_multiple_of(4))
-                && graph.values[input.index() as usize]
-                    .tensor_type
-                    .format
-                    .layout
-                    .order
-                    != tensor.format.layout.order
-            {
-                let mut packed = preparation.clone();
-                packed.format.layout.tiling.tile_count = 1;
-                packed.format.layout.tiling.replicas = 1;
-                for axis in &mut packed.format.layout.tiling.axes {
-                    axis.partitions = 1;
-                    axis.tile_stride = Some(1);
-                }
-                input = copy(graph, source, input, packed, Vec::new());
-            }
             input = copy(graph, source, input, preparation, Vec::new());
             if from != tensor.format.precision {
                 let output = value(
@@ -386,7 +362,11 @@ pub(super) fn append(
                 AccumulationPrecision::F16
             },
             mode: GemmKernelMode::Initialize,
-            weights: GemmWeightLoad::Interleaved,
+            weights: if operands[1].format.layout.memory_class == MemoryClass::Ipu21Interleaved {
+                GemmWeightLoad::Interleaved
+            } else {
+                GemmWeightLoad::Standard
+            },
             inner_block: kw,
             output_columns: nw,
         },

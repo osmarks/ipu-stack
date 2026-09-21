@@ -1,5 +1,7 @@
+use super::super::candidates::LiveValues;
 use super::super::{SearchLimits, boundary_layouts, plan};
 use super::*;
+use crate::planner::tests::gelu;
 use ipu_target::Target;
 
 #[test]
@@ -144,6 +146,14 @@ fn evaluate(candidate: &Candidate, data: &[Vec<f64>; 2], origins: &[ValueId]) ->
             MidOperationKind::Cast { .. } => {
                 result.clone_from(&values[op.inputs[0].index() as usize]);
             }
+            MidOperationKind::Gelu => {
+                for (out, &x) in result
+                    .iter_mut()
+                    .zip(&values[op.inputs[0].index() as usize])
+                {
+                    *out = gelu(x);
+                }
+            }
             MidOperationKind::Copy { mapping, .. } => {
                 assert!(mapping.view.is_none());
                 let input = op.inputs[0].index() as usize;
@@ -234,6 +244,103 @@ fn evaluate(candidate: &Candidate, data: &[Vec<f64>; 2], origins: &[ValueId]) ->
         values[output] = result;
     }
     values
+}
+
+#[test]
+fn neighbour_layouts_connect_gemm_and_elementwise_chains_without_importing_residuals() {
+    let mut rng = fastrand::Rng::with_seed(0xca7a_1090);
+    for _ in 0..8 {
+        let m = rng.u32(2..=6);
+        let k = 16 * rng.u32(1..=2);
+        let mut high = HighGraph::new();
+        let x = high.host_input("x", [m, k]).unwrap();
+        let w = high.parameter("w", [k, k]).unwrap();
+        let first = high.gelu(x).unwrap();
+        let product = high.gemm(first, w).unwrap();
+        let middle = high.gelu(product).unwrap();
+        let output = high.gemm(middle, w).unwrap();
+        high.set_outputs([output, x]).unwrap();
+        let mut config = PipelineConfig::new(Target::Ipu21, 2).with_input(
+            x,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded(1),
+            },
+        );
+        config.standard_memory_reservation_bytes = 0;
+        let layouts = boundary_layouts(&high, &config);
+        let catalogue = super::super::candidates::catalogue(&high, &layouts, &config).unwrap();
+        for (position, alternatives) in catalogue.iter().enumerate() {
+            for candidate in alternatives {
+                let imports = candidate
+                    .graph
+                    .inputs
+                    .iter()
+                    .map(|input| candidate.graph.values[input.value.index() as usize].origin)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    imports,
+                    high.operations()[position].inputs.iter().copied().collect()
+                );
+            }
+        }
+        // The consumer's required packed layout reaches the preceding GeLU,
+        // although neither the input nor the default output uses that layout.
+        for consumer in &catalogue[1] {
+            let required = &consumer.graph.values[consumer.bindings[&first].index() as usize];
+            assert!(catalogue[0].iter().any(|producer| {
+                let output = &producer.graph.values[producer.graph.outputs[0].index() as usize];
+                output.tensor_type == required.tensor_type
+            }));
+        }
+        let exact = SearchLimits {
+            states_per_boundary: None,
+            paths_per_state: None,
+        };
+        let graph = plan(&high, &layouts, &config, exact).unwrap();
+        let mut constrained = layouts.clone();
+        for id in [first, middle] {
+            constrained.insert(id, Some(Layout::row_sharded(1)));
+        }
+        let conventional = plan(&high, &constrained, &config, exact).unwrap();
+        assert!(graph.estimated_cycles <= conventional.estimated_cycles);
+        let data = [m * k, k * k].map(|count| {
+            (0..count)
+                .map(|_| f64::from(rng.i32(-8..=8)) / 16.0)
+                .collect::<Vec<_>>()
+        });
+        let dense = |input: &[f64]| {
+            (0..m * k)
+                .map(|i| {
+                    (0..k)
+                        .map(|j| {
+                            input[((i / k) * k + j) as usize] * data[1][(j * k + i % k) as usize]
+                        })
+                        .sum::<f64>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = dense(
+            &dense(&data[0].iter().copied().map(gelu).collect::<Vec<_>>())
+                .into_iter()
+                .map(gelu)
+                .collect::<Vec<_>>(),
+        );
+        let candidate = Candidate {
+            end: 4,
+            graph,
+            bindings: Default::default(),
+        };
+        let actual = evaluate(&candidate, &data, &[x, w]);
+        for (&actual, expected) in actual[candidate.graph.outputs[0].index() as usize]
+            .iter()
+            .zip(expected)
+        {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+        assert_eq!(actual[candidate.graph.outputs[1].index() as usize], data[0]);
+        crate::low::expand::expand_tiles(Target::Ipu21, &candidate.graph, false).unwrap();
+    }
 }
 
 #[test]
@@ -370,8 +477,14 @@ fn randomized_distributed_gemms_match_dense_products_and_lower() {
                     .sum::<f64>()
             })
             .collect::<Vec<_>>();
-        let mut candidates =
-            generate(&high, 0, &live, &choices, &config, &selectable, options).unwrap();
+        let catalogue = super::super::candidates::catalogue(&high, &choices, &config).unwrap();
+        let mut candidates = catalogue[0]
+            .iter()
+            .flat_map(|candidate| {
+                super::super::search::connect(&high, 0, &live, candidate, &selectable, &config)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         assert!(!candidates.is_empty());
         let mut best = u64::MAX;
         for candidate in &mut candidates {
@@ -392,8 +505,8 @@ fn randomized_distributed_gemms_match_dense_products_and_lower() {
                             crate::low::expand::expand_tiles(Target::Ipu21, &prefix, false)
                         {
                             panic!(
-                                "case={case}: first failure at {end}: {err:?} {:?}",
-                                prefix.operations[end - 1]
+                                "case={case}: first failure at {end}: {err:?} {:?}\n{:#?}",
+                                prefix.operations[end - 1], prefix.values
                             );
                         }
                     }

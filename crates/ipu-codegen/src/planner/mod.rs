@@ -83,18 +83,10 @@ pub(crate) fn plan(
     limits: SearchLimits,
 ) -> PlanningResult<MidGraph> {
     let mut search = Search::new(graph, layouts, settings, limits)?;
-    for position in 0..graph.operations().len() {
-        let selectable_parameters = search.selectable_parameters(position);
+    let catalogue = candidates::catalogue(graph, layouts, settings)?;
+    for (position, candidates) in catalogue.iter().enumerate() {
         for state in search.take_states(position) {
-            // Once per boundary state, not once per time/memory alternative.
-            for candidate in candidates::generate(
-                graph,
-                position,
-                &state.live,
-                layouts,
-                settings,
-                &selectable_parameters,
-            )? {
+            for candidate in candidates {
                 search.extend(position, &state, candidate)?;
             }
         }
@@ -109,6 +101,10 @@ mod search_tests;
 mod tests {
     use super::*;
     use crate::{Precision, TensorFormat, TensorTiling};
+
+    pub(super) fn gelu(x: f64) -> f64 {
+        0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh())
+    }
 
     #[test]
     fn boundaries_share_branch_values_and_include_repeat_parameters_and_body() {

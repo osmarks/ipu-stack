@@ -1,3 +1,4 @@
+use super::tests::gelu;
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::{Precision, TensorFormat};
@@ -44,7 +45,6 @@ fn execute(graph: &MidGraph) -> Vec<Vec<f64>> {
             })
             .collect();
     }
-    let gelu = |x: f64| 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh());
     for op in &graph.operations {
         let left = &values[op.inputs[0].index() as usize];
         let output = match op.kind {
@@ -183,6 +183,7 @@ fn escaped_add_result_is_preserved_and_resident_parameters_are_not_freed() {
 fn empty_graph_keeps_identity_outputs_and_checks_memory() {
     let mut high = HighGraph::new();
     let x = high.host_input("x", [16, 16]).unwrap();
+    high.host_input("unused", [16, 16]).unwrap();
     high.set_outputs([x, x]).unwrap();
     let mut config = PipelineConfig::new(Target::Ipu21, 1).with_input(
         x,

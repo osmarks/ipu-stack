@@ -6,6 +6,25 @@ use super::{PlanningError, PlanningResult};
 use crate::graph::{HighGraph, OperationKind, ValueId};
 use crate::{Layout, PipelineConfig, Precision, TensorFormat, TensorShape};
 
+pub(super) fn initial_format(
+    high: &HighGraph,
+    input: &crate::graph::GraphInput,
+    layout: Option<&Layout>,
+    config: &PipelineConfig,
+) -> PlanningResult<TensorFormat> {
+    let mut format = match config.inputs.get(&input.value) {
+        Some(format) => format.clone(),
+        None if input.kind == crate::graph::GraphInputKind::Parameter => {
+            default_format(high, input.value, config)?
+        }
+        None => return Err(PlanningError::UnassignedLayout(input.value)),
+    };
+    if let Some(layout) = layout {
+        format.layout = layout.clone();
+    }
+    Ok(format)
+}
+
 pub(super) fn default_format(
     high: &HighGraph,
     value: ValueId,

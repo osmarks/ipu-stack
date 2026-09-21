@@ -6,6 +6,7 @@ use super::super::{boundary_layouts, plan};
 use super::*;
 use crate::graph::{GraphInputKind, OperationKind, ValueId};
 use crate::mid::{MidInput, MidOperation, MidOperationKind, MidValue, MidValueId, OperandIndexing};
+use crate::planner::tests::gelu;
 use crate::tensor::{Layout, MemoryClass, OwnerMap, Precision, TensorFormat, TensorType};
 use ipu_target::Target;
 use std::collections::BTreeSet;
@@ -120,8 +121,13 @@ fn edges(
         })
         .map(|input| input.value)
         .collect::<Vec<_>>();
-    let candidates =
-        candidates::generate(high, position, live, choices, config, &selectable).unwrap();
+    let catalogue = candidates::catalogue(high, choices, config).unwrap();
+    let candidates = catalogue[position]
+        .iter()
+        .flat_map(|candidate| {
+            connect(high, position, live, candidate, &selectable, config).unwrap()
+        })
+        .collect::<Vec<_>>();
     if scratch.is_empty() {
         return candidates;
     }
@@ -297,7 +303,7 @@ fn explore<'a>(
                 alternatives.reverse();
             }
             for candidate in alternatives {
-                search.extend(position, &state, candidate)?;
+                search.record(position, &state, candidate)?;
             }
         }
     }
@@ -416,10 +422,6 @@ fn result_cycles(result: &PlanningResult<MidGraph>) -> Option<u64> {
         Err(PlanningError::NoPlan(_)) => None,
         Err(other) => panic!("unexpected planning error: {other:?}"),
     }
-}
-
-fn gelu(x: f64) -> f64 {
-    0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh())
 }
 
 fn check_semantics(high: &HighGraph, mid: &MidGraph, rng: &mut fastrand::Rng) {
