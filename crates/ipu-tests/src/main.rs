@@ -564,7 +564,8 @@ fn main() -> Result<()> {
     } else if matches!(arguments.workload, Workload::ElementwiseSmoke) {
         // Different input ownership requires movement; 104 columns exercises
         // worker tails. The first sum escapes fusion through the residual,
-        // whereas the final Add/GeLU pair can fuse.
+        // whereas the final Add/GeLU pair can fuse. Leave the resident parameter
+        // layout unassigned so this also exercises first-use home selection.
         let shape = [
             u32::from(active_tiles)
                 .checked_mul(arguments.elementwise_rows_per_tile)
@@ -578,21 +579,13 @@ fn main() -> Result<()> {
         let residual = graph.add(activated, sum)?;
         let output = graph.gelu(residual)?;
         graph.set_outputs([output])?;
-        pipeline = pipeline
-            .with_input(
-                input,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::row_sharded((active_tiles / 2).max(1)),
-                },
-            )
-            .with_input(
-                weight,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::row_sharded(active_tiles),
-                },
-            );
+        pipeline = pipeline.with_input(
+            input,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded((active_tiles / 2).max(1)),
+            },
+        );
     } else if matches!(arguments.workload, Workload::MlpSmoke) {
         let left = graph.host_input("left", [u32::from(active_tiles), 64])?;
         let right0 = graph.parameter("right.0", [64, 64])?;

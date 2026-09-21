@@ -44,6 +44,15 @@ pub struct MemoryPeaks {
 }
 
 impl MemoryPeaks {
+    pub(crate) fn include(&mut self, other: Self) {
+        self.standard = self.standard.max(other.standard);
+        self.interleaved = self.interleaved.max(other.interleaved);
+        self.total = self.total.max(other.total);
+        self.maximum_standard_allocation = self
+            .maximum_standard_allocation
+            .max(other.maximum_standard_allocation);
+        self.exchange_rows = self.exchange_rows.max(other.exchange_rows);
+    }
     /// Shared Pareto dimensions for operator and region shortlists.
     pub(crate) fn objectives(self) -> [u64; 5] {
         [

@@ -30,7 +30,10 @@ pub(crate) fn analyze(
 
 /// The normal estimator uses the zero-cost observer. Diagnostics record the
 /// same allocation and liveness decisions, without a second accounting model.
-pub(super) trait MemoryObserver {
+pub(crate) trait MemoryObserver {
+    const SPLIT_RESIDENT: bool = false;
+    fn resident(&mut self, _origin: crate::ValueId, _class: MemoryClass, _bytes: &[u64]) {}
+    fn nonresident(&mut self, _usage: &[MemoryUsage], _maximum_standard: u64) {}
     fn value(
         &mut self,
         _value: &MidValue,
@@ -58,13 +61,13 @@ pub(super) trait MemoryObserver {
 }
 impl MemoryObserver for () {}
 
-pub(super) fn analyze_observed(
+pub(crate) fn analyze_observed(
     target: Target,
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    analyze_storage::<true>(target, program, copies, observer)
+    analyze_storage::<true, _>(target, program, copies, observer)
 }
 
 /// A fitting upper bound needs no refinement. Every failed capacity screen is
@@ -74,7 +77,7 @@ pub(crate) fn analyze_with_budget(
     copies: &BTreeMap<MidValueId, u32>,
     config: &crate::PipelineConfig,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let bound = analyze_storage::<false>(config.target, program, copies, &mut ())?;
+    let bound = analyze_storage::<false, _>(config.target, program, copies, &mut ())?;
     if bound.1.fits_with_budget(
         config.target,
         config.standard_memory_reservation_bytes,
@@ -86,11 +89,11 @@ pub(crate) fn analyze_with_budget(
     }
 }
 
-fn analyze_storage<const PER_TILE: bool>(
+fn analyze_storage<const PER_TILE: bool, O: MemoryObserver>(
     target: Target,
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
-    observer: &mut impl MemoryObserver,
+    observer: &mut O,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
     let mut steps = Vec::new();
     fn flatten<'a>(
@@ -273,6 +276,25 @@ fn analyze_storage<const PER_TILE: bool>(
         .iter()
         .map(|sizes| sizes.iter().copied().max().unwrap_or(0))
         .collect::<Vec<_>>();
+    let mut resident = vec![false; if O::SPLIT_RESIDENT { roots.len() } else { 0 }];
+    let mut tile_resident = vec![MemoryUsage::default(); if O::SPLIT_RESIDENT { tiles } else { 0 }];
+    for input in &program.inputs {
+        if !O::SPLIT_RESIDENT || input.kind != crate::GraphInputKind::Parameter {
+            continue;
+        }
+        let id = roots[input.value.index() as usize];
+        if !resident[id] {
+            observer.resident(
+                program.values[input.value.index() as usize].origin,
+                classes[id],
+                &bytes[id],
+            );
+            for (usage, &size) in tile_resident.iter_mut().zip(&bytes[id]) {
+                usage.add_class(classes[id], size);
+            }
+            resident[id] = true;
+        }
+    }
     let mut initial_standard = 0;
     for id in (0..live.len()).filter(|&id| live[id]) {
         for (usage, &size) in tile_live.iter_mut().zip(&bytes[id]) {
@@ -285,6 +307,30 @@ fn analyze_storage<const PER_TILE: bool>(
     for &usage in &tile_live {
         peak.observe(usage, initial_standard);
     }
+    let observe_nonresident = |observer: &mut _,
+                               usage: &[MemoryUsage],
+                               live: &[bool],
+                               scratch: u64| {
+        if !O::SPLIT_RESIDENT {
+            return;
+        }
+        let usage = usage
+            .iter()
+            .zip(&tile_resident)
+            .map(|(all, resident)| MemoryUsage {
+                standard: all.standard - resident.standard,
+                interleaved: all.interleaved - resident.interleaved,
+            })
+            .collect::<Vec<_>>();
+        let maximum = (0..live.len())
+            .filter(|&id| live[id] && !resident[id] && classes[id] == MemoryClass::Ipu21Standard)
+            .map(|id| maximum_sizes[id])
+            .max()
+            .unwrap_or(0)
+            .max(scratch);
+        MemoryObserver::nonresident(observer, &usage, maximum);
+    };
+    observe_nonresident(observer, &tile_live, &live, 0);
 
     for (index, (operation, count)) in steps.into_iter().enumerate() {
         for value in operation.inputs.iter().chain(&operation.results) {
@@ -363,6 +409,7 @@ fn analyze_storage<const PER_TILE: bool>(
             &tile_usage,
             &tile_scratch,
         );
+        observe_nonresident(observer, &tile_usage, &live, scratch.standard);
         for &usage in &tile_usage {
             peak.observe(usage, maximum_standard.max(scratch.standard));
         }

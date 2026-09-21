@@ -5,6 +5,7 @@
 pub(crate) mod budget;
 mod candidates;
 mod elementwise;
+mod parameters;
 mod search;
 
 use crate::Layout;
@@ -71,9 +72,8 @@ pub enum PlanningError {
 pub type PlanningResult<T> = Result<T, PlanningError>;
 
 /// Layout entries containing Some constrain the corresponding high boundary.
-/// None leaves it to candidate generation. Inputs currently need explicit formats.
-/// Parameter representations are fixed for this initial implementation; allowing
-/// candidates to resize resident storage needs retroactive memory accounting.
+/// None leaves it to candidate generation. Host inputs need explicit formats;
+/// unspecified parameters start in compact FP16 homes and can change at first use.
 pub(crate) fn plan(
     graph: &HighGraph,
     layouts: &BoundaryLayouts,

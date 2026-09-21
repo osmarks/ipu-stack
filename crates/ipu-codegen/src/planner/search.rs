@@ -1,9 +1,9 @@
 //! DP over a fixed high-operation order. A state contains only live boundary
 //! representations; a path label contains historical cost and a predecessor.
-//! This first version fixes parameter representations and disallows boundary
-//! aliasing. Consequently every fragment is costed with the same resident set,
-//! and maxima of its complete-context peaks compose without double-counting.
+//! Parameters begin with compact reservations. Their first consumer can replace
+//! them; selected resident storage is charged against all earlier scratch peaks.
 
+use super::budget::Memory;
 use super::candidates::{BoundaryValue, Candidate, LiveValues};
 use super::{BoundaryLayouts, PlanningError, PlanningResult, SearchLimits};
 use crate::config::PipelineConfig;
@@ -28,25 +28,20 @@ struct Path {
     candidate: Option<Rc<Candidate>>,
     cycles: u64,
     peak: MemoryPeaks,
+    memory: Memory,
 }
 
 pub(super) struct Search<'a> {
     high: &'a HighGraph,
     settings: &'a PipelineConfig,
     limits: SearchLimits,
-    /// Birth boundary and last-use boundary. Parameters extend to graph exit.
+    /// Birth and last-use boundaries for representations, not storage lifetime.
     lifetimes: BTreeMap<ValueId, (usize, usize)>,
     states: Vec<HashMap<LiveValues, Vec<Rc<Path>>, foldhash::fast::FixedState>>,
     initial: Candidate,
-}
-
-fn memory(peak: MemoryPeaks) -> [u64; 4] {
-    [
-        peak.standard,
-        peak.interleaved,
-        peak.total,
-        peak.maximum_standard_allocation,
-    ]
+    /// Unconstrained parameter -> first consumer boundary. Defaults are ranking
+    /// reservations until this boundary, not hard per-tile capacity charges.
+    first_use: BTreeMap<ValueId, usize>,
 }
 
 impl<'a> Search<'a> {
@@ -62,19 +57,23 @@ impl<'a> Search<'a> {
             ));
         }
         let exit = high.operations().len();
+        let first_use = high
+            .inputs()
+            .iter()
+            .filter(|input| {
+                input.kind == GraphInputKind::Parameter
+                    && layouts.get(&input.value).and_then(Option::as_ref).is_none()
+            })
+            .filter_map(|input| {
+                high.operations()
+                    .iter()
+                    .position(|op| high.operation_inputs(op).any(|id| id == input.value))
+                    .map(|position| (input.value, position))
+            })
+            .collect();
         let mut lifetimes = BTreeMap::new();
         for input in high.inputs() {
-            lifetimes.insert(
-                input.value,
-                (
-                    0,
-                    if input.kind == GraphInputKind::Parameter {
-                        exit + 1
-                    } else {
-                        0
-                    },
-                ),
-            );
+            lifetimes.insert(input.value, (0, 0));
         }
         for (index, operation) in high.operations().iter().enumerate() {
             for input in high.operation_inputs(operation) {
@@ -93,17 +92,29 @@ impl<'a> Search<'a> {
                 .ok_or(PlanningError::InvalidFragment("undefined graph output"))?
                 .1 = exit + 1;
         }
+        // Preserve declared resident inputs even if this graph never reads them.
+        for input in high
+            .inputs()
+            .iter()
+            .filter(|i| i.kind == GraphInputKind::Parameter)
+        {
+            if lifetimes[&input.value].1 == 0 {
+                lifetimes.get_mut(&input.value).unwrap().1 = exit + 1;
+            }
+        }
         let mut live = LiveValues::new();
         for input in high
             .inputs()
             .iter()
             .filter(|input| lifetimes[&input.value].1 > 0)
         {
-            let mut format = settings
-                .inputs
-                .get(&input.value)
-                .cloned()
-                .ok_or(PlanningError::UnassignedLayout(input.value))?;
+            let mut format = match settings.inputs.get(&input.value) {
+                Some(format) => format.clone(),
+                None if input.kind == GraphInputKind::Parameter => {
+                    super::parameters::default_format(&input.shape, settings)
+                }
+                None => return Err(PlanningError::UnassignedLayout(input.value)),
+            };
             if let Some(layout) = layouts.get(&input.value).and_then(Option::as_ref) {
                 format.layout = layout.clone();
             }
@@ -122,9 +133,17 @@ impl<'a> Search<'a> {
         initial.graph.outputs = initial.bindings.values().copied().collect();
         initial
             .graph
-            .refresh_estimates(settings.target)
-            .ok_or(PlanningError::InvalidFragment("initial storage"))?;
-        let peak = initial.graph.peak_memory;
+            .validate()
+            .map_err(|_| PlanningError::InvalidFragment("initial storage"))?;
+        let mut memory = Memory::default();
+        let (_, peak) = crate::estimate::analyze_observed(
+            settings.target,
+            &initial.graph,
+            &BTreeMap::new(),
+            &mut memory,
+        )
+        .ok_or(PlanningError::InvalidFragment("initial storage"))?;
+        initial.graph.peak_memory = peak;
         let mut states = (0..=exit).map(|_| HashMap::default()).collect::<Vec<_>>();
         states[0].insert(
             live,
@@ -133,6 +152,7 @@ impl<'a> Search<'a> {
                 candidate: None,
                 cycles: 0,
                 peak,
+                memory,
             })],
         );
         Ok(Self {
@@ -142,6 +162,7 @@ impl<'a> Search<'a> {
             lifetimes,
             states,
             initial,
+            first_use,
         })
     }
 
@@ -151,7 +172,7 @@ impl<'a> Search<'a> {
             .filter(|(_, paths)| !paths.is_empty())
             .map(|(live, paths)| State { live, paths })
             .collect::<Vec<_>>();
-        states.sort_by_key(|state| state.paths.iter().map(|p| p.cycles).min());
+        states.sort_by_key(|state| state.paths.iter().map(|p| (p.cycles, p.peak.total)).min());
         if let Some(limit) = self.limits.states_per_boundary {
             states.truncate(limit);
         }
@@ -175,8 +196,8 @@ impl<'a> Search<'a> {
                 "edge does not advance within graph",
             ));
         }
-        // Until alias identities are part of the boundary key, no candidate may
-        // export an alias or change a parameter representation behind the DP.
+        // Aliases need allocation identities in the boundary state and memory
+        // composition. Do not silently cost shared storage as independent values.
         if candidate
             .graph
             .operations
@@ -200,7 +221,11 @@ impl<'a> Search<'a> {
                 )
             })
             .collect::<LiveValues>();
-        if imports != state.live {
+        if imports.keys().ne(state.live.keys())
+            || state.live.iter().any(|(id, value)| {
+                imports.get(id) != Some(value) && self.first_use.get(id) != Some(&position)
+            })
+        {
             return Err(PlanningError::InvalidFragment(
                 "fragment imports differ from boundary state",
             ));
@@ -225,26 +250,69 @@ impl<'a> Search<'a> {
         candidate.graph.outputs = live.keys().map(|id| candidate.bindings[id]).collect();
         candidate
             .graph
-            .refresh_estimates(self.settings.target)
-            .ok_or(PlanningError::InvalidFragment("uncostable mid fragment"))?;
+            .validate()
+            .map_err(|_| PlanningError::InvalidFragment("invalid mid fragment"))?;
+        let mut local = Memory::default();
+        let (cycles, peak) = crate::estimate::analyze_observed(
+            self.settings.target,
+            &candidate.graph,
+            &BTreeMap::new(),
+            &mut local,
+        )
+        .ok_or(PlanningError::InvalidFragment("uncostable mid fragment"))?;
+        candidate.graph.estimated_cycles = cycles.total;
+        candidate.graph.estimated_exchange_cycles = cycles.exchange;
+        candidate.graph.peak_memory = peak;
         let end = candidate.end;
         let candidate = Rc::new(candidate);
         let paths = self.states[end].entry(live).or_default();
         for old in &state.paths {
-            let local = candidate.graph.peak_memory;
-            let peak = MemoryPeaks {
-                standard: old.peak.standard.max(local.standard),
-                interleaved: old.peak.interleaved.max(local.interleaved),
-                total: old.peak.total.max(local.total),
-                maximum_standard_allocation: old
-                    .peak
-                    .maximum_standard_allocation
-                    .max(local.maximum_standard_allocation),
-                // Row sharing/code residency need whole-program accounting.
-                // They are not treated as a local, composable memory resource.
-                exchange_rows: 0,
-            };
-            if !peak.fits_with_budget(
+            let mut memory = local.clone();
+            for (peak, old) in memory.nonresident.iter_mut().zip(&old.memory.nonresident) {
+                peak.include(*old);
+            }
+            memory.nonresident_total = memory.nonresident_total.max(old.memory.nonresident_total);
+            // Later consumers can increase padding/alignment requirements even
+            // when the resident layout is unchanged. Preserve those requirements.
+            for (&id, old_bytes) in &old.memory.parameters {
+                if self.first_use.get(&id) == Some(&position) {
+                    continue;
+                }
+                let bytes = memory
+                    .parameters
+                    .entry(id)
+                    .or_insert_with(|| old_bytes.clone());
+                for (bytes, old) in bytes.iter_mut().zip(old_bytes) {
+                    bytes.standard = bytes.standard.max(old.standard);
+                    bytes.interleaved = bytes.interleaved.max(old.interleaved);
+                }
+            }
+            let peak = memory.peak(|_| true);
+            // Undecided layouts impose no per-tile lower bound: they may move
+            // away from that tile entirely. Their default footprint ranks only.
+            let mut lower =
+                memory.peak(|id| self.first_use.get(&id).is_none_or(|&first| first < end));
+            let resident_total = memory
+                .parameters
+                .iter()
+                .map(|(id, bytes)| {
+                    if self.first_use.get(id).is_some_and(|&first| first >= end) {
+                        let value =
+                            &candidate.graph.values[candidate.bindings[id].index() as usize];
+                        value.tensor_type.shape.elements()
+                            * value.tensor_type.format.precision.bytes()
+                    } else {
+                        bytes.iter().map(|bytes| bytes.total()).sum()
+                    }
+                })
+                .sum::<u64>();
+            lower.total = lower.total.max(
+                memory
+                    .nonresident_total
+                    .saturating_add(resident_total)
+                    .div_ceil(u64::from(self.settings.tile_count)),
+            );
+            if !lower.fits_with_budget(
                 self.settings.target,
                 self.settings.standard_memory_reservation_bytes,
                 self.settings.tile_memory_budget_bytes,
@@ -252,25 +320,19 @@ impl<'a> Search<'a> {
                 continue;
             }
             let cycles = old.cycles.saturating_add(candidate.graph.estimated_cycles);
-            let dominates = |a_cycles, a_peak, b_cycles, b_peak| {
-                a_cycles <= b_cycles
-                    && memory(a_peak)
-                        .into_iter()
-                        .zip(memory(b_peak))
-                        .all(|(a, b)| a <= b)
-            };
             if paths
                 .iter()
-                .any(|p| dominates(p.cycles, p.peak, cycles, peak))
+                .any(|p| p.cycles <= cycles && p.memory.dominates(&memory))
             {
                 continue;
             }
-            paths.retain(|p| !dominates(cycles, peak, p.cycles, p.peak));
+            paths.retain(|p| !(cycles <= p.cycles && memory.dominates(&p.memory)));
             paths.push(Rc::new(Path {
                 previous: Some(Rc::clone(old)),
                 candidate: Some(Rc::clone(&candidate)),
                 cycles,
                 peak,
+                memory,
             }));
         }
         Ok(())
@@ -293,6 +355,16 @@ impl<'a> Search<'a> {
         let mut graph = self.initial.graph;
         let mut bindings = self.initial.bindings;
         for candidate in path.into_iter().rev() {
+            // Planning order does not imply loading order. Replace the original
+            // graph input's format; it remains resident from execution entry.
+            for input in &candidate.graph.inputs {
+                if input.kind == GraphInputKind::Parameter {
+                    let value = &candidate.graph.values[input.value.index() as usize];
+                    let destination = &mut graph.values[bindings[&value.origin].index() as usize];
+                    destination.tensor_type = value.tensor_type.clone();
+                    destination.owners = value.owners.clone();
+                }
+            }
             let imports = candidate
                 .graph
                 .inputs

@@ -218,3 +218,30 @@ fn invalid_proposed_layout_does_not_discard_valid_vector_plan() {
     let graph = plan(&high, &boundary_layouts(&high, &config), &config, EXACT).unwrap();
     crate::low::expand::expand_tiles(Target::Ipu21, &graph, false).unwrap();
 }
+
+#[test]
+fn first_consumer_can_replace_compact_home_and_avoid_preparation() {
+    let mut high = HighGraph::new();
+    let x = high.host_input("x", [16, 16]).unwrap();
+    let weight = high.parameter("weight", [16, 16]).unwrap();
+    let first = high.gelu(x).unwrap();
+    let output = high.add(first, weight).unwrap();
+    high.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(Target::Ipu21, 4).with_input(
+        x,
+        TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(4),
+        },
+    );
+    let mut choices = boundary_layouts(&high, &config);
+    choices.insert(first, Some(Layout::row_sharded(4)));
+    choices.insert(output, Some(Layout::row_sharded(4)));
+    let selected = plan(&high, &choices, &config, EXACT).unwrap();
+    let baseline = parameters::default_format(high.value_shape(weight).unwrap(), &config);
+    choices.insert(weight, Some(baseline.layout));
+    let fixed = plan(&high, &choices, &config, EXACT).unwrap();
+    assert!(selected.estimated_cycles < fixed.estimated_cycles);
+    assert_eq!(execute(&selected), execute(&fixed));
+    crate::low::expand::expand_tiles(Target::Ipu21, &selected, false).unwrap();
+}

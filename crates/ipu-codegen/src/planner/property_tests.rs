@@ -42,7 +42,10 @@ fn initial(high: &HighGraph, config: &PipelineConfig) -> (MidGraph, BTreeMap<Val
             owners: OwnerMap::default(),
             tensor_type: TensorType {
                 shape: input.shape.clone(),
-                format: config.inputs[&input.value].clone(),
+                format: config.inputs.get(&input.value).cloned().unwrap_or_else(|| {
+                    assert_eq!(input.kind, GraphInputKind::Parameter);
+                    super::super::parameters::default_format(&input.shape, config)
+                }),
             },
         });
         graph.inputs.push(MidInput {
@@ -70,6 +73,12 @@ fn live_at(
             high.inputs()
                 .iter()
                 .filter(|input| input.kind == GraphInputKind::Parameter)
+                .filter(|input| {
+                    !high
+                        .operations()
+                        .iter()
+                        .any(|op| high.operation_inputs(op).any(|id| id == input.value))
+                })
                 .map(|input| input.value),
         )
         .filter_map(|high| {
@@ -119,7 +128,8 @@ fn edges(
                         value.tensor_type =
                             TensorType::new([1, bytes / 2], Precision::F16, Layout::row_sharded(1));
                         value.tensor_type.format.layout.memory_class = class;
-                        value.owners = OwnerMap::default();
+                        value.owners =
+                            OwnerMap::rotated((bytes / 8 % u32::from(config.tile_count)) as u16);
                         (
                             MidOperationKind::FillZero {
                                 offset: 0,
@@ -188,6 +198,12 @@ fn enumerate(
             let mut bound = bindings.clone();
             let mut ids = BTreeMap::new();
             for input in &candidate.graph.inputs {
+                let value = &candidate.graph.values[input.value.index() as usize];
+                if input.kind == GraphInputKind::Parameter {
+                    let original = &mut next.values[bindings[&value.origin].index() as usize];
+                    original.tensor_type = value.tensor_type.clone();
+                    original.owners = value.owners.clone();
+                }
                 ids.insert(
                     input.value,
                     bindings[&candidate.graph.values[input.value.index() as usize].origin],
@@ -313,6 +329,14 @@ fn check_frontier(complete: &[MidGraph], search: &Search<'_>, seed: u64) {
                     .inputs
                     .iter()
                     .filter(|i| i.kind == GraphInputKind::Parameter)
+                    .filter(|i| {
+                        !search.high.operations().iter().any(|op| {
+                            search
+                                .high
+                                .operation_inputs(op)
+                                .any(|id| id == graph.values[i.value.index() as usize].origin)
+                        })
+                    })
                     .map(|i| i.value),
             )
             .map(|id| {
@@ -340,7 +364,7 @@ fn check_frontier(complete: &[MidGraph], search: &Search<'_>, seed: u64) {
                 .any(|b| a != b && b.iter().zip(a).all(|(b, a)| b <= a))
         });
     }
-    let actual = search
+    let mut actual = search
         .states
         .last()
         .unwrap()
@@ -353,6 +377,15 @@ fn check_frontier(complete: &[MidGraph], search: &Search<'_>, seed: u64) {
             )
         })
         .collect::<Frontiers>();
+    // Search retains tile-specific tradeoffs needed by later resident choices.
+    // Projecting those labels to global maxima can introduce dominance.
+    for labels in actual.values_mut() {
+        let all = labels.clone();
+        labels.retain(|a| {
+            !all.iter()
+                .any(|b| a != b && b.iter().zip(a).all(|(b, a)| b <= a))
+        });
+    }
     assert_eq!(
         actual, expected,
         "frontier mismatch: seed={seed}, budget={}",
@@ -484,6 +517,10 @@ fn random_fixture(rng: &mut fastrand::Rng) -> (HighGraph, PipelineConfig, Bounda
         );
     }
     let mut choices = boundary_layouts(&high, &config);
+    if rng.bool() && !high.outputs().contains(&weight) {
+        config.inputs.remove(&weight);
+        choices.insert(weight, None);
+    }
     for op in high.operations() {
         if rng.usize(0..4) == 0 {
             choices.insert(op.results[0], Some(config.inputs[&x].layout.clone()));
@@ -663,5 +700,67 @@ fn interleaved_capacity_is_enforced_even_when_total_storage_fits() {
         let selected = search.finish().unwrap();
         assert_eq!(Some(selected.estimated_cycles), optimum(&complete, &config));
         assert!(selected.estimated_cycles > fastest.estimated_cycles);
+    }
+}
+
+#[test]
+fn late_resident_choices_match_whole_program_memory_under_tight_budgets() {
+    for seed in 0..32 {
+        let mut rng = fastrand::Rng::with_seed(0x1a7e_0000 + seed);
+        let mut high = HighGraph::new();
+        let rows = 4 * rng.u32(1..=4);
+        let x = high.host_input("x", [rows, 16]).unwrap();
+        let a = high.parameter("a", [rows, 16]).unwrap();
+        let b = high.parameter("b", [rows, 16]).unwrap();
+        let first = high.gelu(x).unwrap();
+        let second = high.add(first, a).unwrap();
+        let third = high.add(second, b).unwrap();
+        let last = high.add(third, a).unwrap();
+        high.set_outputs([last]).unwrap();
+        let mut config = PipelineConfig::new(Target::Ipu21, 4).with_input(
+            x,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded(4),
+            },
+        );
+        config.standard_memory_reservation_bytes = 0;
+        let mut choices = boundary_layouts(&high, &config);
+        for op in high.operations() {
+            choices.insert(op.results[0], Some(Layout::row_sharded(4)));
+        }
+        let scratch = [
+            (rng.u32(32..=128) * 8, 0, MemoryClass::Ipu21Standard),
+            (64, 1, MemoryClass::Ipu21Interleaved),
+        ];
+        let complete = enumerate(&high, &choices, &config, &scratch);
+        let minimum = complete.iter().map(|g| g.peak_memory.total).min().unwrap();
+        let maximum = complete.iter().map(|g| g.peak_memory.total).max().unwrap();
+        for budget in [minimum - 1, minimum, maximum] {
+            config.tile_memory_budget_bytes = budget;
+            let complete = enumerate(&high, &choices, &config, &scratch);
+            let expected = optimum(&complete, &config);
+            let search = explore(&high, &choices, &config, &scratch, EXACT, rng.bool()).unwrap();
+            let selected = search.finish();
+            assert_eq!(
+                result_cycles(&selected),
+                expected,
+                "seed={seed}, budget={budget}"
+            );
+            if let Ok(graph) = selected {
+                check_semantics(&high, &graph, &mut rng);
+                // Both parameters are initial, permanent inputs, including a
+                // shared parameter whose consumers are separated by b's use.
+                assert_eq!(
+                    graph
+                        .inputs
+                        .iter()
+                        .filter(|i| i.kind == GraphInputKind::Parameter)
+                        .count(),
+                    2
+                );
+                graph.validate().unwrap();
+            }
+        }
     }
 }

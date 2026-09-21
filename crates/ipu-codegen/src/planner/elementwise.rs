@@ -4,7 +4,7 @@
 use super::candidates::{Candidate, LiveValues};
 use super::{BoundaryLayouts, PlanningError, PlanningResult};
 use crate::config::PipelineConfig;
-use crate::graph::{HighGraph, OperationKind};
+use crate::graph::{GraphInputKind, HighGraph, OperationKind};
 use crate::mid::{
     CoordinateMapping, MidOperation, MidOperationKind, OperandIndexing, PackingPolicy,
     default_copy_policy,
@@ -71,60 +71,83 @@ pub(super) fn generate(
             {
                 continue;
             }
-            let mut candidate = Candidate::inputs(high, live, settings.tile_count, end);
-            let tensor = TensorType {
-                shape: shape.clone(),
-                format: crate::TensorFormat {
-                    precision: Precision::F16,
-                    layout,
-                },
-            };
-            let owners = OwnerMap::default();
-            let mut inputs = Vec::new();
-            let mut prepared = BTreeMap::new();
-            for &input in &op.inputs {
-                if let Some(&value) = prepared.get(&input) {
-                    inputs.push(value);
-                    continue;
+            let mut homes = vec![live.clone()];
+            for input in high.inputs().iter().filter(|input| {
+                input.kind == GraphInputKind::Parameter
+                    && op.inputs.contains(&input.value)
+                    && choices.get(&input.value).and_then(Option::as_ref).is_none()
+                    && !high.operations()[..position]
+                        .iter()
+                        .any(|op| high.operation_inputs(op).any(|id| id == input.value))
+            }) {
+                let mut alternatives = Vec::new();
+                for home in &homes {
+                    if home[&input.value].tensor.format.layout != layout {
+                        let mut home = home.clone();
+                        home.get_mut(&input.value).unwrap().tensor.format.layout = layout.clone();
+                        alternatives.push(home);
+                    }
                 }
-                let original = candidate.bindings[&input];
-                let from = &candidate.graph.values[original.index() as usize];
-                let value = if from.tensor_type == tensor && from.owners == owners {
-                    original
-                } else {
-                    let policy =
-                        default_copy_policy(&from.tensor_type.format.layout, &tensor.format.layout);
-                    let copied = candidate.value(input, tensor.clone(), owners.clone());
-                    candidate.graph.operations.push(MidOperation {
-                        source: Some(op.id),
-                        inputs: vec![original],
-                        results: vec![copied],
-                        kind: MidOperationKind::Copy {
-                            mapping: CoordinateMapping::default(),
-                            policy,
-                            packing: PackingPolicy::Staged,
-                        },
-                        operands: Vec::new(),
-                        output_aliases: Vec::new(),
-                        output_windows: Vec::new(),
-                    });
-                    copied
-                };
-                inputs.push(value);
-                prepared.insert(input, value);
+                homes.extend(alternatives);
             }
-            let value = candidate.value(output, tensor, owners);
-            candidate.graph.operations.push(MidOperation {
-                source: Some(high.operations()[end - 1].id),
-                operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
-                inputs,
-                results: vec![value],
-                kind: kind.clone(),
-                output_aliases: Vec::new(),
-                output_windows: Vec::new(),
-            });
-            candidate.bindings.insert(output, value);
-            candidates.push(candidate);
+            for home in homes {
+                let mut candidate = Candidate::inputs(high, &home, settings.tile_count, end);
+                let tensor = TensorType {
+                    shape: shape.clone(),
+                    format: crate::TensorFormat {
+                        precision: Precision::F16,
+                        layout: layout.clone(),
+                    },
+                };
+                let owners = OwnerMap::default();
+                let mut inputs = Vec::new();
+                let mut prepared = BTreeMap::new();
+                for &input in &op.inputs {
+                    if let Some(&value) = prepared.get(&input) {
+                        inputs.push(value);
+                        continue;
+                    }
+                    let original = candidate.bindings[&input];
+                    let from = &candidate.graph.values[original.index() as usize];
+                    let value = if from.tensor_type == tensor && from.owners == owners {
+                        original
+                    } else {
+                        let policy = default_copy_policy(
+                            &from.tensor_type.format.layout,
+                            &tensor.format.layout,
+                        );
+                        let copied = candidate.value(input, tensor.clone(), owners.clone());
+                        candidate.graph.operations.push(MidOperation {
+                            source: Some(op.id),
+                            inputs: vec![original],
+                            results: vec![copied],
+                            kind: MidOperationKind::Copy {
+                                mapping: CoordinateMapping::default(),
+                                policy,
+                                packing: PackingPolicy::Staged,
+                            },
+                            operands: Vec::new(),
+                            output_aliases: Vec::new(),
+                            output_windows: Vec::new(),
+                        });
+                        copied
+                    };
+                    inputs.push(value);
+                    prepared.insert(input, value);
+                }
+                let value = candidate.value(output, tensor, owners);
+                candidate.graph.operations.push(MidOperation {
+                    source: Some(high.operations()[end - 1].id),
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
+                    inputs,
+                    results: vec![value],
+                    kind: kind.clone(),
+                    output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
+                });
+                candidate.bindings.insert(output, value);
+                candidates.push(candidate);
+            }
         }
     }
     Ok(candidates)
