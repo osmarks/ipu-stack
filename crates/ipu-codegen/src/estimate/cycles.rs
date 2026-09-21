@@ -1,29 +1,6 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
-use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic};
-use crate::graph::TensorShape;
-use crate::{CopyPolicy, ElementOrder, Layout, Precision, TensorFormat, TensorType};
-use foldhash::fast::FixedState;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-
-pub trait CostModel: Sync {
-    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64;
-    fn rearrangement_cost(
-        &self,
-        shape: &TensorShape,
-        precision: Precision,
-        strategy: CopyPolicy,
-        from: &Layout,
-        to: &Layout,
-    ) -> RearrangementCost;
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RearrangementCost {
-    pub cycles: u64,
-    pub exchange_cycles: u64,
-}
+use crate::estimate::ExchangeEndpointTraffic;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExchangeFootprint {
@@ -49,54 +26,6 @@ impl ExchangeFootprint {
             .saturating_mul(4)
     }
 }
-
-pub(crate) struct MemoizedCostModel<'a, C> {
-    inner: &'a C,
-    rearrangements: Mutex<RearrangementCache>,
-}
-
-type RearrangementKey = (TensorShape, Precision, CopyPolicy, Layout, Layout);
-type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
-
-impl<'a, C> MemoizedCostModel<'a, C> {
-    pub(crate) fn new(inner: &'a C) -> Self {
-        Self {
-            inner,
-            rearrangements: Mutex::new(HashMap::default()),
-        }
-    }
-}
-
-impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
-        self.inner.cast_format_cycles(input, output)
-    }
-
-    fn rearrangement_cost(
-        &self,
-        shape: &TensorShape,
-        precision: Precision,
-        strategy: CopyPolicy,
-        from: &Layout,
-        to: &Layout,
-    ) -> RearrangementCost {
-        let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
-        let cached = self
-            .rearrangements
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .clone();
-        *cached.get_or_init(|| {
-            self.inner
-                .rearrangement_cost(shape, precision, strategy, from, to)
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Ipu21CostModel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipu21TargetCosts {
@@ -158,180 +87,13 @@ pub(super) fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -
     (cycles, rows)
 }
 
-impl CostModel for Ipu21CostModel {
-    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
-        let destination = TensorType {
-            shape: input.shape.clone(),
-            format: output.clone(),
-        };
-        let (Some(source), Some(destination)) = (
-            crate::OperandWindow::default().local_extents(input, false),
-            crate::OperandWindow::default().local_extents(&destination, false),
-        ) else {
-            return u64::MAX;
-        };
-        crate::kernel::KernelCall::select(
-            &crate::mid::MidOperationKind::Cast {
-                from: input.format.precision,
-                to: output.precision,
-            },
-            &[crate::storage::TensorStorage {
-                format: &input.format,
-                extents: &source,
-            }],
-            &[crate::storage::TensorStorage {
-                format: output,
-                extents: &destination,
-            }],
-            None,
-        )
-        .map_or(u64::MAX, |call| call.cycles)
-    }
-
-    fn rearrangement_cost(
-        &self,
-        shape: &TensorShape,
-        precision: Precision,
-        strategy: CopyPolicy,
-        from: &Layout,
-        to: &Layout,
-    ) -> RearrangementCost {
-        if strategy == CopyPolicy::GatherThenMulticast {
-            return RearrangementCost {
-                cycles: u64::MAX / 8,
-                exchange_cycles: u64::MAX / 8,
-            };
-        }
-        let strategy = if strategy == CopyPolicy::Automatic {
-            crate::default_copy_policy(from, to)
-        } else {
-            strategy
-        };
-        if strategy == CopyPolicy::StageLogicalThenTransform
-            && from.order != ElementOrder::RowMajor
-            && to.order != ElementOrder::RowMajor
-        {
-            // This strategy receives into row-major destination staging. It
-            // does not yet pack a permuted source locally, so a non-row-major
-            // source can expose sub-word logical spans which the exchange
-            // hardware cannot send. Do not price an unmaterializable plan.
-            return RearrangementCost {
-                cycles: u64::MAX / 8,
-                exchange_cycles: u64::MAX / 8,
-            };
-        }
-        let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
-            return RearrangementCost {
-                cycles: u64::MAX / 8,
-                exchange_cycles: u64::MAX / 8,
-            };
-        };
-        let direct_retile = strategy == CopyPolicy::DirectRetile;
-        let endpoint_traffic = &traffic.exchange;
-        let mut exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
-        if direct_retile && !endpoint_traffic.is_empty() {
-            let input = TensorType::new(shape.0.clone(), precision, from.clone());
-            let output = TensorType::new(shape.0.clone(), precision, to.clone());
-            if let Some(fragments) = super::movement::grid_fragments(&input, &output) {
-                exchange_cycles =
-                    exchange_fragment_price(endpoint_traffic.maximum_payload_bytes(), 1, fragments)
-                        .0;
-            }
-        }
-        let (local_bytes, local_calls) = if direct_retile {
-            (
-                traffic.maximum_local_bytes,
-                traffic.maximum_local_intersections,
-            )
-        } else {
-            (
-                traffic.maximum_destination_bytes.saturating_mul(2),
-                traffic.maximum_intersections,
-            )
-        };
-        let local_cycles = local_bytes
-            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        RearrangementCost {
-            cycles: exchange_cycles.saturating_add(local_cycles),
-            exchange_cycles,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::estimate::ExchangeEndpointLoad;
+    use crate::{Layout, Precision, TensorType};
 
     const CASES: usize = 32;
-
-    #[test]
-    fn memoized_rearrangements_preserve_critical_path_costs() {
-        let costs = MemoizedCostModel::new(&Ipu21CostModel);
-        // The underlying model already charges the longest local copy, so
-        // fewer owners increase latency without a second occupancy multiplier.
-        for (shape, owners, cycles) in [
-            ([64, 128], 1, 2336),
-            ([64, 128], 8, 544),
-            ([64, 128], 64, 320),
-            ([729, 1152], 96, 2592),
-            ([729, 1152], 729, 576),
-            ([729, 1152], 1472, 576),
-        ] {
-            let source = Layout::row_sharded(owners);
-            let mut target = source.clone();
-            target.memory_class = crate::MemoryClass::Ipu21Interleaved;
-            assert_eq!(
-                costs.rearrangement_cost(
-                    &TensorShape::new(shape),
-                    Precision::F16,
-                    CopyPolicy::DirectRetile,
-                    &source,
-                    &target,
-                ),
-                RearrangementCost {
-                    cycles,
-                    exchange_cycles: 0
-                },
-            );
-        }
-        let shape = TensorShape::new([64, 128]);
-        for source_tiles in [1, 2, 8, 64] {
-            for target_tiles in [1, 4, 32, 64] {
-                let source = Layout::row_sharded(source_tiles);
-                let target = Layout::row_major(crate::TensorTiling::sharded(
-                    crate::TensorAxis::FromEnd(1),
-                    target_tiles,
-                ));
-                for strategy in [
-                    CopyPolicy::DirectRetile,
-                    CopyPolicy::StageLogicalThenTransform,
-                ] {
-                    let expected = Ipu21CostModel.rearrangement_cost(
-                        &shape,
-                        Precision::F16,
-                        strategy,
-                        &source,
-                        &target,
-                    );
-                    assert!(expected.cycles > 0);
-                    for _ in 0..2 {
-                        assert_eq!(
-                            costs.rearrangement_cost(
-                                &shape,
-                                Precision::F16,
-                                strategy,
-                                &source,
-                                &target,
-                            ),
-                            expected
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     #[test]
     fn randomized_exchange_endpoint_costs_overlap_opposite_directions() {

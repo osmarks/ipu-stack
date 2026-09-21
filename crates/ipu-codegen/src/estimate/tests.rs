@@ -3,6 +3,207 @@ use crate::TensorAxis;
 use crate::mid::MidOperationKind;
 use std::collections::BTreeSet;
 
+pub(super) fn copy_graph(input: TensorType, output: TensorType, tiles: u16) -> crate::MidGraph {
+    let id = MidValueId::from_index;
+    crate::MidGraph {
+        tile_count: tiles,
+        values: [input, output]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tensor_type)| crate::MidValue {
+                id: id(i as u32),
+                storage_group: id(i as u32),
+                origin: crate::ValueId::from_index(i as u32),
+                owners: Default::default(),
+                tensor_type,
+            })
+            .collect(),
+        operations: vec![MidOperation {
+            source: None,
+            inputs: vec![id(0)],
+            results: vec![id(1)],
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::DirectRetile,
+                packing: crate::PackingPolicy::Staged,
+                mapping: Default::default(),
+            },
+            operands: vec![],
+            output_aliases: vec![],
+            output_windows: vec![],
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
+    use crate::{CoordinateMapping, TensorTiling};
+    let mut rng = fastrand::Rng::with_seed(0xc09f_ee21);
+    for case in 0..128 {
+        let rows = rng.u32(4..=16);
+        let columns = rng.u32(4..=16) * 4;
+        let offsets = vec![rng.u32(0..rows), rng.u32(0..columns / 4) * 4];
+        let shape = [rows - offsets[0], columns - offsets[1]];
+        let mut layout = || {
+            let mut tiling =
+                TensorTiling::sharded(TensorAxis::FromStart(rng.u16(0..2)), rng.u16(1..=4));
+            tiling.replicas = rng.u16(1..=2);
+            tiling.tile_count *= tiling.replicas;
+            Layout::row_major(tiling)
+        };
+        let mut graph = copy_graph(
+            TensorType::new([rows, columns], Precision::F16, layout()),
+            TensorType::new(shape, Precision::F16, layout()),
+            16,
+        );
+        for value in &mut graph.values {
+            let mut owners = (0..16).collect::<Vec<u16>>();
+            rng.shuffle(&mut owners);
+            value.owners = crate::tensor::OwnerMap::embedded(owners).with_rotation(rng.u16(0..16));
+        }
+        let mapping = CoordinateMapping {
+            offsets: offsets.clone(),
+            view: None,
+        };
+        let traffic = conversion_traffic(&graph.values[0], &graph.values[1], &mapping, 16).unwrap();
+        let mut sources = vec![BTreeSet::new(); (rows * columns) as usize];
+        for (tile, extents) in layout_extents(
+            &graph.values[0].tensor_type.shape,
+            &graph.values[0].tensor_type.format.layout,
+        )
+        .unwrap()
+        {
+            let tile = graph.values[0].owners.tile(tile, 16).unwrap();
+            for r in extents[0].0..extents[0].1 {
+                for c in extents[1].0..extents[1].1 {
+                    sources[(r * columns + c) as usize].insert(tile);
+                }
+            }
+        }
+        let mut local = [0u64; 16];
+        let mut incoming = [0u64; 16];
+        let mut outgoing = [0u64; 16];
+        let mut multicast = BTreeSet::new();
+        for (tile, extents) in layout_extents(
+            &graph.values[1].tensor_type.shape,
+            &graph.values[1].tensor_type.format.layout,
+        )
+        .unwrap()
+        {
+            let tile = graph.values[1].owners.tile(tile, 16).unwrap();
+            for r in extents[0].0..extents[0].1 {
+                for c in extents[1].0..extents[1].1 {
+                    let index = ((r + offsets[0]) * columns + c + offsets[1]) as usize;
+                    if sources[index].contains(&tile) {
+                        local[tile as usize] += 2;
+                    } else {
+                        incoming[tile as usize] += 2;
+                        multicast.insert((*sources[index].first().unwrap(), index));
+                    }
+                }
+            }
+        }
+        for (tile, _) in multicast {
+            outgoing[tile as usize] += 2;
+        }
+        assert_eq!(
+            traffic.maximum_local_bytes,
+            *local.iter().max().unwrap(),
+            "case {case}"
+        );
+        for tile in 0..16 {
+            assert_eq!(
+                traffic
+                    .exchange
+                    .incoming_tiles
+                    .get(tile)
+                    .map_or(0, |l| l.bytes),
+                incoming[tile],
+                "case {case}, tile {tile}"
+            );
+            assert_eq!(
+                traffic
+                    .exchange
+                    .outgoing_lanes
+                    .get(tile)
+                    .map_or(0, |l| l.bytes),
+                outgoing[tile],
+                "case {case}, tile {tile}"
+            );
+        }
+        if let MidOperationKind::Copy {
+            mapping: selected, ..
+        } = &mut graph.operations[0].kind
+        {
+            *selected = mapping;
+        }
+        let cost = operation_cost(&graph.operations[0], &graph.values, 16).unwrap();
+        assert_eq!(cost.0.exchange == 0, incoming.iter().all(|&n| n == 0));
+    }
+}
+
+#[test]
+fn local_copy_cost_accumulates_all_shards_on_each_tile() {
+    let mut rng = fastrand::Rng::with_seed(0x10ca_1c09);
+    for _ in 0..64 {
+        let rows = rng.u32(2..=32);
+        let columns = rng.u32(1..=16) * 4;
+        let input = TensorType::new(
+            [rows, columns],
+            Precision::F16,
+            Layout::logical_linear(1, 4),
+        );
+        let mut output = input.clone();
+        output.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+        let graph = copy_graph(input, output, 1);
+        let traffic =
+            conversion_traffic(&graph.values[0], &graph.values[1], &Default::default(), 1).unwrap();
+        assert_eq!(traffic.maximum_local_bytes, u64::from(rows * columns * 2));
+        assert!(traffic.maximum_local_intersections >= u64::from(rows));
+        let (cost, _, rows) = operation_cost(&graph.operations[0], &graph.values, 1).unwrap();
+        assert_eq!((cost.exchange, rows), (0, 0));
+        assert_eq!(
+            cost.total,
+            traffic
+                .maximum_local_bytes
+                .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+                + traffic.maximum_local_intersections * IPU21_TARGET_COSTS.local_copy_call_cycles
+        );
+    }
+}
+
+#[test]
+fn remote_copy_charges_local_zero_extension_and_staging() {
+    let mut rng = fastrand::Rng::with_seed(0x2e20_c09);
+    for _ in 0..32 {
+        let width = rng.u32(1..=32) * 4;
+        let padding = rng.u32(1..=16) * 4;
+        let input = TensorType::new([1, width], Precision::F16, Layout::row_sharded(1));
+        let output = TensorType::new([1, width + padding], Precision::F16, Layout::row_sharded(1));
+        let mut graph = copy_graph(input, output, 2);
+        graph.values[1].owners = crate::tensor::OwnerMap::rotated(1);
+        let traffic =
+            conversion_traffic(&graph.values[0], &graph.values[1], &Default::default(), 2).unwrap();
+        assert_eq!(traffic.maximum_local_bytes, u64::from(padding * 2));
+        assert_eq!(
+            traffic.exchange.maximum_payload_bytes(),
+            u64::from(width * 2)
+        );
+        let direct = operation_cost(&graph.operations[0], &graph.values, 2)
+            .unwrap()
+            .0;
+        assert!(direct.total > direct.exchange);
+        if let MidOperationKind::Copy { policy, .. } = &mut graph.operations[0].kind {
+            *policy = crate::CopyPolicy::StageLogicalThenTransform;
+        }
+        let staged = operation_cost(&graph.operations[0], &graph.values, 2)
+            .unwrap()
+            .0;
+        assert_eq!(staged.exchange, direct.exchange);
+        assert!(staged.total > direct.total);
+    }
+}
+
 #[test]
 fn randomized_average_shard_storage_covers_spatial_work() {
     let mut random = fastrand::Rng::with_seed(0x7370_6174_6961_6c77);
@@ -118,10 +319,22 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
         );
         let destination =
             Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
-        let fragmented =
-            conversion_traffic(&shape, Precision::F16, &fragmented_source, &destination).unwrap();
-        let aligned =
-            conversion_traffic(&shape, Precision::F16, &aligned_source, &destination).unwrap();
+        let traffic = |layout: &Layout| {
+            let graph = copy_graph(
+                TensorType::new(shape.0.clone(), Precision::F16, layout.clone()),
+                TensorType::new(shape.0.clone(), Precision::F16, destination.clone()),
+                tiles,
+            );
+            conversion_traffic(
+                &graph.values[0],
+                &graph.values[1],
+                &Default::default(),
+                tiles,
+            )
+            .unwrap()
+        };
+        let fragmented = traffic(&fragmented_source);
+        let aligned = traffic(&aligned_source);
 
         assert_eq!(
             fragmented,
@@ -421,7 +634,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         };
-        let (cost, _, rows) = operation_cost(&op, &values).unwrap();
+        let (cost, _, rows) = operation_cost(&op, &values, 4).unwrap();
         (cost.total, cost.exchange, rows)
     };
     assert_eq!(cost(vec![]), cost(vec![0, 0]));

@@ -1,7 +1,7 @@
 //! Coordinate-copy semantics and composition before tile expansion.
 
 use crate::mid::MidOperationKind;
-use crate::mid::{MidOperation, MidGraph, MidValue, MidValueId};
+use crate::mid::{MidGraph, MidOperation, MidValue, MidValueId};
 use crate::tensor::{AxisFactorView, TensorShape};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -395,7 +395,7 @@ mod tests {
         for value in &mut values {
             value.tensor_type.format.layout = Layout::logical_linear(3, 4);
         }
-        let (price, _, _) = crate::estimate::operation_cost(&operations[0], &values).unwrap();
+        let (price, _, _) = crate::estimate::operation_cost(&operations[0], &values, 3).unwrap();
         assert_eq!(price.exchange, 0);
         assert!(super::super::rewrite::same_storage(&values[0], &values[1]));
 

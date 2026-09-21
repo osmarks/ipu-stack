@@ -34,8 +34,7 @@ use crate::{
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 
-pub(crate) use cycles::MemoizedCostModel;
-pub use cycles::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel};
+pub use cycles::IPU21_TARGET_COSTS;
 pub(crate) use memory::*;
 pub use memory::{MemoryPeaks, MemoryUsage};
 pub(crate) use tensor::*;

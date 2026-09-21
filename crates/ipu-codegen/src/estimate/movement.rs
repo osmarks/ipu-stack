@@ -277,38 +277,30 @@ mod tests {
         assert_eq!(expanded_maximum(&input, &output), 888);
         // The old payload-only heuristic priced this as 111 fragments.
         assert_eq!(maximum_shard_bytes(&output).div_ceil(256), 111);
-        let cost = Ipu21CostModel.rearrangement_cost(
-            &input.shape,
-            input.format.precision,
-            crate::CopyPolicy::DirectRetile,
-            &input.format.layout,
-            &output.format.layout,
-        );
-        assert_eq!(
-            cost.exchange_cycles,
-            super::exchange_fragment_price(
-                conversion_traffic(
-                    &input.shape,
-                    input.format.precision,
-                    &input.format.layout,
-                    &output.format.layout
+        let graph = crate::estimate::tests::copy_graph(input.clone(), output.clone(), 1458);
+        let (cost, _, _) =
+            operation_cost(&graph.operations[0], &graph.values, graph.tile_count).unwrap();
+        assert!(
+            cost.exchange
+                >= super::exchange_fragment_price(
+                    conversion_traffic(
+                        &graph.values[0],
+                        &graph.values[1],
+                        &Default::default(),
+                        graph.tile_count
+                    )
+                    .unwrap()
+                    .exchange
+                    .maximum_payload_bytes(),
+                    1,
+                    888
                 )
-                .unwrap()
-                .exchange
-                .maximum_payload_bytes(),
-                1,
-                888
-            )
-            .0
+                .0
         );
-        let local = Ipu21CostModel.rearrangement_cost(
-            &input.shape,
-            input.format.precision,
-            crate::CopyPolicy::DirectRetile,
-            &input.format.layout,
-            &input.format.layout,
-        );
-        assert_eq!(local.exchange_cycles, 0);
+        let graph = crate::estimate::tests::copy_graph(input.clone(), input.clone(), 1458);
+        let (local, _, _) =
+            operation_cost(&graph.operations[0], &graph.values, graph.tile_count).unwrap();
+        assert_eq!(local.exchange, 0);
         // Replicating each consumer panel adds multicast recipients, not sends.
         output.format.layout.tiling.tile_count *= 24;
         output.format.layout.tiling.replicas = 24;

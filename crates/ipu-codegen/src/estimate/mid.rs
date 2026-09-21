@@ -10,9 +10,10 @@ use crate::MidGraph;
 pub(crate) fn operation_cycles<'a>(
     operations: impl IntoIterator<Item = &'a MidOperation>,
     values: &[MidValue],
+    tile_count: u16,
 ) -> Option<u64> {
     operations.into_iter().try_fold(0u64, |sum, op| {
-        operation_cost(op, values).map(|(cost, _, _)| sum.saturating_add(cost.total))
+        operation_cost(op, values, tile_count).map(|(cost, _, _)| sum.saturating_add(cost.total))
     })
 }
 
@@ -282,7 +283,8 @@ fn analyze_storage<const PER_TILE: bool>(
         for value in operation.inputs.iter().chain(&operation.results) {
             live[roots[value.index() as usize]] = true;
         }
-        let (price, scratch, row_bytes) = operation_cost(operation, &program.values)?;
+        let (price, scratch, row_bytes) =
+            operation_cost(operation, &program.values, program.tile_count)?;
         tracing::debug!(index, source = ?operation.source, count,
             cycles = price.total, exchange = price.exchange,
             "estimated mid operation");
@@ -370,6 +372,7 @@ fn analyze_storage<const PER_TILE: bool>(
 pub(crate) fn operation_cost(
     operation: &MidOperation,
     values: &[MidValue],
+    tile_count: u16,
 ) -> Option<(ProgramCycles, MemoryUsage, u64)> {
     let tensor = |id: MidValueId| &values[id.index() as usize].tensor_type;
     if matches!(operation.kind, MidOperationKind::Repeat(_)) {
@@ -394,7 +397,9 @@ pub(crate) fn operation_cost(
     let mut price = ProgramCycles::default();
     match &operation.kind {
         MidOperationKind::Copy {
-            policy, packing, ..
+            policy,
+            packing,
+            mapping,
         } => {
             // Relay scratch and its two transfer legs require concrete geometry.
             // Do not rank this explicit strategy with the direct-copy estimate.
@@ -403,20 +408,57 @@ pub(crate) fn operation_cost(
             }
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
-            let local_conversion = *policy == crate::CopyPolicy::LocalKernel;
+            let policy = if *policy == crate::CopyPolicy::Automatic {
+                crate::default_copy_policy(&input.format.layout, &output.format.layout)
+            } else {
+                *policy
+            };
+            let traffic = conversion_traffic(
+                &values[operation.inputs[0].index() as usize],
+                &values[operation.results[0].index() as usize],
+                mapping,
+                tile_count,
+            );
+            let (local_bytes, local_calls) = if let Some(traffic) = &traffic {
+                if !traffic.exchange.is_empty() {
+                    if policy == crate::CopyPolicy::LocalKernel {
+                        return None;
+                    }
+                    price.exchange = super::cycles::exchange_endpoint_cycles(&traffic.exchange, 1);
+                    let fragments = if mapping.is_identity() {
+                        super::movement::grid_fragments(input, output).unwrap_or(0)
+                    } else {
+                        0
+                    }
+                    .max(traffic.exchange.maximum_fragments());
+                    let (fragment_cycles, footprint) = exchange_fragment_price(
+                        traffic.exchange.maximum_payload_bytes(),
+                        1,
+                        fragments,
+                    );
+                    price.exchange = price.exchange.max(fragment_cycles);
+                    rows = footprint;
+                }
+                if policy == crate::CopyPolicy::DirectRetile {
+                    (
+                        traffic.maximum_local_bytes,
+                        traffic.maximum_local_intersections,
+                    )
+                } else {
+                    (
+                        traffic.maximum_destination_bytes.saturating_mul(2),
+                        traffic.maximum_intersections,
+                    )
+                }
+            } else {
+                (bytes, 1)
+            };
+            let local_conversion = policy == crate::CopyPolicy::LocalKernel;
             let same_ownership = local_conversion
                 || (crate::tensor::same_distribution(input, output)
                     && values[operation.inputs[0].index() as usize].owners
                         == values[operation.results[0].index() as usize].owners);
-            if !same_ownership
-                || matches!(
-                    operation.kind,
-                    MidOperationKind::Copy {
-                        mapping: crate::CoordinateMapping { view: Some(_), .. },
-                        ..
-                    }
-                )
-            {
+            if traffic.is_none() && (!same_ownership || mapping.view.is_some()) {
                 let destinations = u64::from(output.format.layout.tiling.tile_count);
                 let sources = u64::from(input.format.layout.tiling.tile_count).max(1);
                 let sends = bytes
@@ -424,10 +466,8 @@ pub(crate) fn operation_cost(
                     .div_ceil(sources)
                     .min(maximum_shard_bytes(input));
                 let payload = bytes.max(sends);
-                let identity = !matches!(&operation.kind,
-                    MidOperationKind::Copy { mapping, .. }
-                    if !mapping.is_identity());
-                let fragments = identity
+                let fragments = mapping
+                    .is_identity()
                     .then(|| super::movement::grid_fragments(input, output))
                     .flatten()
                     .unwrap_or_else(|| {
@@ -439,8 +479,10 @@ pub(crate) fn operation_cost(
             }
             price.total = price
                 .exchange
-                .saturating_add(bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
-                .saturating_add(IPU21_TARGET_COSTS.local_copy_call_cycles);
+                .saturating_add(local_bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
+                .saturating_add(
+                    local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles),
+                );
             if *packing == crate::PackingPolicy::Staged
                 && input.format.precision == output.format.precision
                 && input.format.layout.order != output.format.layout.order

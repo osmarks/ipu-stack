@@ -3,8 +3,8 @@ use crate::estimate::operation_cycles;
 use crate::graph::OperationId;
 use crate::mid::MidOperationKind;
 
-use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
 use crate::CopyPolicy;
+use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::Precision;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -173,9 +173,10 @@ pub(crate) fn fusion_pays<'a>(
     before: impl IntoIterator<Item = &'a MidOperation>,
     after: impl IntoIterator<Item = &'a MidOperation>,
     values: &[MidValue],
+    tile_count: u16,
 ) -> bool {
-    let separate_cycles = operation_cycles(before, values);
-    let fused_cycles = operation_cycles(after, values);
+    let separate_cycles = operation_cycles(before, values, tile_count);
+    let fused_cycles = operation_cycles(after, values, tile_count);
     let keep = separate_cycles
         .zip(fused_cycles)
         .is_some_and(|(a, b)| b < a);
