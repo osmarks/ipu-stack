@@ -74,13 +74,25 @@ pub(super) fn generate(
             }
             let mut homes = vec![Vec::new()];
             for &input in selectable_parameters {
-                if !op.inputs.contains(&input) || live[&input].tensor.format.layout == layout {
+                if !op.inputs.contains(&input) {
                     continue;
                 }
-                for index in 0..homes.len() {
-                    let mut home = homes[index].clone();
-                    home.push((input, layout.clone()));
-                    homes.push(home);
+                let mut alternatives = vec![
+                    layout.clone(),
+                    super::parameters::compact_format(shape, settings).layout,
+                ];
+                alternatives.sort();
+                alternatives.dedup();
+                let count = homes.len();
+                for resident in alternatives {
+                    if resident == live[&input].tensor.format.layout {
+                        continue;
+                    }
+                    for index in 0..count {
+                        let mut home = homes[index].clone();
+                        home.push((input, resident.clone()));
+                        homes.push(home);
+                    }
                 }
             }
             for home in homes {

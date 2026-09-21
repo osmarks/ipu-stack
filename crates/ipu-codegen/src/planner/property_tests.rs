@@ -44,7 +44,7 @@ fn initial(high: &HighGraph, config: &PipelineConfig) -> (MidGraph, BTreeMap<Val
                 shape: input.shape.clone(),
                 format: config.inputs.get(&input.value).cloned().unwrap_or_else(|| {
                     assert_eq!(input.kind, GraphInputKind::Parameter);
-                    super::super::parameters::default_format(&input.shape, config)
+                    super::super::parameters::default_format(high, input.value, config).unwrap()
                 }),
             },
         });

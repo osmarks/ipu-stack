@@ -111,7 +111,7 @@ impl<'a> Search<'a> {
             let mut format = match settings.inputs.get(&input.value) {
                 Some(format) => format.clone(),
                 None if input.kind == GraphInputKind::Parameter => {
-                    super::parameters::default_format(&input.shape, settings)
+                    super::parameters::default_format(high, input.value, settings)?
                 }
                 None => return Err(PlanningError::UnassignedLayout(input.value)),
             };
