@@ -48,26 +48,10 @@ pub(super) fn compact_format(shape: &TensorShape, config: &PipelineConfig) -> Te
         .max(required)
         .max(1)
         .min(u64::from(config.tile_count));
-    // Linear ownership cannot represent a padded logical tail. Vectors can
-    // use ordinary axis partitioning, which can pad the final four-FP16 block.
-    let mut layout = if shape.0.len() == 1 {
-        Layout::row_major(crate::TensorTiling::sharded(
-            crate::TensorAxis::FromEnd(1),
-            owners as u16,
-        ))
-    } else {
-        let grain = if shape.elements().is_multiple_of(4) {
-            4
-        } else {
-            1
-        };
-        Layout::logical_linear(owners as u16, grain)
-    };
-    if shape.0.len() == 1 {
-        layout.tiling.axes[0].block_size = 4;
-        layout.tiling.axes[0].padding_multiple = 4;
-        layout.tiling.axes[0].padding = crate::Padding::Zero;
-    }
+    // Four FP16 elements permit dense 64-bit local copies. Only the final
+    // allocation receives tail padding, even for a multidimensional tensor.
+    let mut layout = Layout::logical_linear(owners as u16, 4);
+    layout.tiling.axes[0].padding = crate::Padding::Zero;
     TensorFormat { precision, layout }
 }
 

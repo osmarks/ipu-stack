@@ -136,8 +136,8 @@ impl ResolvedLayout {
 
     #[cfg(test)]
     pub(crate) fn physical_elements(&self) -> u64 {
-        if self.linear_grain.is_some() {
-            return self.shape.elements();
+        if let Some(grain) = self.linear_grain {
+            return self.shape.elements().div_ceil(u64::from(grain)) * u64::from(grain);
         }
         self.axes
             .iter()
@@ -147,7 +147,10 @@ impl ResolvedLayout {
 
     pub(crate) fn maximum_tile_elements(&self) -> u64 {
         if let Some(grain) = self.linear_grain {
-            return (self.shape.elements() / u64::from(grain))
+            return self
+                .shape
+                .elements()
+                .div_ceil(u64::from(grain))
                 .div_ceil(u64::from(self.tile_count))
                 .saturating_mul(u64::from(grain));
         }
@@ -163,7 +166,7 @@ impl ResolvedLayout {
             return 0;
         }
         if let Some(grain) = self.linear_grain {
-            let grains = self.shape.elements() / u64::from(grain);
+            let grains = self.shape.elements().div_ceil(u64::from(grain));
             let tiles = u64::from(self.tile_count);
             return (grains / tiles + u64::from(u64::from(tile) < grains % tiles))
                 * u64::from(grain);
@@ -186,8 +189,9 @@ impl ResolvedLayout {
             let mut cursor = 0;
             for tile in 0..self.tile_count {
                 let start = cursor;
-                let end = start + self.tile_elements(tile);
-                cursor = end;
+                let physical_end = start + self.tile_elements(tile);
+                let end = physical_end.min(shape.elements());
+                cursor = physical_end;
                 let first_row = start / width;
                 let last_row = end.div_ceil(width);
                 for row in first_row..last_row {
@@ -220,8 +224,17 @@ impl ResolvedLayout {
                             .map_err(|_| LayoutError::ExtentOverflow(rank))?,
                         logical_end: u32::try_from(column_end)
                             .map_err(|_| LayoutError::ExtentOverflow(rank))?,
-                        physical_end: u32::try_from(column_end)
-                            .map_err(|_| LayoutError::ExtentOverflow(rank))?,
+                        // Flat padding belongs only to the final local row;
+                        // it must not become another logical row or wrap axes.
+                        physical_end: u32::try_from(
+                            column_end
+                                + if row + 1 == last_row {
+                                    physical_end - end
+                                } else {
+                                    0
+                                },
+                        )
+                        .map_err(|_| LayoutError::ExtentOverflow(rank))?,
                     });
                     all.push((tile, region));
                 }
@@ -335,7 +348,9 @@ impl TensorTiling {
 }
 
 impl Layout {
-    /// Returns the physical extents after applying declared zero padding.
+    /// Returns axis-wise padded extents. Flat ownership padding is allocation
+    /// tail space, not a rectangular extension of the logical tensor; its size
+    /// is described by resolved tile sizes and shard physical bounds instead.
     pub fn padded_shape(&self, shape: &TensorShape) -> Result<TensorShape, LayoutError> {
         if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
             return Err(LayoutError::EmptyTileGroup);
@@ -344,8 +359,9 @@ impl Layout {
             let elements = shape.elements();
             if shape.0.is_empty()
                 || grain == 0
-                || elements / u64::from(grain) < u64::from(self.tiling.tile_count)
-                || !elements.is_multiple_of(u64::from(grain))
+                || elements.div_ceil(u64::from(grain)) < u64::from(self.tiling.tile_count)
+                || (self.tiling.axes[0].padding == Padding::Reject
+                    && !elements.is_multiple_of(u64::from(grain)))
             {
                 return Err(LayoutError::EmptyAxisTiling);
             }
@@ -546,4 +562,74 @@ pub(crate) fn same_distribution(a: &TensorType, b: &TensorType) -> bool {
                                 && a.iter().zip(b).all(|(a, b)| a.same_partitioning(b))
                         }))
             })
+}
+
+#[cfg(test)]
+mod linear_padding_tests {
+    use super::*;
+
+    #[test]
+    fn padded_linear_shards_cover_the_tensor_once_and_account_for_only_one_tail() {
+        let mut rng = fastrand::Rng::with_seed(0xf1a7_7a11);
+        for _ in 0..256 {
+            let shape = TensorShape((0..rng.usize(1..=4)).map(|_| rng.u32(1..=13)).collect());
+            let grain = rng.u32(1..=32);
+            let elements = shape.elements();
+            let tiles = rng.u16(1..=elements.div_ceil(u64::from(grain)).min(32) as u16);
+            let mut layout = Layout::logical_linear(tiles, grain);
+            assert_eq!(
+                layout.resolve(&shape).is_ok(),
+                elements.is_multiple_of(u64::from(grain))
+            );
+            layout.tiling.axes[0].padding = Padding::Zero;
+            let resolved = layout.resolve(&shape).unwrap();
+            let mut cursor = 0;
+            let mut allocated = vec![0; usize::from(tiles)];
+            let format = crate::TensorFormat {
+                precision: crate::Precision::F16,
+                layout: layout.clone(),
+            };
+            for (tile, extents) in resolved.shard_extents().unwrap() {
+                let start = extents
+                    .iter()
+                    .zip(&shape.0)
+                    .fold(0u64, |offset, (extent, &width)| {
+                        offset * u64::from(width) + u64::from(extent.start)
+                    });
+                assert_eq!(start, cursor);
+                let last = extents.last().unwrap();
+                cursor += u64::from(last.logical_end - last.start);
+                let bytes = crate::storage::storage_bytes(crate::storage::TensorStorage {
+                    format: &format,
+                    extents: &extents,
+                })
+                .unwrap();
+                allocated[usize::from(tile)] += u64::from(bytes) / 2;
+                if cursor != elements {
+                    assert_eq!(last.logical_end, last.physical_end);
+                }
+            }
+            assert_eq!(cursor, elements);
+            assert_eq!(
+                allocated.iter().sum::<u64>(),
+                elements.div_ceil(u64::from(grain)) * u64::from(grain)
+            );
+            assert_eq!(
+                allocated.iter().copied().max().unwrap(),
+                resolved.maximum_tile_elements()
+            );
+            assert_eq!(allocated.iter().sum::<u64>(), resolved.physical_elements());
+            for (tile, &size) in allocated.iter().enumerate() {
+                assert_eq!(size, resolved.tile_elements(tile as u16));
+            }
+            if shape.0.len() == 1 {
+                let mut axis = layout.clone();
+                axis.tiling.axes[0].axis = TensorAxis::FromEnd(1);
+                assert_eq!(
+                    resolved.shard_extents().unwrap(),
+                    axis.resolve(&shape).unwrap().shard_extents().unwrap()
+                );
+            }
+        }
+    }
 }

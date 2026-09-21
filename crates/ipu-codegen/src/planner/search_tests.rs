@@ -245,3 +245,26 @@ fn native_resident_layout_avoids_compact_preparation() {
     assert_eq!(execute(&selected), execute(&fixed));
     crate::low::expand::expand_tiles(Target::Ipu21, &selected, false).unwrap();
 }
+
+#[test]
+fn copies_into_padded_linear_layouts_lower_for_vectors_and_matrices() {
+    for shape in [vec![30], vec![3, 10]] {
+        let mut high = HighGraph::new();
+        let input = high.host_input("input", shape).unwrap();
+        let output = high.gelu(input).unwrap();
+        high.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(Target::Ipu21, 2).with_input(
+            input,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::logical_linear(1, 1),
+            },
+        );
+        let mut layout = Layout::logical_linear(2, 4);
+        layout.tiling.axes[0].padding = crate::Padding::Zero;
+        let mut choices = boundary_layouts(&high, &config);
+        choices.insert(output, Some(layout));
+        let mid = plan(&high, &choices, &config, EXACT).unwrap();
+        crate::low::expand::expand_tiles(Target::Ipu21, &mid, false).unwrap();
+    }
+}
