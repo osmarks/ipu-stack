@@ -1,13 +1,12 @@
 //! Compiler/planner configuration and explicit user overrides.
 use crate::graph::ValueId;
 use crate::tensor::TensorFormat;
-use ipu_target::ipu21::memory::{
-    IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES, IPU21_PLANNED_DATA_BYTES,
-};
+use ipu_target::Target;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
+    pub target: Target,
     pub tile_count: u16,
     /// Bijection from planned tile indices to execution tile indices.
     pub tile_mapping: Option<Vec<u16>>,
@@ -41,6 +40,7 @@ pub struct PipelineConfig {
 impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
+            target: Target::Ipu21,
             tile_count,
             tile_mapping: None,
             memory_profile_directory: None,
@@ -49,8 +49,8 @@ impl PipelineConfig {
             exchange_stream_words: None,
             exchange_table_budget_bytes: 80 * 1024,
             exchange_transfer_limit_per_tile: 16_384,
-            standard_memory_reservation_bytes: u64::from(IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-            tile_memory_budget_bytes: u64::from(IPU21_PLANNED_DATA_BYTES),
+            standard_memory_reservation_bytes: Target::Ipu21.support_reservation_bytes(),
+            tile_memory_budget_bytes: Target::Ipu21.planned_data_bytes(),
             profiling: false,
             diagnostic_checkpoints: false,
         }

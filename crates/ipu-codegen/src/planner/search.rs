@@ -244,7 +244,8 @@ impl<'a> Search<'a> {
                 // They are not treated as a local, composable memory resource.
                 exchange_rows: 0,
             };
-            if !peak.fits_ipu21_with_budget(
+            if !peak.fits_with_budget(
+                self.settings.target,
                 self.settings.standard_memory_reservation_bytes,
                 self.settings.tile_memory_budget_bytes,
             ) {
@@ -322,7 +323,8 @@ impl<'a> Search<'a> {
         graph
             .refresh_estimates()
             .ok_or(PlanningError::InvalidFragment("selected graph"))?;
-        if !graph.peak_memory.fits_ipu21_with_budget(
+        if !graph.peak_memory.fits_with_budget(
+            self.settings.target,
             self.settings.standard_memory_reservation_bytes,
             self.settings.tile_memory_budget_bytes,
         ) {

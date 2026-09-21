@@ -274,7 +274,8 @@ fn optimum(complete: &[MidGraph], config: &PipelineConfig) -> Option<u64> {
     complete
         .iter()
         .filter(|graph| {
-            graph.peak_memory.fits_ipu21_with_budget(
+            graph.peak_memory.fits_with_budget(
+                config.target,
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
             )
@@ -296,7 +297,8 @@ fn check_frontier(complete: &[MidGraph], search: &Search<'_>, seed: u64) {
     };
     let mut expected = Frontiers::default();
     for graph in complete.iter().filter(|g| {
-        g.peak_memory.fits_ipu21_with_budget(
+        g.peak_memory.fits_with_budget(
+            search.settings.target,
             search.settings.standard_memory_reservation_bytes,
             search.settings.tile_memory_budget_bytes,
         )
@@ -556,7 +558,7 @@ fn randomized_dp_matches_complete_path_enumeration() {
                     mid.estimated_cycles >= expected.unwrap(),
                     "beam beat exhaustive oracle: seed={seed}"
                 );
-                assert!(mid.peak_memory.fits_ipu21_with_budget(0, budget));
+                assert!(mid.peak_memory.fits_with_budget(config.target, 0, budget));
                 check_semantics(&high, &mid, &mut rng);
             }
         }

@@ -2,7 +2,6 @@
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::{HighGraph, PipelineConfig};
-use ipu_target::ipu21::memory::{IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -259,12 +258,14 @@ fn profile(
         tile_count: config.tile_count,
         budget_bytes: config
             .tile_memory_budget_bytes
-            .min(u64::from(IPU21_PLANNED_DATA_BYTES)),
-        interleaved_budget_bytes: u64::from(IPU21_INTERLEAVED_REGION_BYTES),
+            .min(config.target.planned_data_bytes()),
+        interleaved_budget_bytes: config.target.interleaved_data_bytes(),
         standard_contiguous_overflow_bytes: peak.standard_contiguous_overflow_with_reservation(
+            config.target,
             config.standard_memory_reservation_bytes,
         ),
-        fits_budget: peak.fits_ipu21_with_budget(
+        fits_budget: peak.fits_with_budget(
+            config.target,
             config.standard_memory_reservation_bytes,
             config.tile_memory_budget_bytes,
         ),

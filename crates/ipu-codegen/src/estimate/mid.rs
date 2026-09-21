@@ -70,7 +70,8 @@ pub(crate) fn analyze_with_budget(
     config: &crate::PipelineConfig,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
     let bound = analyze_storage::<false>(program, copies, &mut ())?;
-    if bound.1.fits_ipu21_with_budget(
+    if bound.1.fits_with_budget(
+        config.target,
         config.standard_memory_reservation_bytes,
         config.tile_memory_budget_bytes,
     ) {

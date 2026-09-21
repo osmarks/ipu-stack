@@ -1,9 +1,7 @@
 //! Allocation requirements and region liveness; no cycle pricing.
 
 use super::*;
-use ipu_target::ipu21::memory::{
-    IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES, IPU21_STANDARD_FIXED_BYTES,
-};
+use ipu_target::Target;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct MemoryUsage {
@@ -32,8 +30,8 @@ impl MemoryUsage {
     }
 }
 
-/// Tensor-only class maxima and maximum simultaneous live storage. Region 1
-/// is shared by both classes; separate peaks need not coexist. These are cheap
+/// Tensor-only class maxima and maximum simultaneous live storage.
+/// Separate peaks need not coexist. These are cheap
 /// capacity screens, not a guarantee that aligned concrete placement succeeds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MemoryPeaks {
@@ -70,35 +68,29 @@ impl MemoryPeaks {
             .max(maximum_standard_allocation);
     }
 
-    pub fn fits_ipu21_with_budget(
+    pub fn fits_with_budget(
         self,
+        target: Target,
         reserved_standard_bytes: u64,
         tile_memory_budget_bytes: u64,
     ) -> bool {
-        self.interleaved <= u64::from(IPU21_INTERLEAVED_REGION_BYTES)
+        self.interleaved <= target.interleaved_data_bytes()
             // Row storage is a coarse ranking estimate: it sums independent
             // phase maxima and cannot prove that an allocation is impossible.
             // Exact encoded rows participate in package acceptance after scheduling.
             && self.total.saturating_add(reserved_standard_bytes)
-                <= tile_memory_budget_bytes.min(u64::from(IPU21_PLANNED_DATA_BYTES))
-            && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
-    }
-
-    pub(crate) fn standard_contiguous_overflow(self) -> u64 {
-        self.standard_contiguous_overflow_with_reservation(0)
+                <= tile_memory_budget_bytes.min(target.planned_data_bytes())
+            && self.standard_contiguous_overflow_with_reservation(target, reserved_standard_bytes)
+                == 0
     }
 
     pub fn standard_contiguous_overflow_with_reservation(
         self,
+        target: Target,
         reserved_standard_bytes: u64,
     ) -> u64 {
-        // A standard buffer can use all of region 1 when interleaved
-        // temporaries are dead. Do not subtract an unrelated class peak.
-        let upper_standard = u64::from(IPU21_INTERLEAVED_REGION_BYTES);
-        let lower_standard =
-            u64::from(IPU21_STANDARD_FIXED_BYTES).saturating_sub(reserved_standard_bytes);
         self.maximum_standard_allocation
-            .saturating_sub(lower_standard.max(upper_standard))
+            .saturating_sub(target.maximum_standard_allocation(reserved_standard_bytes))
     }
 }
 
