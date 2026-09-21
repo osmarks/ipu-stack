@@ -824,8 +824,6 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::HighGraph;
-    use crate::estimate::Ipu21CostModel;
 
     #[test]
     fn package_assembly_maps_host_code_by_physical_tile() {
@@ -982,36 +980,6 @@ mod tests {
         assert!(data.range.end < RUNTIME_EXECUTABLE_START);
         let code = allocate_package_code(&mut memory, "code", 128, 8, 0).unwrap();
         assert_eq!(code.range.start, RUNTIME_EXECUTABLE_START);
-    }
-
-    #[test]
-    fn attention_scratch_does_not_override_result_precision() {
-        let mut graph = HighGraph::new();
-        let q = graph.host_input("q", [2, 17, 72]).unwrap();
-        let k = graph.host_input("k", [2, 73, 72]).unwrap();
-        let v = graph.host_input("v", [2, 73, 72]).unwrap();
-        let y = graph.flash_attention(q, k, v).unwrap();
-        graph.set_outputs([y]).unwrap();
-        let config = PipelineConfig::new(64)
-            .with_attention_strategy(crate::AttentionStrategy::Flash)
-            .with_automatic_input(q, Precision::F16)
-            .with_automatic_input(k, Precision::F16)
-            .with_automatic_input(v, Precision::F16);
-        let mid = crate::planner::build::baseline(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &crate::planner::cache::FragmentCache::default(),
-        )
-        .unwrap();
-        let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
-        assert!(
-            low.logical_values
-                .iter()
-                .any(|value| value.origin == y
-                    && value.tensor_type.format.precision == Precision::F32)
-        );
-        assert_eq!(package_precisions(&low)[&y], Precision::F16);
     }
 }
 

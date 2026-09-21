@@ -5,8 +5,14 @@ Graphcore IPU21 devices. It lowers tensor graphs to executable `.ipuexe`
 packages, including layout selection, SRAM allocation, kernel generation,
 exchange scheduling, and repeated execution with resident parameters.
 
+The planner is currently being replaced. The current compilation entry point
+supports FP16 equal-shape Add and GeLU graphs with explicit input layouts;
+GEMM, attention and Repeat construction are not yet implemented in the new
+planner. The model results below describe the previous planner, retained in
+history. Existing compiled packages remain runnable.
+
 The full pretrained SigLIP So400m/14 384 vision tower (27 encoder layers and MAP
-head, batch size 1) runs on hardware. On six real photographs, its embeddings
+head, batch size 1) was validated on hardware. On six real photographs, its embeddings
 achieved **0.994614–0.997866 cosine similarity** against an independent FP32
 Hugging Face reference. Weights were uploaded once and retained across all six
 inferences. This is a small numerical validation, not a task-accuracy evaluation

@@ -155,133 +155,6 @@ fn copy_elimination_preserves_values_across_in_place_writes() {
 }
 
 #[test]
-fn reduction_fragment_accepts_a_materialized_crop() {
-    let mut mid = copied_columns(8);
-    for value in &mut mid.values {
-        value.tensor_type.format.precision = Precision::F16;
-        value.tensor_type.shape.0.insert(0, 2);
-        value.tensor_type.format.layout =
-            Layout::row_major(TensorTiling::sharded(TensorAxis::FromStart(0), 2));
-    }
-    mid.tile_count = 2;
-    let input = mid.values[1].tensor_type.clone();
-    let mut output = input.clone();
-    output.shape.0.remove(0);
-    output.format.layout = Layout::row_major(TensorTiling::replicated(1));
-    let mut builder = crate::planner::fragments::FragmentBuilder::new(&[input]);
-    let result = builder
-        .sum(
-            MidValueId::from_index(0),
-            &output,
-            0,
-            crate::ReductionStaging::Complete,
-        )
-        .unwrap();
-    builder.program.outputs = vec![result];
-    builder.program.tile_count = 2;
-    mid.outputs = crate::mid::append_fragment(
-        &builder.program,
-        &[MidValueId::from_index(1)],
-        &crate::tensor::OwnerMap::default(),
-        None,
-        ValueId::from_index(0),
-        2,
-        &mut mid.values,
-        &mut mid.operations,
-    )
-    .unwrap();
-    expand_tiles(&mid, false).unwrap();
-}
-
-#[test]
-fn grouping_moves_complete_reductions_and_their_preparation() {
-    let mut input = TensorType::new(
-        [2, 4, 64],
-        Precision::F16,
-        Layout::row_major(TensorTiling::sharded(TensorAxis::FromStart(0), 2)),
-    );
-    input.format.layout.order = ElementOrder::Amp(crate::AmpOrder::Left);
-    let mut output = input.clone();
-    output.shape.0.remove(0);
-    output.format.layout.tiling = TensorTiling::replicated(1);
-    let mut builder = crate::planner::fragments::FragmentBuilder::new(&[input.clone(), input]);
-    let mut groups = Vec::new();
-    let mut results = Vec::new();
-    for input in 0..2 {
-        let begin = builder.program.operations.len();
-        let result = builder
-            .sum(
-                MidValueId::from_index(input),
-                &output,
-                0,
-                crate::ReductionStaging::Complete,
-            )
-            .unwrap();
-        groups.push(
-            builder.program.operations[begin..]
-                .iter()
-                .filter(|op| matches!(op.kind, MidOperationKind::ReductionSum { .. }))
-                .map(|op| op.results[0])
-                .collect::<Vec<_>>(),
-        );
-        results.push(result);
-    }
-    for result in results {
-        let id = MidValueId::from_index(builder.program.values.len() as u32);
-        let mut value = builder.program.values[result.index() as usize].clone();
-        value.id = id;
-        value.storage_group = id;
-        value.tensor_type.format.layout.order = ElementOrder::RowMajor;
-        builder.program.values.push(value);
-        builder.program.operations.push(MidOperation {
-            source: None,
-            inputs: vec![result],
-            results: vec![id],
-            kind: MidOperationKind::Copy {
-                mapping: CoordinateMapping::default(),
-                policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Staged,
-            },
-            operands: vec![],
-            output_aliases: vec![],
-            output_windows: vec![],
-        });
-        builder.program.outputs.push(id);
-    }
-    builder.program.tile_count = 4;
-    let copies = builder
-        .program
-        .operations
-        .iter()
-        .filter(|op| matches!(op.kind, MidOperationKind::Copy { .. }))
-        .count();
-    builder.program.group_reductions(2).unwrap();
-    assert_ne!(
-        builder.program.values[groups[0][0].index() as usize].owners,
-        builder.program.values[groups[1][0].index() as usize].owners
-    );
-    assert_eq!(
-        copies,
-        builder
-            .program
-            .operations
-            .iter()
-            .filter(|op| matches!(op.kind, MidOperationKind::Copy { .. }))
-            .count()
-    );
-    for group in groups {
-        let final_home = &builder.program.values[group.last().unwrap().index() as usize].owners;
-        assert!(
-            group
-                .iter()
-                .all(|id| &builder.program.values[id.index() as usize].owners == final_home),
-            "group moved only some panel writers: {group:?}"
-        );
-    }
-    expand_tiles(&builder.program, false).unwrap();
-}
-
-#[test]
 fn exported_copies_have_complete_storage_and_preserve_values() {
     for columns in [8, 16] {
         let mid = copied_columns(columns);
@@ -627,83 +500,54 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
 }
 
 #[test]
-fn writable_aliases_and_reductions_require_complete_copy_buffers() {
-    for sum in [false, true] {
-        let mut mid = copied_columns(8);
-        for value in &mut mid.values {
-            value.tensor_type.format.precision = Precision::F16;
-            if sum {
-                value.tensor_type.shape.0.insert(0, 2);
-                value.tensor_type.format.layout =
-                    Layout::row_major(TensorTiling::sharded(TensorAxis::FromStart(0), 2));
-            }
-        }
-        mid.tile_count = if sum { 2 } else { 1 };
-        let mut result = mid.values[1].clone();
-        result.id = MidValueId::from_index(2);
-        result.storage_group = result.id;
-        if sum {
-            result.tensor_type.shape.0.remove(0);
-            result.tensor_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
-        }
-        mid.outputs = vec![mid.values[0].id, result.id];
-        if sum {
-            let mut builder = crate::planner::fragments::FragmentBuilder { program: mid };
-            let output = builder
-                .sum(
-                    crate::MidValueId::from_index(1),
-                    &result.tensor_type,
-                    0,
-                    crate::ReductionStaging::Complete,
-                )
-                .unwrap();
-            mid = builder.program;
-            mid.outputs[1] = output;
-        } else {
-            mid.operations.push(MidOperation {
-                source: None,
-                inputs: vec![mid.values[1].id],
-                results: vec![result.id],
-                kind: MidOperationKind::Gelu,
-                operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                output_aliases: vec![(0, 0)],
-                output_windows: vec![],
-            });
-            mid.values.push(result);
-        }
-        let graph = expand_tiles(&mid, false).unwrap();
-        let low = crate::low::lower_to_tiles(&graph, false);
-        let copied = low
-            .value_views(mid.values[1].id)
-            .iter()
-            .map(|view| view.shard)
-            .collect::<Vec<_>>();
-        for run in &low.kernel_runs {
-            run.call(None).unwrap();
-        }
-        let placement = crate::place(&low).unwrap();
-        for &shard in &copied {
-            let source = low
-                .value_views(low.inputs[0].value)
-                .iter()
-                .find(|id| {
-                    low.shards[id.shard.index() as usize].tile
-                        == low.shards[shard.index() as usize].tile
-                })
-                .unwrap();
-            if !sum {
-                assert_ne!(
-                    placement.shard_addresses[&shard],
-                    placement.shard_addresses[&source.shard]
-                );
-            }
-        }
-        if !sum {
-            let output = low.value_views(low.outputs[1])[0].shard;
-            assert_eq!(
-                placement.shard_addresses[&output],
-                placement.shard_addresses[&copied[0]]
-            );
-        }
+fn writable_aliases_require_complete_copy_buffers() {
+    let mut mid = copied_columns(8);
+    for value in &mut mid.values {
+        value.tensor_type.format.precision = Precision::F16;
     }
+    mid.tile_count = 1;
+    let mut result = mid.values[1].clone();
+    result.id = MidValueId::from_index(2);
+    result.storage_group = result.id;
+    mid.outputs = vec![mid.values[0].id, result.id];
+    mid.operations.push(MidOperation {
+        source: None,
+        inputs: vec![mid.values[1].id],
+        results: vec![result.id],
+        kind: MidOperationKind::Gelu,
+        operands: vec![OperandIndexing::Elementwise { result: 0 }],
+        output_aliases: vec![(0, 0)],
+        output_windows: vec![],
+    });
+    mid.values.push(result);
+    let graph = expand_tiles(&mid, false).unwrap();
+    let low = crate::low::lower_to_tiles(&graph, false);
+    let copied = low
+        .value_views(mid.values[1].id)
+        .iter()
+        .map(|view| view.shard)
+        .collect::<Vec<_>>();
+    for run in &low.kernel_runs {
+        run.call(None).unwrap();
+    }
+    let placement = crate::place(&low).unwrap();
+    for &shard in &copied {
+        let source = low
+            .value_views(low.inputs[0].value)
+            .iter()
+            .find(|id| {
+                low.shards[id.shard.index() as usize].tile
+                    == low.shards[shard.index() as usize].tile
+            })
+            .unwrap();
+        assert_ne!(
+            placement.shard_addresses[&shard],
+            placement.shard_addresses[&source.shard]
+        );
+    }
+    let output = low.value_views(low.outputs[1])[0].shard;
+    assert_eq!(
+        placement.shard_addresses[&output],
+        placement.shard_addresses[&copied[0]]
+    );
 }

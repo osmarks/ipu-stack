@@ -1204,12 +1204,7 @@ impl DisjointSets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimate::Ipu21CostModel;
-    use crate::planner::test_support::lower;
-    use crate::{
-        HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles,
-        materialize_kernel_run,
-    };
+    use crate::{HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles};
 
     #[test]
     fn displaced_alias_constraints_preserve_repeat_equalities_and_reject_cycles() {
@@ -1268,7 +1263,13 @@ mod tests {
                 layout: Layout::row_sharded(1),
             },
         );
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let requests = [64, 128].map(|bytes| {
             vec![AuxiliaryRequest {
@@ -1322,30 +1323,25 @@ mod tests {
 
     #[test]
     fn pointwise_parameter_input_is_never_overwritten() {
-        for case in 0..3 {
+        for tiles in [1, 2, 4] {
             let mut graph = HighGraph::new();
             let parameter = graph.parameter("p", [8, 64]).unwrap();
-            let output = match case {
-                0 => graph.gelu(parameter).unwrap(),
-                1 => {
-                    let view = graph.slice(parameter, 0, 0, 4).unwrap();
-                    graph.gelu(view).unwrap()
-                }
-                _ => graph
-                    .repeat(2, [parameter], [], [], |body, args| {
-                        Ok(vec![body.gelu(args.carried[0])?])
-                    })
-                    .unwrap()[0],
-            };
+            let output = graph.gelu(parameter).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(4).with_input(
+            let config = PipelineConfig::new(tiles).with_input(
                 parameter,
                 TensorFormat {
                     precision: Precision::F16,
-                    layout: Layout::row_sharded(4),
+                    layout: Layout::row_sharded(tiles),
                 },
             );
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let mid = crate::planner::plan(
+                &graph,
+                &crate::planner::boundary_layouts(&graph, &config),
+                &config,
+                crate::planner::SearchLimits::default(),
+            )
+            .unwrap();
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
             let analysis = analyze_allocations(&low).unwrap();
             let roots = low
@@ -1417,7 +1413,13 @@ mod tests {
                     layout,
                 },
             );
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let mid = crate::planner::plan(
+                &graph,
+                &crate::planner::boundary_layouts(&graph, &config),
+                &config,
+                crate::planner::SearchLimits::default(),
+            )
+            .unwrap();
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
             let placed = place_with_ranges(&low, &available).unwrap();
             assert!(!placed.shard_addresses.is_empty());
@@ -1660,142 +1662,6 @@ mod tests {
     }
 
     #[test]
-    fn repeat_bank_separation_reserves_the_sequence_without_padding_each_member() {
-        let mut graph = HighGraph::new();
-        let carried = graph.host_input("carried", [8, 16]).unwrap();
-        let parameters = (0..3)
-            .map(|index| {
-                graph
-                    .parameter(format!("parameter.{index}"), [8, 16])
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let sequence = graph
-            .value_sequence("parameters", parameters.clone())
-            .unwrap();
-        let output = graph
-            .repeat(3, [carried], [], [sequence], |body, arguments| {
-                Ok(vec![body.add(arguments.carried[0], arguments.iterated[0])?])
-            })
-            .unwrap()[0];
-        graph.set_outputs([output]).unwrap();
-        let format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::row_sharded(4),
-        };
-        let mut config = PipelineConfig::new(4).with_input(carried, format.clone());
-        for parameter in parameters {
-            config.inputs.insert(parameter, format.clone());
-        }
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let mut expanded = (*crate::expand_tiles(&mid).unwrap()).clone();
-        // Bank constraints may be introduced during expansion, after mid has
-        // selected the iterated values' shapes.
-        for run in &mut expanded.kernel_runs {
-            if run.inputs.len() == 2 {
-                std::sync::Arc::make_mut(&mut run.metadata)
-                    .requirements
-                    .distinct_elements
-                    .push(vec![
-                        crate::MemoryOperand::Output(0),
-                        crate::MemoryOperand::Input(1),
-                    ]);
-            }
-        }
-        let low = lower_to_tiles(&std::sync::Arc::new(expanded), false);
-        let mut checked = 0;
-        for placement in [
-            place(&low).unwrap(),
-            place_with_ranges(
-                &low,
-                &[
-                    (IPU21_DATA_BASE, IPU21_DATA_BASE + 4),
-                    (IPU21_INTERLEAVED_MEMORY_BASE, APPLICATION_LOAD_LIMIT),
-                ],
-            )
-            .unwrap(),
-            place_with_ranges(
-                &low,
-                &[(IPU21_INTERLEAVED_MEMORY_BASE, APPLICATION_LOAD_LIMIT)],
-            )
-            .unwrap(),
-        ] {
-            for tile in &low.tiles {
-                for work in tile.work.iter() {
-                    let crate::BlockOperation::Repeat(repeat) = work else {
-                        continue;
-                    };
-                    let repeat = &low.repeat_runs[*repeat];
-                    for input in &repeat.binding.iterated {
-                        assert!(
-                            placement.sequence_strides[&input.argument] < TILE_MEMORY_ELEMENT_SIZE
-                        );
-                        let output = placement.shard_addresses[&repeat.binding.carried[0].initial];
-                        let element = |address| {
-                            if address >= IPU21_INTERLEAVED_MEMORY_BASE {
-                                IPU21_INTERLEAVED_ELEMENT_SIZE
-                            } else {
-                                TILE_MEMORY_ELEMENT_SIZE
-                            }
-                        };
-                        for member in &input.inputs {
-                            let address = placement.shard_addresses[member];
-                            let bytes =
-                                shard_storage_bytes(&low.shards[member.index() as usize]).unwrap();
-                            assert!(
-                                (address + bytes).div_ceil(element(address)) * element(address)
-                                    <= output
-                                    || output.div_euclid(element(output)) * element(output)
-                                        + element(output)
-                                        <= address,
-                                "a sequence member shares the output's element"
-                            );
-                        }
-                        for pair in input.inputs.windows(2) {
-                            assert_eq!(
-                                placement.shard_addresses[&pair[1]]
-                                    - placement.shard_addresses[&pair[0]],
-                                placement.sequence_strides[&input.argument]
-                            );
-                        }
-                        checked += 1;
-                    }
-                }
-            }
-        }
-        assert!(checked > 0);
-
-        // Independently constrained members still require separate elements.
-        let mut analysis = analyze_allocations(&low).unwrap();
-        let group = analysis.tiles[0].iterated[0].clone();
-        let second_root = analysis.root_of_member[group.shards[1].index() as usize];
-        let first_root = analysis.root_of_member[group.shards[0].index() as usize];
-        analysis
-            .conflicts
-            .entry(first_root)
-            .or_default()
-            .insert(second_root);
-        analysis
-            .conflicts
-            .entry(second_root)
-            .or_default()
-            .insert(first_root);
-        let placed = place_tile(
-            &low,
-            0,
-            &[(IPU21_DATA_BASE, APPLICATION_LOAD_LIMIT)],
-            0,
-            &analysis,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            placed.addresses[&group.shards[1]] - placed.addresses[&group.shards[0]],
-            TILE_MEMORY_ELEMENT_SIZE
-        );
-    }
-
-    #[test]
     fn output_lifetimes_follow_ownership_not_output_list_order() {
         let mut graph = HighGraph::new();
         let input = graph.host_input("input", [8, 16]).unwrap();
@@ -1805,19 +1671,14 @@ mod tests {
             precision: Precision::F16,
             layout: Layout::row_sharded(4),
         };
-        let mut config = PipelineConfig::new(4).with_input(input, format.clone());
-        config.operator_candidates =
-            vec![crate::planner::catalogue::ConcreteOperatorCandidate::new(
-                crate::planner::operator::OperatorFamily::Gelu,
-                [crate::planner::operator::OperandRequirement::new(
-                    format.clone(),
-                )],
-                format,
-            )]
-            .into_iter()
-            .map(crate::planner::OperatorCandidate::Concrete)
-            .collect();
-        let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let config = PipelineConfig::new(4).with_input(input, format);
+        let candidate = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let mut program = (*crate::expand_tiles(&candidate).unwrap()).clone();
         let work = program
             .body
@@ -1841,108 +1702,6 @@ mod tests {
     }
 
     #[test]
-    fn randomized_gemm_placement_respects_classes_and_kernel_views() {
-        let mut random = fastrand::Rng::with_seed(0x706c_6163);
-        for _ in 0..48 {
-            let tiles = 1_u16 << random.u32(0..=3);
-            let rows = u32::from(tiles) * random.u32(1..=8);
-            let columns = random.u32(1..=2) * 64;
-            let mut graph = HighGraph::new();
-            let left = graph.host_input("left", [rows, 64]).unwrap();
-            let right = graph.parameter("right", [64, columns]).unwrap();
-            let output = graph.gemm(left, right).unwrap();
-            graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(tiles)
-                .with_input(
-                    left,
-                    TensorFormat {
-                        precision: Precision::F16,
-                        layout: Layout::amp_left(64, tiles),
-                    },
-                )
-                .with_input(
-                    right,
-                    TensorFormat {
-                        precision: Precision::F16,
-                        layout: Layout::block_major_matrix(64, tiles),
-                    },
-                );
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(
-                &crate::expand_tiles(&mid).unwrap(),
-                config.diagnostic_checkpoints,
-            );
-            let placement = place_with_offset(
-                &low,
-                &[(IPU21_DATA_BASE, APPLICATION_LOAD_LIMIT)],
-                random.u32(0..8) * 4096,
-            )
-            .unwrap();
-            assert_eq!(placement.shard_addresses.len(), low.shards.len());
-            for shard in &low.shards {
-                let address = placement.shard_addresses[&shard.id];
-                match shard.tensor_type.format.layout.memory_class {
-                    MemoryClass::Ipu21Interleaved => {
-                        assert!(
-                            (IPU21_INTERLEAVED_MEMORY_BASE..APPLICATION_LOAD_LIMIT)
-                                .contains(&address)
-                        )
-                    }
-                    MemoryClass::Ipu21Standard => assert!(address >= IPU21_DATA_BASE),
-                }
-            }
-            for tile in &low.tiles {
-                for work in tile.work.iter() {
-                    if let BlockOperation::Compute { run, .. } = work {
-                        let run = &low.kernel_runs[run.0 as usize];
-                        materialize_kernel_run(
-                            run,
-                            &low.shards,
-                            &placement.shard_addresses,
-                            &BTreeMap::new(),
-                        )
-                        .unwrap();
-                        {
-                            let requirements = &run.requirements;
-                            for operands in &requirements.distinct_elements {
-                                let mut ranges = Vec::new();
-                                for operand in operands {
-                                    let shards = match operand {
-                                        crate::MemoryOperand::Output(index) => {
-                                            vec![run.outputs[usize::from(*index)].shard]
-                                        }
-                                        crate::MemoryOperand::Input(index) => {
-                                            vec![run.inputs[usize::from(*index)].shard]
-                                        }
-                                    };
-                                    for shard in shards {
-                                        let definition = &low.shards[shard.index() as usize];
-                                        let address = placement.shard_addresses[&shard];
-                                        let bytes = shard_storage_bytes(definition).unwrap();
-                                        ranges.push(
-                                            ipu_target::ipu21::memory::effective_memory_elements(
-                                                address,
-                                                bytes.div_ceil(4),
-                                            ),
-                                        );
-                                    }
-                                }
-                                for (index, left) in ranges.iter().enumerate() {
-                                    for right in &ranges[..index] {
-                                        assert!(
-                                            left.iter().all(|element| !right.contains(element))
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn randomized_sequential_pointwise_values_reuse_dead_input_storage() {
         let mut random = fastrand::Rng::with_seed(0x6c69_7665);
         for _ in 0..48 {
@@ -1958,19 +1717,21 @@ mod tests {
                 precision: Precision::F16,
                 layout: Layout::row_sharded(tiles),
             };
-            let mut config = PipelineConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, format.clone())
                 .with_input(right, format);
-            // This is an in-place allocation fixture, independent of whether
-            // the cost model prefers another precision or inserts conversions.
-            config.operator_candidates.retain(|candidate| {
-                candidate.concrete().is_some_and(|candidate| {
-                    let format = &candidate.plan.output;
-                    format.precision == Precision::F16
-                        && format.layout.order == crate::ElementOrder::RowMajor
-                })
-            });
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let mut layouts = crate::planner::boundary_layouts(&graph, &config);
+            layouts.insert(sum, Some(Layout::row_sharded(tiles)));
+            let mut mid = crate::planner::plan(
+                &graph,
+                &layouts,
+                &config,
+                crate::planner::SearchLimits::default(),
+            )
+            .unwrap();
+            // Test placement of an explicitly donated temporary, independently
+            // of whether a planner would select donation or fusion.
+            mid.operations[1].output_aliases = vec![(0, 0)];
             assert_eq!(mid.operations.len(), 2);
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];

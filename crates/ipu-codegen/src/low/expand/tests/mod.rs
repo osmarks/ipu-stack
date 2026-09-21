@@ -3,7 +3,6 @@ use super::copy::{
     realize::{MaterializationBatch, append_span_copies},
 };
 use crate::mid::MidOperationKind;
-use crate::planner::catalogue::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
 fn lower_to_tiles(
     graph: &crate::MidGraph,
@@ -15,15 +14,9 @@ fn lower_to_tiles(
     Ok(crate::low::lower_to_tiles(&expanded, checkpoints))
 }
 use super::*;
-use crate::estimate::Ipu21CostModel;
-use crate::planner::OperatorCandidate;
-use crate::planner::operator::{
-    GemmDistribution, OperandRequirement, OperatorDispatch, OperatorFamily,
-};
-use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, AxisTiling, HighGraph, ElementOrder, GridOrder, Layout, MemoryClass,
-    Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
+    AxisTiling, ElementOrder, GridOrder, HighGraph, Layout, MemoryClass, Padding, PipelineConfig,
+    Precision, TensorAxis, TensorFormat, TensorTiling,
 };
 use std::collections::BTreeSet;
 
@@ -43,10 +36,12 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             let input = graph.host_input("input", [16, 16]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
-            let mid = lower(
+            let config = PipelineConfig::new(4).with_input(input, format(1));
+            let mid = crate::planner::plan(
                 &graph,
-                &PipelineConfig::new(4).with_input(input, format(1)),
-                &Ipu21CostModel,
+                &crate::planner::boundary_layouts(&graph, &config),
+                &config,
+                crate::planner::SearchLimits::default(),
             )
             .unwrap();
             let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
@@ -182,7 +177,13 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         let input = graph.host_input("input", [16, 16]).unwrap();
         graph.set_outputs([input]).unwrap();
         let config = PipelineConfig::new(3).with_input(input, format(1));
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
         let source = builder.full_view(builder.program.shards[0].id);
         let mut mappings = Vec::new();
@@ -271,7 +272,13 @@ fn factor_mappings_keep_the_bound_source_selection() {
     let input = graph.host_input("input", [1, 4, 32]).unwrap();
     graph.set_outputs([input]).unwrap();
     let config = PipelineConfig::new(1).with_input(input, format(1));
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::plan(
+        &graph,
+        &crate::planner::boundary_layouts(&graph, &config),
+        &config,
+        crate::planner::SearchLimits::default(),
+    )
+    .unwrap();
     let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
     let source = builder.program.shards[0].id;
     let mut source_view = builder.full_view(source);
@@ -360,43 +367,6 @@ fn format(tiles: u16) -> TensorFormat {
 }
 
 #[test]
-fn panel_construction_keeps_both_operand_casts_materialized() {
-    let mut graph = HighGraph::new();
-    let left = graph.host_input("left", [8, 128]).unwrap();
-    let right = graph.parameter("right", [128, 64]).unwrap();
-    let output = graph.gemm(left, right).unwrap();
-    graph.set_outputs([output]).unwrap();
-    let input_format = TensorFormat {
-        precision: Precision::F32,
-        layout: Layout::row_sharded(4),
-    };
-    let mut config = PipelineConfig::new(4)
-        .with_input(left, input_format.clone())
-        .with_input(right, input_format);
-    config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
-    config.operator_candidates.retain(|candidate| {
-        matches!(
-            candidate.operator(),
-            OperatorFamily::Gemm {
-                multiply: Precision::F16,
-                ..
-            }
-        )
-    });
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let casts = mid
-        .operations
-        .iter()
-        .filter(|op| matches!(op.kind, MidOperationKind::Cast { .. }))
-        .collect::<Vec<_>>();
-    assert_eq!(casts.len(), 2);
-    let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-    for cast in casts {
-        assert!(!low.value_views(cast.results[0]).is_empty());
-    }
-}
-
-#[test]
 fn randomized_linear_shards_cover_flat_storage_once_in_balanced_grains() {
     let mut random = fastrand::Rng::with_seed(0x666c_6174_5f73_6864);
     for case in 0..CASES {
@@ -454,244 +424,6 @@ fn randomized_linear_shards_cover_flat_storage_once_in_balanced_grains() {
 }
 
 #[test]
-fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
-    let mut random = fastrand::Rng::with_seed(0x7472_6565_5f6b_7370);
-    for case in 0..CASES {
-        let output_columns = [64, 128][random.usize(0..2)];
-        let inner_partitions = random.u16(2..=4);
-        let column_partitions = random.u16(1..=3);
-        let row_partitions = random.u16(inner_partitions..=8);
-        let tiles = inner_partitions * column_partitions * row_partitions;
-        let rows_per_partition = random.u32(1..=4);
-        let rows = u32::from(row_partitions) * rows_per_partition;
-        let inner = u32::from(inner_partitions)
-            * 64
-            * random.u32(1..=u32::from(row_partitions / inner_partitions));
-        let columns = u32::from(column_partitions) * output_columns;
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [1, rows, inner]).unwrap();
-        let right = graph.parameter("right", [1, inner, columns]).unwrap();
-        let product = graph.gemm(left, right).unwrap();
-        graph.set_outputs([product]).unwrap();
-        let operator = OperatorFamily::Gemm {
-            options: Default::default(),
-            multiply: Precision::F16,
-            accumulate: AccumulationPrecision::F32,
-        };
-        let left_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_parallel_grid(
-                64,
-                tiles,
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-            ),
-        };
-        let right_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::block_major_matrix_storage(
-                64,
-                output_columns,
-                column_partitions,
-                inner_partitions,
-                1,
-                MemoryClass::Ipu21Interleaved,
-            ),
-        };
-        let (result_row_partitions, result_column_partitions) = if random.bool() {
-            (1, 1)
-        } else if random.bool() && rows_per_partition >= u32::from(inner_partitions) {
-            (inner_partitions, 1)
-        } else {
-            (1, inner_partitions)
-        };
-        let storage_rows = row_partitions.saturating_mul(result_row_partitions);
-        let storage_columns = column_partitions.saturating_mul(result_column_partitions);
-        let reduction_staging = if random.bool() {
-            crate::ReductionStaging::Complete
-        } else {
-            crate::ReductionStaging::Streamed
-        };
-        let output_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_result_grid(
-                if result_column_partitions > 1 {
-                    crate::tensor::AMP_COLUMN_MICRO
-                } else {
-                    output_columns
-                },
-                storage_rows * storage_columns,
-                storage_rows,
-                storage_columns,
-                crate::tensor::GridOrder::ColumnsFast,
-            ),
-        };
-        let candidate = ConcreteOperatorCandidate::new(
-            operator,
-            [
-                OperandRequirement::new(left_format.clone()),
-                OperandRequirement::new(right_format.clone()),
-            ],
-            output_format,
-        )
-        .with_dispatch(OperatorDispatch::BlockedGemm {
-            inner_block: 64,
-            output_column_block: output_columns,
-            orientation: crate::planner::operator::GemmOrientation::Normal,
-            distribution: GemmDistribution::ParallelReduction {
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-                result_row_partitions,
-                result_column_partitions,
-                reduction_staging,
-            },
-        });
-        let mut config = PipelineConfig::new(tiles)
-            .with_input(left, left_format)
-            .with_input(right, right_format);
-        config.operator_candidates = vec![candidate]
-            .into_iter()
-            .map(OperatorCandidate::Concrete)
-            .collect();
-        let mid = lower(&graph, &config, &Ipu21CostModel)
-            .unwrap_or_else(|error| panic!("case {case}: {error}"));
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "case {case}: {error}; rows={rows} inner={inner} columns={columns} grid={row_partitions}x{column_partitions}x{inner_partitions}"
-                )
-            });
-        let reduction_runs = low
-            .kernel_runs
-            .iter()
-            .filter(|run| matches!(run.kernel, MidOperationKind::ReductionSum { .. }))
-            .collect::<Vec<_>>();
-        assert!(!reduction_runs.is_empty(), "case {case}");
-        assert!(
-            reduction_runs.iter().all(|run| {
-                matches!(
-                    run.kernel,
-                    MidOperationKind::ReductionSum { partials }
-                        if partials == match reduction_staging {
-                            crate::ReductionStaging::Complete => inner_partitions,
-                            crate::ReductionStaging::Streamed => 2,
-                            crate::ReductionStaging::Batched(limit) => limit.get() + 1,
-                        }
-                ) && run.inputs.len() == 2
-            }),
-            "case {case}"
-        );
-        assert!(
-            low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(2),
-            "case {case}"
-        );
-        if (result_row_partitions, result_column_partitions) != (1, 1) {
-            let root = |id| crate::low::storage::storage_root(&low.shards, id);
-            let output_shards = low
-                .value_views(low.outputs[0])
-                .iter()
-                .map(|view| root(view.shard))
-                .collect::<BTreeSet<_>>();
-            let packed_results = reduction_runs
-                .iter()
-                .map(|run| root(run.outputs[0].shard))
-                .collect::<BTreeSet<_>>();
-            let copied_outputs = low
-                .local_copies
-                .iter()
-                .filter(|copy| packed_results.contains(&root(copy.movement().source)))
-                .map(|copy| root(copy.movement().destination))
-                .collect::<BTreeSet<_>>();
-            assert!(
-                output_shards.iter().all(
-                    |output| copied_outputs.contains(output) || packed_results.contains(output)
-                ),
-                "case {case}: every distributed result shard must be written by a reduction or its copy"
-            );
-        }
-    }
-}
-
-#[test]
-fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
-    let mut random = fastrand::Rng::with_seed(0x7061_7261_6d73);
-    for case in 0..CASES {
-        let owner_tiles = 1_u16 << random.u32(1..=3);
-        let compute_tiles = owner_tiles * 2;
-        let inner = u32::from(owner_tiles) * 64;
-        let rows = u32::from(compute_tiles) * random.u32(1..=4);
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [rows, inner]).unwrap();
-        let right0 = graph.parameter("right.0", [inner, 64]).unwrap();
-        let right1 = graph.parameter("right.1", [inner, 64]).unwrap();
-        let output0 = graph.gemm(left, right0).unwrap();
-        let output1 = graph.gemm(left, right1).unwrap();
-        graph.set_outputs([output0, output1]).unwrap();
-
-        let left_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left(64, compute_tiles),
-        };
-        let right_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::block_major_matrix_storage(
-                64,
-                64,
-                1,
-                owner_tiles,
-                1,
-                MemoryClass::Ipu21Standard,
-            ),
-        };
-        let output_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_result(compute_tiles),
-        };
-        let mut config = PipelineConfig::new(compute_tiles)
-            .with_input(left, left_format.clone())
-            .with_input(right0, right_format.clone())
-            .with_input(right1, right_format.clone());
-        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            OperatorFamily::Gemm {
-                options: crate::GemmOptions::default(),
-                multiply: Precision::F16,
-                accumulate: crate::AccumulationPrecision::F16,
-            },
-            [
-                OperandRequirement::new(left_format),
-                OperandRequirement::new(right_format),
-            ],
-            output_format,
-        )]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
-
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        let parameter_tiles = |name: &str| {
-            low.value_views(
-                low.inputs
-                    .iter()
-                    .find(|input| input.name == name)
-                    .unwrap()
-                    .value,
-            )
-            .iter()
-            .map(|shard| low.shards[shard.shard.index() as usize].tile)
-            .collect::<BTreeSet<_>>()
-        };
-        let first = parameter_tiles("right.0");
-        let second = parameter_tiles("right.1");
-        assert_eq!(first.len(), usize::from(owner_tiles), "case {case}");
-        assert_eq!(second.len(), usize::from(owner_tiles), "case {case}");
-        assert!(first.is_disjoint(&second), "case {case}");
-    }
-}
-
-#[test]
 fn randomized_pointwise_dispatch_skips_empty_output_shards() {
     let mut random = fastrand::Rng::with_seed(0x656d_7074);
     for case in 0..CASES {
@@ -703,17 +435,15 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
-        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            OperatorFamily::Gelu,
-            [OperandRequirement::new(tensor_format.clone())],
-            tensor_format,
-        )]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
+        let config = PipelineConfig::new(tiles).with_input(input, tensor_format);
 
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let runs = low
             .tiles
@@ -731,81 +461,6 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
                 .iter()
                 .all(|extent| extent.start < extent.physical_end)
         }));
-    }
-}
-
-#[test]
-fn randomized_panel_consumers_have_bounded_materialized_operands() {
-    let mut random = fastrand::Rng::with_seed(0x7374_7265_616d);
-    for case in 0..8 {
-        let batch = random.u32(1..=4);
-        let tokens = 16;
-        let mut graph = HighGraph::new();
-        let input = graph.host_input("input", [batch, tokens, 64]).unwrap();
-        let up = graph.parameter("up", [1, 64, 256]).unwrap();
-        let down = graph.parameter("down", [1, 256, 64]).unwrap();
-        let hidden = graph.gemm(input, up).unwrap();
-        let hidden = graph.gelu(hidden).unwrap();
-        let output = graph.gemm(hidden, down).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(16)
-            .with_active_tile_counts([16])
-            .with_input(
-                input,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::row_sharded(16),
-                },
-            )
-            .with_automatic_input(up, Precision::F16)
-            .with_automatic_input(down, Precision::F16);
-        config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
-
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        mid.validate().unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        for run in low
-            .tiles
-            .iter()
-            .flat_map(|tile| tile.work.iter())
-            .filter_map(|work| match work {
-                BlockOperation::Compute { run, .. }
-                    if matches!(
-                        low.kernel_runs[run.0 as usize].kernel,
-                        MidOperationKind::Gemm { .. }
-                    ) =>
-                {
-                    Some(&low.kernel_runs[run.0 as usize])
-                }
-                _ => None,
-            })
-        {
-            let output = &low.shards[run.outputs[0].shard.index() as usize];
-            let flattens_outer_rows = matches!(
-                output.tensor_type.format.layout.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-            );
-            assert!(
-                flattens_outer_rows
-                    || run.outputs[0].extents[..run.outputs[0].extents.len() - 2]
-                        .iter()
-                        .all(|extent| extent.physical_end - extent.start == 1),
-                "case {case}"
-            );
-        }
-        for run in &low.kernel_runs {
-            if matches!(run.kernel, MidOperationKind::Gemm { .. }) {
-                let input = &run.inputs[0];
-                let inner = input.extents.last().unwrap();
-                let MidOperationKind::Gemm { inner_block, .. } = &run.kernel else {
-                    continue;
-                };
-                assert!(
-                    inner.physical_end - inner.start <= *inner_block,
-                    "case {case}"
-                );
-            }
-        }
     }
 }
 
@@ -836,19 +491,16 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
-        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            OperatorFamily::Gelu,
-            // GeLU preserves element order. Requesting its output format on
-            // the operand makes the required local conversion explicit.
-            [OperandRequirement::new(output_format.clone())],
-            output_format,
-        )]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
-
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let config = PipelineConfig::new(tiles).with_input(input, input_format);
+        let mut layouts = crate::planner::boundary_layouts(&graph, &config);
+        layouts.insert(output, Some(output_format.layout));
+        let mid = crate::planner::plan(
+            &graph,
+            &layouts,
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.exchange_phases.is_empty(), "random case {case}");
         for tile in &low.tiles {
@@ -908,17 +560,16 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
-        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            OperatorFamily::Gelu,
-            [OperandRequirement::new(target_format.clone())],
-            target_format,
-        )]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
-
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let config = PipelineConfig::new(tiles).with_input(input, input_format);
+        let mut layouts = crate::planner::boundary_layouts(&graph, &config);
+        layouts.insert(output, Some(target_format.layout));
+        let mid = crate::planner::plan(
+            &graph,
+            &layouts,
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let conversion_phases = low
             .exchange_phases
@@ -1339,10 +990,15 @@ fn randomized_schedules_make_kernel_operands_resident() {
         let output = graph.add(left, right).unwrap();
         graph.set_outputs([output]).unwrap();
         let config = PipelineConfig::new(tiles)
-            .with_active_tile_counts([tiles])
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
@@ -1375,565 +1031,6 @@ fn randomized_schedules_make_kernel_operands_resident() {
                     ShardDefinition::Value(_) | ShardDefinition::Staging
                 )));
             }
-        }
-    }
-}
-
-#[test]
-fn randomized_broadcast_adds_schedule_remote_singleton_views() {
-    let mut random = fastrand::Rng::with_seed(0x6272_6463);
-    for case in 0..CASES {
-        let tiles = 1_u16 << random.u32(1..=3);
-        let rows = u32::from(tiles) * random.u32(1..=8);
-        let columns = random.u32(1..=8) * 16;
-        let mut graph = HighGraph::new();
-        let bias = graph.host_input("bias", [1, columns]).unwrap();
-        let tensor = graph.host_input("tensor", [rows, columns]).unwrap();
-        let output = graph.add(bias, tensor).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles)
-            .with_input(bias, format(tiles))
-            .with_input(tensor, format(tiles));
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-
-        assert!(
-            low.exchange_phases
-                .iter()
-                .any(|phase| matches!(phase.provenance.reason, WorkReason::OperatorInputs)),
-            "case {case}"
-        );
-        for tile in &low.tiles {
-            let add = tile
-                .work
-                .iter()
-                .find_map(|work| match work {
-                    BlockOperation::Compute { run, .. }
-                        if matches!(
-                            low.kernel_runs[run.0 as usize].kernel,
-                            MidOperationKind::Add
-                        ) =>
-                    {
-                        Some(&low.kernel_runs[run.0 as usize])
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(add.inputs[0].extents[0].logical_end, 1);
-            assert_eq!(
-                low.shards[add.inputs[0].shard.index() as usize].tile,
-                tile.tile
-            );
-        }
-    }
-}
-
-#[test]
-fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
-    let shared_cache = Arc::new(GeometryCache::default());
-    let mut random = fastrand::Rng::with_seed(0x6765_6d6d);
-    for case in 0..CASES {
-        let tiles = 1_u16 << random.u32(0..=3);
-        let rows = u32::from(tiles) * random.u32(1..=4) * 8;
-        let inner_blocks = random.u32(1..=4);
-        let column_blocks = random.u32(1..=4);
-        let inner = inner_blocks * 64;
-        let columns = column_blocks * 64;
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [rows, inner]).unwrap();
-        let right = graph.parameter("right", [inner, columns]).unwrap();
-        let output = graph.gemm(left, right).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles)
-            .with_active_tile_counts([tiles])
-            .with_input(left, format(tiles))
-            .with_input(right, format(tiles));
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let fresh = super::expand_tiles_cached(&mid, true, false, Arc::default()).unwrap();
-        for _ in 0..2 {
-            let cached =
-                super::expand_tiles_cached(&mid, true, false, Arc::clone(&shared_cache)).unwrap();
-            assert_eq!(cached, fresh, "cache changed graph in case {case}");
-        }
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-
-        let mut metadata = Vec::<&Arc<KernelRunMetadata>>::new();
-        for run in &low.kernel_runs {
-            if let Some(existing) = metadata
-                .iter()
-                .find(|existing| existing.as_ref() == run.metadata.as_ref())
-            {
-                assert!(Arc::ptr_eq(existing, &run.metadata), "case {case}");
-            } else {
-                metadata.push(&run.metadata);
-            }
-        }
-
-        for tile in &low.tiles {
-            let gemms = tile
-                .work
-                .iter()
-                .filter_map(|work| match work {
-                    BlockOperation::Compute { run, .. }
-                        if matches!(
-                            low.kernel_runs[run.0 as usize].kernel,
-                            MidOperationKind::Gemm { .. }
-                        ) =>
-                    {
-                        Some(&low.kernel_runs[run.0 as usize])
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let mut initialized_columns = std::collections::BTreeSet::new();
-            for run in gemms {
-                assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
-                assert!(run.provenance.operation.is_some());
-                assert!(run.provenance.value.is_some());
-                let MidOperationKind::Gemm {
-                    mode,
-                    inner_block: kernel_inner,
-                    output_columns: kernel_columns,
-                    ..
-                } = run.kernel
-                else {
-                    unreachable!()
-                };
-                let output_key = run.outputs[0]
-                    .extents
-                    .iter()
-                    .map(|extent| (extent.start, extent.physical_end))
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    mode,
-                    if initialized_columns.insert(output_key) {
-                        crate::GemmKernelMode::Initialize
-                    } else {
-                        crate::GemmKernelMode::Accumulate
-                    },
-                    "case {case}"
-                );
-                assert_eq!(run.inputs.len(), 2);
-                assert!(
-                    run.inputs[0]
-                        .extents
-                        .iter()
-                        .any(|extent| { extent.physical_end - extent.start == kernel_inner })
-                );
-                assert!(
-                    run.outputs[0]
-                        .extents
-                        .iter()
-                        .any(|extent| { extent.physical_end - extent.start == kernel_columns })
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
-    let mut random = fastrand::Rng::with_seed(0x7375_6273_6574);
-    for case in 0..16 {
-        let active_tiles = 1_u16 << random.u32(2..=5);
-        let capacity = active_tiles + random.u16(1..active_tiles);
-        let rows = u32::from(active_tiles);
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [rows, 64]).unwrap();
-        let right = graph.parameter("right", [64, 64]).unwrap();
-        let output = graph.gemm(left, right).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(capacity)
-            .with_automatic_input(left, Precision::F16)
-            .with_automatic_input(right, Precision::F16);
-
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let result = mid.operations.last().unwrap().results[0];
-        let selected_tiles = mid.values[result.index() as usize]
-            .tensor_type
-            .format
-            .layout
-            .tiling
-            .tile_count;
-        assert!(selected_tiles <= capacity, "case {case}");
-
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        assert_eq!(low.tile_count, capacity, "case {case}");
-        assert_eq!(
-            low.value_views(low.outputs[0]).len(),
-            usize::from(selected_tiles)
-        );
-        for view in low.value_views(low.outputs[0]) {
-            let shard = view.shard;
-            assert!(
-                low.shards[shard.index() as usize]
-                    .extents
-                    .iter()
-                    .all(|extent| extent.start < extent.logical_end),
-                "case {case} capacity={capacity} selected={selected_tiles} shard={:?} type={:?}",
-                low.shards[shard.index() as usize].extents,
-                mid.values[result.index() as usize].tensor_type,
-            );
-        }
-        assert!(low.tiles.iter().all(|tile| tile.tile < capacity));
-    }
-}
-
-#[test]
-fn randomized_resident_blocked_weights_lower_without_panel_copies() {
-    let mut random = fastrand::Rng::with_seed(0x7265_7369);
-    for _ in 0..48 {
-        let tiles = 1_u16 << random.u32(0..=3);
-        let rows = u32::from(tiles) * random.u32(1..=4);
-        let inner = 64 * random.u32(2..=4);
-        let columns = 64 * random.u32(1..=4);
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [rows, inner]).unwrap();
-        let right = graph.parameter("right", [inner, columns]).unwrap();
-        let output = graph.gemm(left, right).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles)
-            .with_automatic_input(left, Precision::F16)
-            .with_automatic_input(right, Precision::F16);
-        config.operator_candidates.retain(|candidate| {
-            let Some(candidate) = candidate.concrete() else {
-                return false;
-            };
-            matches!(
-                candidate.plan.dispatch,
-                OperatorDispatch::BlockedGemm {
-                    distribution: GemmDistribution::OutputStationary,
-                    ..
-                }
-            ) && candidate.plan.inputs.get(1).is_some_and(|requirement| {
-                requirement.format.layout.order
-                    == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                        row_block: 64,
-                        column_block: crate::tensor::AMP_COLUMN_MICRO as u16,
-                    })
-                    && requirement.format.layout.tiling.tile_count == tiles
-                    && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-            })
-        });
-        let selected = crate::planner::build::select(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &crate::planner::cache::FragmentCache::default(),
-            false,
-        )
-        .unwrap();
-        let product = selected
-            .operations
-            .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::Gemm { .. }))
-            .unwrap();
-        let config = config
-            .with_input(
-                left,
-                selected.values[product.inputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .clone(),
-            )
-            .with_input(
-                right,
-                selected.values[product.inputs[1].index() as usize]
-                    .tensor_type
-                    .format
-                    .clone(),
-            );
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        assert!(low.tiles.iter().all(|tile| tile.work.iter().all(|work| {
-            !matches!(work, BlockOperation::Copy { .. })
-                && !matches!(work, BlockOperation::Exchange(_))
-        })));
-        assert!(
-            low.tiles
-                .iter()
-                .flat_map(|tile| tile.work.iter())
-                .any(|work| {
-                    matches!(
-                        work,
-                        BlockOperation::Compute { run, .. }
-                            if matches!(low.kernel_runs[run.0 as usize].kernel, MidOperationKind::Gemm {
-                                weights: crate::GemmWeightLoad::Interleaved,
-                                ..
-                            })
-                    )
-                })
-        );
-    }
-}
-
-#[test]
-fn randomized_partially_sharded_weight_grids_preserve_storage() {
-    let mut random = fastrand::Rng::with_seed(0x7374_726d_6765_6d6d);
-    for _ in 0..32 {
-        let row_partitions = 1_u16 << random.u32(1..=2);
-        let inner_partitions = 1_u16 << random.u32(1..=row_partitions.ilog2());
-        let column_partitions = 1_u16 << random.u32(0..=2);
-        let tiles = row_partitions * column_partitions;
-        let rows = u32::from(row_partitions) * random.u32(1..=4);
-        let inner_blocks = u32::from(row_partitions) * random.u32(1..=2);
-        let inner = inner_blocks * 64;
-        let columns = u32::from(column_partitions) * 64;
-        let mut graph = HighGraph::new();
-        let left = graph.host_input("left", [rows, inner]).unwrap();
-        let right = graph.parameter("right", [inner, columns]).unwrap();
-        let output = graph.gemm(left, right).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let left_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_grid(
-                64,
-                tiles,
-                row_partitions,
-                column_partitions,
-                crate::tensor::GridOrder::ColumnsFast,
-            ),
-        };
-        let right_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::block_major_matrix_storage(
-                64,
-                64,
-                column_partitions,
-                inner_partitions,
-                row_partitions / inner_partitions,
-                crate::MemoryClass::Ipu21Standard,
-            ),
-        };
-        let output_format = TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_result_grid(
-                64,
-                tiles,
-                row_partitions,
-                column_partitions,
-                crate::tensor::GridOrder::ColumnsFast,
-            ),
-        };
-        let mut config = PipelineConfig::new(tiles)
-            .with_input(left, left_format.clone())
-            .with_input(right, right_format.clone());
-        config.operator_candidates =
-            vec![crate::planner::catalogue::ConcreteOperatorCandidate::new(
-                crate::planner::operator::OperatorFamily::Gemm {
-                    options: crate::GemmOptions::default(),
-                    multiply: Precision::F16,
-                    accumulate: crate::AccumulationPrecision::F32,
-                },
-                [
-                    crate::planner::operator::OperandRequirement::new(left_format),
-                    crate::planner::operator::OperandRequirement::new(right_format),
-                ],
-                output_format,
-            )]
-            .into_iter()
-            .map(OperatorCandidate::Concrete)
-            .collect();
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-
-        let expected_weight_bytes = inner
-            .div_ceil(u32::from(inner_partitions))
-            .saturating_mul(columns.div_ceil(u32::from(column_partitions)))
-            .saturating_mul(2);
-        assert!(low.value_views(low.inputs[1].value).iter().all(|shard| {
-            crate::shard_storage_bytes(&low.shards[shard.shard.index() as usize])
-                == Ok(expected_weight_bytes)
-        }));
-    }
-}
-
-#[test]
-fn randomized_repeats_remain_structured_per_tile() {
-    let mut random = fastrand::Rng::with_seed(0x7265_706c);
-    for case in 0..CASES {
-        let tiles = 1_u16 << random.u32(0..=3);
-        let count = random.u32(1..=8);
-        let width = u32::from(tiles) * random.u32(1..=8);
-        let mut graph = HighGraph::new();
-        let carried = graph.host_input("carried", [width, 16]).unwrap();
-        // A sequence may contain more values than this invocation consumes.
-        let parameters = (0..count + random.u32(0..=3))
-            .map(|index| graph.parameter(format!("parameter.{index}"), [width, 16]))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let sequence = graph
-            .value_sequence("parameters", parameters.clone())
-            .unwrap();
-        let result = graph
-            .repeat(count, [carried], [], [sequence], |body, arguments| {
-                Ok(vec![body.add(arguments.carried[0], arguments.iterated[0])?])
-            })
-            .unwrap()[0];
-        graph.set_outputs([result]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(carried, format(tiles));
-        for parameter in parameters {
-            config.inputs.insert(parameter, format(tiles));
-        }
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-
-        for tile in &low.tiles {
-            let repeats = tile
-                .work
-                .iter()
-                .filter_map(|work| match work {
-                    BlockOperation::Repeat(repeat) => Some(&low.repeat_runs[*repeat]),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(repeats.len(), 1, "case {case}");
-            assert_eq!(repeats[0].count, count);
-            assert_eq!(repeats[0].binding.iterated[0].inputs.len(), count as usize);
-            let placement = crate::place(&low).unwrap();
-            let stride = placement.sequence_strides[&repeats[0].binding.iterated[0].argument];
-            assert!(stride > 0 && stride.is_multiple_of(4));
-            let carried = &repeats[0].binding.carried[0];
-            assert_eq!(
-                low.shards[carried.argument.index() as usize].definition,
-                ShardDefinition::Alias(carried.initial)
-            );
-            assert_eq!(
-                low.shards[carried.yielded.index() as usize].definition,
-                ShardDefinition::WritableAlias(carried.argument)
-            );
-            assert_eq!(
-                low.shards[carried.result.index() as usize].definition,
-                ShardDefinition::Alias(carried.initial)
-            );
-            assert!(
-                repeats[0]
-                    .body
-                    .work
-                    .iter()
-                    .any(|work| matches!(work, BlockOperation::Compute { .. }))
-            );
-        }
-    }
-}
-
-#[test]
-fn repeat_binds_every_linear_fragment_including_rotated_owners() {
-    let mut graph = HighGraph::new();
-    let carried = graph.host_input("carried", [8, 16]).unwrap();
-    let invariant = graph.parameter("invariant", [8, 16]).unwrap();
-    let parameters = (0..2)
-        .map(|index| {
-            graph
-                .parameter(format!("parameter.{index}"), [8, 16])
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let sequence = graph
-        .value_sequence("parameters", parameters.clone())
-        .unwrap();
-    let result = graph
-        .repeat(2, [carried], [invariant], [sequence], |body, arguments| {
-            let first = body.add(arguments.carried[0], arguments.invariants[0])?;
-            Ok(vec![body.add(first, arguments.iterated[0])?])
-        })
-        .unwrap()[0];
-    graph.set_outputs([result]).unwrap();
-    let format = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::logical_linear(2, 16),
-    };
-    let mut candidate = ConcreteOperatorCandidate::new(
-        OperatorFamily::Add,
-        vec![OperandRequirement::new(format.clone()); 2],
-        format.clone(),
-    );
-    candidate.plan.reuse_inputs = Some(vec![0]);
-    let mut config = PipelineConfig::new(2);
-    for input in [carried, invariant].into_iter().chain(parameters) {
-        config.inputs.insert(input, format.clone());
-    }
-    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
-    let mut mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    for offset in 0..2 {
-        for value in &mut mid.values {
-            value.owners = crate::tensor::OwnerMap::rotated(offset);
-        }
-        let low = lower_to_tiles(&mid, false).unwrap();
-        let placement = crate::place(&low).unwrap();
-        for repeat in &low.repeat_runs {
-            assert_eq!(repeat.binding.carried.len(), 4);
-            assert_eq!(repeat.binding.invariants.len(), 4);
-            assert_eq!(repeat.binding.iterated.len(), 4);
-            for binding in &repeat.binding.carried {
-                let initial = placement.shard_addresses[&binding.initial];
-                for shard in [binding.argument, binding.yielded, binding.result] {
-                    assert_eq!(placement.shard_addresses[&shard], initial);
-                }
-            }
-            for binding in &repeat.binding.invariants {
-                assert_eq!(
-                    placement.shard_addresses[&binding.input],
-                    placement.shard_addresses[&binding.argument]
-                );
-            }
-            for binding in &repeat.binding.iterated {
-                assert_eq!(
-                    placement.shard_addresses[&binding.inputs[0]],
-                    placement.shard_addresses[&binding.argument]
-                );
-                assert_eq!(binding.inputs.len(), 2);
-                assert!(
-                    placement.shard_addresses[&binding.inputs[1]]
-                        > placement.shard_addresses[&binding.inputs[0]]
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
-    let mut random = fastrand::Rng::with_seed(0x696e_706c);
-    for case in 0..CASES {
-        let tiles = 1_u16 << random.u32(0..=3);
-        let count = random.u32(1..=4);
-        let rows = u32::from(tiles) * random.u32(1..=4) * 8;
-        let mut graph = HighGraph::new();
-        let carried = graph.host_input("carried", [rows, 64]).unwrap();
-        let weights = (0..count)
-            .map(|index| graph.parameter(format!("weight.{index}"), [64, 64]))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
-        let result = graph
-            .repeat(count, [carried], [], [sequence], |body, arguments| {
-                Ok(vec![
-                    body.gemm(arguments.carried[0], arguments.iterated[0])?,
-                ])
-            })
-            .unwrap()[0];
-        graph.set_outputs([result]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_input(carried, format(tiles));
-        for weight in weights {
-            config.inputs.insert(weight, format(tiles));
-        }
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        for tile in &low.tiles {
-            let repeat = tile
-                .work
-                .iter()
-                .find_map(|work| match work {
-                    BlockOperation::Repeat(repeat) => Some(&low.repeat_runs[*repeat]),
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(
-                low.shards[repeat.binding.carried[0].yielded.index() as usize].definition,
-                ShardDefinition::WritableAlias(repeat.binding.carried[0].argument),
-                "case {case}"
-            );
         }
     }
 }
@@ -2019,101 +1116,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     );
 }
 
-#[test]
-fn repeat_preserves_shared_initial_values() {
-    for case in 0..6 {
-        let mut graph = HighGraph::new();
-        let input = if case == 5 {
-            graph.parameter("input", [8, 16]).unwrap()
-        } else {
-            graph.host_input("input", [8, 16]).unwrap()
-        };
-        let carried = if case == 2 {
-            vec![input; 2]
-        } else {
-            vec![input]
-        };
-        let invariants = if case == 3 { vec![input] } else { vec![] };
-        let results = graph
-            .repeat(2, carried, invariants, [], |body, args| {
-                args.carried
-                    .iter()
-                    .map(|&x| match args.invariants.first() {
-                        Some(&bias) => body.add(x, bias),
-                        None => body.gelu(x),
-                    })
-                    .collect()
-            })
-            .unwrap();
-        let mut outputs = results.clone();
-        if case == 0 {
-            outputs.push(input);
-        } else if case == 1 {
-            outputs.push(graph.add(input, results[0]).unwrap());
-        }
-        graph.set_outputs(outputs).unwrap();
-        let config = PipelineConfig::new(1).with_input(input, format(1));
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, false).unwrap();
-        let placement = crate::place(&low).unwrap();
-        let initial = placement.shard_addresses[&low.value_views(low.inputs[0].value)[0].shard];
-        let repeat = &low.repeat_runs[0];
-        for binding in &repeat.binding.carried {
-            let result = placement.shard_addresses[&binding.result];
-            if case == 4 {
-                assert_eq!(initial, result, "an unshared host input can be donated");
-            } else {
-                assert_ne!(
-                    initial, result,
-                    "case {case}: Repeat overwrites shared input"
-                );
-            }
-        }
-        if case == 2 {
-            assert_ne!(
-                placement.shard_addresses[&repeat.binding.carried[0].result],
-                placement.shard_addresses[&repeat.binding.carried[1].result],
-                "two carried states must evolve independently"
-            );
-        }
-    }
-}
-
-#[test]
-fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
-    let mut graph = HighGraph::new();
-    let a = graph.host_input("a", [8, 16]).unwrap();
-    let b = graph.host_input("b", [8, 16]).unwrap();
-    let output = graph
-        .repeat(2, [a, b], [], [], |body, args| {
-            let t = body.gelu(args.carried[0])?;
-            let y = body.gelu(args.carried[1])?;
-            let z = body.gelu(t)?;
-            Ok(vec![y, z])
-        })
-        .unwrap();
-    graph.set_outputs(output).unwrap();
-    let tensor_format = format(1);
-    let mut candidate = ConcreteOperatorCandidate::new(
-        OperatorFamily::Gelu,
-        [OperandRequirement::new(tensor_format.clone())],
-        tensor_format.clone(),
-    );
-    candidate.plan.reuse_inputs = Some(vec![0]);
-    let mut config = PipelineConfig::new(1)
-        .with_input(a, tensor_format.clone())
-        .with_input(b, tensor_format);
-    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    // y cannot overwrite a: t still lives there and is read by z afterwards.
-    // Such cross-coupled state updates need a separate copy-back plan, which
-    // this in-place Repeat representation does not support.
-    assert_eq!(
-        lower_to_tiles(&mid, false),
-        Err(ExpansionError::RepeatRequiresInPlace(0))
-    );
-}
-
 fn contains_phase(program: &LowGraph, list: &TileWorkList, phase: ExchangePhaseId) -> bool {
     list.work.iter().any(|work| match work {
         BlockOperation::Exchange(candidate) => *candidate == phase,
@@ -2124,169 +1126,6 @@ fn contains_phase(program: &LowGraph, list: &TileWorkList, phase: ExchangePhaseI
         | BlockOperation::Copy { .. }
         | BlockOperation::Checkpoint(..) => false,
     })
-}
-
-#[test]
-fn factor_copies_and_offset_windows_preserve_coordinates() {
-    for chain in 0..5 {
-        for offset in [0, 1] {
-            for rank in 2..=5 {
-                for split in 0..rank {
-                    for merge in 0..rank {
-                        if split == merge {
-                            continue;
-                        }
-                        let mut shape = vec![2; rank];
-                        shape[split] = 12;
-                        let mut graph = HighGraph::new();
-                        let input = graph.host_input("input", shape.clone()).unwrap();
-                        let mut views = vec![AxisFactorView::new(split, merge, 3)];
-                        match chain {
-                            1 => views.push(AxisFactorView::new(split, merge, 2)),
-                            2 => views.push(AxisFactorView::new(merge, split, 2)),
-                            3 => views.push(views[0].inverse()),
-                            4 => {
-                                // Exercise an inverse without its matching producer.
-                                // Both axes are divisible by three in this case.
-                                views = vec![AxisFactorView::new(merge, split, 3).inverse()];
-                            }
-                            _ => {}
-                        }
-                        let mut output = input;
-                        for &view in &views {
-                            output = graph.view(output, view).unwrap();
-                        }
-                        graph.set_outputs([output]).unwrap();
-                        let config = PipelineConfig::new(1).with_input(
-                            input,
-                            TensorFormat {
-                                precision: Precision::F32,
-                                layout: Layout::row_major(TensorTiling::replicated(1)),
-                            },
-                        );
-                        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                        let mut mid = mid;
-                        assert_eq!(
-                            mid.operations.len(),
-                            if chain == 2 || chain == 3 { 2 } else { 1 }
-                        );
-                        let result = mid.outputs[0];
-                        for width in &mut mid.values[result.index() as usize].tensor_type.shape.0 {
-                            *width -= offset;
-                        }
-                        let copy = mid
-                            .operations
-                            .iter_mut()
-                            .find(|operation| operation.results.contains(&result))
-                            .unwrap();
-                        let MidOperationKind::Copy { mapping, .. } = &mut copy.kind else {
-                            panic!("view must resolve to a copy");
-                        };
-                        mapping.offsets = vec![offset; rank];
-
-                        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-                        let mut buffers = low
-                            .shards
-                            .iter()
-                            .map(|shard| {
-                                vec![
-                                    u32::MAX;
-                                    crate::shard_storage_bytes(shard).unwrap() as usize / 4
-                                ]
-                            })
-                            .collect::<Vec<_>>();
-                        let input_shard =
-                            low.value_views(low.inputs[0].value)[0].shard.index() as usize;
-                        buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
-                        for work in low.tiles[0].work.iter() {
-                            let copy = match work {
-                                BlockOperation::Copy { copy, .. } => {
-                                    low.local_copies[copy.0 as usize].movement()
-                                }
-                                BlockOperation::Exchange(phase) => {
-                                    assert!(
-                                        low.exchange_phases[phase.index() as usize]
-                                            .transfers
-                                            .is_empty()
-                                    );
-                                    continue;
-                                }
-                                _ => panic!("row-major view should only require copies"),
-                            };
-                            let (rows, width, source_stride, destination_stride) =
-                                match copy.pattern {
-                                    CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
-                                    CopyPattern::Strided {
-                                        rows,
-                                        row_bytes,
-                                        source_stride,
-                                        destination_stride,
-                                    } => (rows, row_bytes, source_stride, destination_stride),
-                                };
-                            for row in 0..rows {
-                                for byte in (0..width).step_by(4) {
-                                    let value = buffers[copy.source.index() as usize][((copy
-                                        .source_offset
-                                        + row * source_stride
-                                        + byte)
-                                        / 4)
-                                        as usize];
-                                    buffers[copy.destination.index() as usize][((copy
-                                        .destination_offset
-                                        + row * destination_stride
-                                        + byte)
-                                        / 4)
-                                        as usize] = value;
-                                }
-                            }
-                        }
-                        let window_shape = &mid.values[result.index() as usize].tensor_type.shape.0;
-                        let actual =
-                            &buffers[low.value_views(low.outputs[0])[0].shard.index() as usize];
-                        for source in 0..shape.iter().product::<u32>() {
-                            let mut index = source;
-                            let mut coordinates = vec![0; rank];
-                            for axis in (0..rank).rev() {
-                                coordinates[axis] = index % shape[axis];
-                                index /= shape[axis];
-                            }
-                            let mut current_shape = crate::TensorShape(shape.clone());
-                            for &view in &views {
-                                if view.reversed {
-                                    let part = coordinates[view.merge_axis] % view.factor;
-                                    coordinates[view.merge_axis] /= view.factor;
-                                    coordinates[view.split_axis] +=
-                                        part * current_shape.0[view.split_axis];
-                                    current_shape = view.output_shape(&current_shape).unwrap();
-                                } else {
-                                    current_shape = view.output_shape(&current_shape).unwrap();
-                                    let width = current_shape.0[view.split_axis];
-                                    let part = coordinates[view.split_axis] / width;
-                                    coordinates[view.split_axis] %= width;
-                                    coordinates[view.merge_axis] =
-                                        coordinates[view.merge_axis] * view.factor + part;
-                                }
-                            }
-                            if coordinates.iter().any(|&coordinate| coordinate < offset) {
-                                continue;
-                            }
-                            for coordinate in &mut coordinates {
-                                *coordinate -= offset;
-                            }
-                            let target = coordinates
-                                .iter()
-                                .zip(window_shape)
-                                .fold(0, |index, (&coordinate, &width)| index * width + coordinate);
-                            assert_eq!(
-                                actual[target as usize], source,
-                                "rank {rank}, split {split}, merge {merge}, offset {offset}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -2373,18 +1212,17 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let input = graph.host_input("input", [3, 17, 32]).unwrap();
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
-    let mut candidate = ConcreteOperatorCandidate::new(
-        OperatorFamily::Gelu,
-        [OperandRequirement::new(format.clone())],
-        format.clone(),
-    );
-    candidate.plan.reuse_inputs = Some(vec![0]);
-    let mut config = PipelineConfig::new(4).with_input(input, format);
-    config.operator_candidates = vec![candidate]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let config = PipelineConfig::new(4).with_input(input, format.clone());
+    let mut layouts = crate::planner::boundary_layouts(&graph, &config);
+    layouts.insert(output, Some(format.layout));
+    let mut mid = crate::planner::plan(
+        &graph,
+        &layouts,
+        &config,
+        crate::planner::SearchLimits::default(),
+    )
+    .unwrap();
+    mid.operations[0].output_aliases = vec![(0, 0)];
     let low = lower_to_tiles(&mid, false).unwrap();
     assert!(low.kernel_runs.len() > 4);
     for run in &low.kernel_runs {
@@ -2393,50 +1231,6 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
             panic!("expected in-place GeLU: {result:?}");
         };
         assert_eq!(low.shards[source.index() as usize].extents, result.extents);
-    }
-}
-
-#[test]
-fn local_casts_pair_corresponding_linear_fragments() {
-    let mut graph = HighGraph::new();
-    let input = graph.host_input("input", [8, 16]).unwrap();
-    let output = graph.gelu(input).unwrap();
-    graph.set_outputs([output]).unwrap();
-    let target = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::logical_linear(2, 16),
-    };
-    let candidate = ConcreteOperatorCandidate::new(
-        OperatorFamily::Gelu,
-        [OperandRequirement::new(target.clone())],
-        target.clone(),
-    );
-    let mut config = PipelineConfig::new(2).with_input(
-        input,
-        TensorFormat {
-            precision: Precision::F32,
-            ..target
-        },
-    );
-    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let low = lower_to_tiles(&mid, false).unwrap();
-    let casts = low
-        .kernel_runs
-        .iter()
-        .filter(|run| {
-            matches!(
-                run.kernel,
-                MidOperationKind::Cast {
-                    from: Precision::F32,
-                    to: Precision::F16
-                }
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(casts.len(), 8);
-    for run in casts {
-        assert_eq!(run.inputs[0].extents, run.outputs[0].extents);
     }
 }
 

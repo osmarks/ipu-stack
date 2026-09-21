@@ -1,5 +1,5 @@
 //! Bind executable work to enclosing inputs and return its actual result values.
-use super::{MidOperation, MidGraph, MidValue, MidValueId};
+use super::{MidGraph, MidOperation, MidValue, MidValueId};
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidOperationKind;
 use crate::tensor::OwnerMap;
@@ -9,12 +9,13 @@ use crate::tensor::OwnerMap;
 /// the ordinary ownership pass, rather than by preallocating boundary slots.
 /// Returning an input or returning one value twice needs no extra operation.
 /// Failure leaves both caller vectors unchanged.
+/// A missing origin override preserves per-value origins in multi-operation fragments.
 pub(crate) fn append_fragment(
     fragment: &MidGraph,
     inputs: &[MidValueId],
     working: &OwnerMap,
     source: Option<OperationId>,
-    origin: ValueId,
+    origin: Option<ValueId>,
     tile_count: u16,
     values: &mut Vec<MidValue>,
     operations: &mut Vec<MidOperation>,
@@ -90,7 +91,9 @@ pub(crate) fn append_fragment(
             .ok()?;
         value.id = ids[value.id.index() as usize];
         value.storage_group = *storage_group;
-        value.origin = origin;
+        if let Some(origin) = origin {
+            value.origin = origin;
+        }
     }
     let mut bound = fragment.operations.clone();
     remap_operations(&mut bound, &ids, source);
@@ -136,8 +139,8 @@ mod tests {
     use crate::graph::{GraphInputKind, ValueId};
 
     use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat, OperandIndexing};
-    use crate::{CopyPolicy, PackingPolicy};
     use crate::tensor::{Layout, Precision, TensorType};
+    use crate::{CopyPolicy, PackingPolicy};
 
     fn id(i: u32) -> MidValueId {
         MidValueId::from_index(i)
@@ -353,7 +356,7 @@ mod tests {
             &[id(0)],
             &working,
             Some(graph.operations()[0].id),
-            ValueId::from_index(0),
+            Some(ValueId::from_index(0)),
             bound.tile_count,
             &mut bound.values,
             &mut bound.operations,
@@ -377,7 +380,7 @@ mod tests {
                 &[id(0)],
                 &crate::tensor::OwnerMap::embedded(vec![2]),
                 None,
-                ValueId::from_index(0),
+                Some(ValueId::from_index(0)),
                 invalid.tile_count,
                 &mut invalid.values,
                 &mut invalid.operations
@@ -412,7 +415,7 @@ mod tests {
                 &[id(2), id(3), id(4)],
                 &working,
                 None,
-                ValueId::from_index(5),
+                Some(ValueId::from_index(5)),
                 bound.tile_count,
                 &mut bound.values,
                 &mut bound.operations,
@@ -471,7 +474,7 @@ mod tests {
                     &[id(2), id(3), id(4)],
                     &crate::tensor::OwnerMap::default(),
                     None,
-                    ValueId::from_index(5),
+                    Some(ValueId::from_index(5)),
                     bound.tile_count,
                     &mut bound.values,
                     &mut bound.operations
@@ -502,7 +505,7 @@ mod tests {
             &[id(1)],
             &crate::tensor::OwnerMap::default(),
             None,
-            ValueId::from_index(0),
+            Some(ValueId::from_index(0)),
             1,
             &mut bound.values,
             &mut bound.operations,

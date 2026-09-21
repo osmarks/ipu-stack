@@ -2,11 +2,9 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, AttentionProducts, AttentionStrategy, AxisFactorView, BlockMajorOrder,
-    CompiledPackage, HighGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
-    MemoryClass, OperatorFamily, PackageConfig, PipelineConfig, Precision, ReductionStaging,
-    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
-    build_package,
+    AmpOrder, AxisFactorView, BlockMajorOrder, CompiledPackage, DiagnosticTensor, HighGraph,
+    Layout, PackageConfig, PipelineConfig, Precision, TensorFormat, amp_matrix_coordinates,
+    block_major_matrix_coordinates, build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -58,9 +56,6 @@ struct Arguments {
     /// Load named logical tensors and independent expected outputs from a fixture manifest.
     #[arg(long, requires = "reference_run", conflicts_with_all = ["diagnostic_run", "save_reference_inputs", "profile_output"])]
     reference_fixture: Option<PathBuf>,
-    /// Fixed shared-operand scales produced by calibrate_siglip_fixture.py.
-    #[arg(long, requires = "reference_fixture", conflicts_with = "fp8_scale")]
-    reference_calibration: Option<PathBuf>,
     /// Save packed weights, input and validated output for resident inference replay.
     #[arg(long, requires = "reference_run")]
     save_reference_inputs: Option<PathBuf>,
@@ -112,12 +107,6 @@ struct Arguments {
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
-    /// Force eligible one-use layout conversions to stream into consumer slices.
-    #[arg(long, conflicts_with = "materialize_conversions")]
-    stream_conversions: bool,
-    /// Materialize eligible layout conversions before their consumers.
-    #[arg(long, conflicts_with = "stream_conversions")]
-    materialize_conversions: bool,
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
@@ -127,27 +116,17 @@ struct Arguments {
     /// Cap geometry-derived static transfer fragments per tile (default 16384).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_transfer_limit_per_tile: Option<u64>,
-    /// Per-operator candidate catalogue breadth (default comes from PipelineConfig).
-    #[arg(long, conflicts_with = "reuse_package")]
-    operator_candidate_limit: Option<usize>,
-    /// Use the experimental capacity-first baseline.
-    #[arg(long)]
-    capacity_baseline: bool,
     /// Use compact exchange rows with endpoint-balanced waves of this many words.
     #[arg(long)]
     exchange_stream_words: Option<std::num::NonZeroU32>,
-    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION.
-    #[arg(
-        long,
-        value_parser = parse_gemm_plan_constraint,
-        conflicts_with = "reuse_package"
-    )]
-    gemm_plan_constraint: Vec<GemmPlanConstraint>,
     /// JSON array mapping planned tile indices to execution tile indices.
     #[arg(long)]
     tile_mapping: Option<PathBuf>,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
+    /// Rows per tile in the Add/GeLU planner fixture; one permits BiasGeLU fusion.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+    elementwise_rows_per_tile: u32,
     #[arg(long)]
     runtime_source: Option<PathBuf>,
     #[arg(long, default_value_t = 10)]
@@ -169,24 +148,6 @@ struct Arguments {
     /// Sequential projected attention blocks, represented by one structured repeat.
     #[arg(long, default_value_t = 1)]
     attention_blocks: u32,
-    /// Restrict attention planning for controlled strategy comparisons.
-    #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
-    attention_strategy: AttentionMode,
-    /// Compare shared row ownership with independent materialized QK/PV grids.
-    #[arg(long, value_enum, default_value = "auto")]
-    attention_products: AttentionProductMode,
-    /// Experimental materialized QK operand scale (native F143/F16 accumulation).
-    #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
-    attention_qk_fp8_scale: Option<i8>,
-    /// Experimental materialized PV scale, with fused FP8 probability output and FP32 softmax statistics.
-    #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
-    attention_pv_fp8_scale: Option<i8>,
-    /// Compare native and packed GEMM stores, or force one for diagnostics.
-    #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
-    gemm_output_packing: String,
-    /// Group up to this many independent reductions (zero disables grouping).
-    #[arg(long, default_value_t = 0)]
-    parallel_reductions: usize,
     /// Fuse shared-input QKV projections (and MAP KV) in attention and ViT benchmarks.
     #[arg(long)]
     fuse_qkv: bool,
@@ -266,6 +227,8 @@ enum Workload {
     BatchedGemmSmoke,
     /// Numerically verify GEMM-GeLU-GEMM-GeLU with Gaussian data.
     MlpSmoke,
+    /// Verify planned Add/GeLU, residual lifetimes, fusion and redistribution.
+    ElementwiseSmoke,
     /// Numerically verify exact non-causal FP16 FlashAttention.
     AttentionSmoke,
     /// Profile one compute-dense F16 GEMM.
@@ -294,43 +257,6 @@ enum ExchangeStressPattern {
     Loopback,
     /// Paired 64-bit sends across the standard/interleaved SRAM bank matrix.
     Wide,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum AttentionMode {
-    Auto,
-    Flash,
-    Materialized,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum AttentionProductMode {
-    Auto,
-    SharedRows,
-    QkOnly,
-    PvOnly,
-    Independent,
-}
-impl From<AttentionProductMode> for AttentionProducts {
-    fn from(value: AttentionProductMode) -> Self {
-        match value {
-            AttentionProductMode::Auto => Self::Automatic,
-            AttentionProductMode::SharedRows => Self::SharedRows,
-            AttentionProductMode::QkOnly => Self::QkOnly,
-            AttentionProductMode::PvOnly => Self::PvOnly,
-            AttentionProductMode::Independent => Self::Independent,
-        }
-    }
-}
-
-impl From<AttentionMode> for AttentionStrategy {
-    fn from(value: AttentionMode) -> Self {
-        match value {
-            AttentionMode::Auto => Self::Automatic,
-            AttentionMode::Flash => Self::Flash,
-            AttentionMode::Materialized => Self::Materialized,
-        }
-    }
 }
 
 impl Workload {
@@ -363,81 +289,6 @@ fn mlp_weight_name(blocks: u32, block: u32, projection: u32) -> String {
     } else {
         format!("right.{block}.{projection}")
     }
-}
-
-fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String> {
-    let fields = value.split(':').collect::<Vec<_>>();
-    let [
-        operation,
-        grid,
-        result_grid,
-        columns,
-        memory,
-        orientation,
-        reduction,
-    ] = fields.as_slice()
-    else {
-        return Err("expected OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION".into());
-    };
-    let grid = grid
-        .split('x')
-        .map(|field| field.parse::<u16>().map_err(|error| error.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let [row_partitions, column_partitions, inner_partitions] = grid.as_slice() else {
-        return Err("GEMM grid must be ROWSxCOLUMNSxINNER".into());
-    };
-    let result_grid = result_grid
-        .split('x')
-        .map(|field| field.parse::<u16>().map_err(|error| error.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let [result_row_partitions, result_column_partitions] = result_grid.as_slice() else {
-        return Err("result grid must be ROWSxCOLUMNS".into());
-    };
-    let nonzero = [
-        *row_partitions,
-        *column_partitions,
-        *inner_partitions,
-        *result_row_partitions,
-        *result_column_partitions,
-    ];
-    if nonzero.contains(&0) {
-        return Err("GEMM and result grid partitions must be nonzero".into());
-    }
-    let output_column_block = columns.parse::<u32>().map_err(|error| error.to_string())?;
-    if output_column_block == 0 {
-        return Err("GEMM output column block must be nonzero".into());
-    }
-    Ok(GemmPlanConstraint {
-        source_operation: operation
-            .parse::<u32>()
-            .map_err(|error| error.to_string())?,
-        orientation: match *orientation {
-            "normal" => GemmOrientation::Normal,
-            "swapped" => GemmOrientation::Swapped,
-            _ => return Err("orientation must be normal or swapped".into()),
-        },
-        row_partitions: *row_partitions,
-        column_partitions: *column_partitions,
-        inner_partitions: *inner_partitions,
-        result_row_partitions: *result_row_partitions,
-        result_column_partitions: *result_column_partitions,
-        output_column_block,
-        weight_memory_class: match *memory {
-            "standard" => MemoryClass::Ipu21Standard,
-            "interleaved" => MemoryClass::Ipu21Interleaved,
-            _ => return Err("memory must be standard or interleaved".into()),
-        },
-        reduction_staging: match *reduction {
-            "complete" => ReductionStaging::Complete,
-            "streamed" => ReductionStaging::Streamed,
-            value if value.starts_with("batch-") => ReductionStaging::Batched(
-                value[6..]
-                    .parse()
-                    .map_err(|_| "batch size must be a nonzero u16")?,
-            ),
-            _ => return Err("reduction must be complete, streamed, or batch-N".into()),
-        },
-    })
 }
 
 fn main() -> Result<()> {
@@ -495,6 +346,7 @@ fn main() -> Result<()> {
             Workload::GemmSmoke
                 | Workload::BatchedGemmSmoke
                 | Workload::MlpSmoke
+                | Workload::ElementwiseSmoke
                 | Workload::GemmBenchmark
                 | Workload::SiglipAttentionBenchmark
                 | Workload::SiglipVitBenchmark
@@ -661,28 +513,13 @@ fn main() -> Result<()> {
 
     let mut graph = HighGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
-    if let Some(width) = arguments.operator_candidate_limit {
-        pipeline = pipeline.with_operator_candidate_limit(width);
-    }
-    pipeline.capacity_baseline = arguments.capacity_baseline;
-    pipeline.reuse_cast_inputs = arguments.capacity_baseline;
-    pipeline.exchange_stream_words = arguments.exchange_stream_words;
-    pipeline.parallel_reductions = arguments.parallel_reductions;
-    pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
-        "native" => ipu_codegen::GemmOutputPacking::Native,
-        "packed" => ipu_codegen::GemmOutputPacking::Packed,
-        _ => ipu_codegen::GemmOutputPacking::Automatic,
+    // The planner currently requires explicit boundary formats. Benchmark
+    // graphs without dedicated formats start from a distributed linear layout.
+    let default_input = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::logical_linear(active_tiles, 4),
     };
-    pipeline = pipeline
-        .with_attention_strategy(arguments.attention_strategy.into())
-        .with_attention_products(arguments.attention_products.into());
-    pipeline.attention_fp8_scales = [
-        arguments.attention_qk_fp8_scale,
-        arguments.attention_pv_fp8_scale,
-    ];
-    for constraint in &arguments.gemm_plan_constraint {
-        pipeline = pipeline.with_gemm_plan_constraint(*constraint);
-    }
+    pipeline.exchange_stream_words = arguments.exchange_stream_words;
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);
@@ -694,11 +531,6 @@ fn main() -> Result<()> {
     }
     if let Some(limit) = arguments.exchange_transfer_limit_per_tile {
         pipeline.exchange_transfer_limit_per_tile = limit;
-    }
-    if arguments.stream_conversions {
-        pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
-    } else if arguments.materialize_conversions {
-        pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
     }
     if matches!(
         arguments.workload,
@@ -726,6 +558,38 @@ fn main() -> Result<()> {
                 TensorFormat {
                     precision: Precision::F16,
                     layout: Layout::block_major_matrix(64, active_tiles),
+                },
+            );
+    } else if matches!(arguments.workload, Workload::ElementwiseSmoke) {
+        // Different input ownership requires movement; 104 columns exercises
+        // worker tails. The first sum escapes fusion through the residual,
+        // whereas the final Add/GeLU pair can fuse.
+        let shape = [
+            u32::from(active_tiles)
+                .checked_mul(arguments.elementwise_rows_per_tile)
+                .context("elementwise row count overflow")?,
+            104,
+        ];
+        let input = graph.host_input("input", shape)?;
+        let weight = graph.parameter("weight", shape)?;
+        let sum = graph.add(input, weight)?;
+        let activated = graph.gelu(sum)?;
+        let residual = graph.add(activated, sum)?;
+        let output = graph.gelu(residual)?;
+        graph.set_outputs([output])?;
+        pipeline = pipeline
+            .with_input(
+                input,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::row_sharded((active_tiles / 2).max(1)),
+                },
+            )
+            .with_input(
+                weight,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::row_sharded(active_tiles),
                 },
             );
     } else if matches!(arguments.workload, Workload::MlpSmoke) {
@@ -783,7 +647,7 @@ fn main() -> Result<()> {
                         .checked_mul(if arguments.fuse_qkv { 3 } else { 1 })
                         .context("QKV width overflow")?;
                     let weight = graph.parameter(name, [model_width, columns])?;
-                    pipeline = pipeline.with_automatic_input(weight, Precision::F16);
+                    pipeline = pipeline.with_input(weight, default_input.clone());
                     weights.push(weight);
                 }
             }
@@ -849,25 +713,19 @@ fn main() -> Result<()> {
                 )?[0]
             };
             graph.set_outputs([output])?;
-            pipeline = pipeline.with_automatic_input(
+            pipeline = pipeline.with_input(
                 input,
-                if arguments.attention_blocks == 1 {
-                    Precision::F16
-                } else {
-                    // The carried state is the F32 attention result. Keep that
-                    // precision across iterations; GEMMs still select F16 inputs.
-                    Precision::F32
+                TensorFormat {
+                    precision: if arguments.attention_blocks == 1 {
+                        Precision::F16
+                    } else {
+                        // The carried state is the F32 attention result. Keep that
+                        // precision across iterations; GEMMs still select F16 inputs.
+                        Precision::F32
+                    },
+                    ..default_input.clone()
                 },
             );
-            // This benchmark compares the two F16 attention strategies. Keep
-            // projection precision controlled as batch size changes instead
-            // of allowing a different GEMM precision to confound the sweep.
-            pipeline.operator_candidates.retain(|candidate| {
-                !matches!(
-                    candidate.operator(),
-                    OperatorFamily::Gemm { multiply, .. } if multiply != Precision::F16
-                )
-            });
             pipeline.profiling = !arguments.no_profile;
         } else {
             let (heads, query_rows, key_rows) = (4, 17, 19);
@@ -906,10 +764,6 @@ fn main() -> Result<()> {
                         layout: Layout::attention_output(heads, key_partitions),
                     },
                 );
-            // Exercise the tiled attention lowering and its explicit input
-            // conversions rather than the independent whole-head codelet.
-            pipeline.operator_candidates.clear();
-            pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
             pipeline.profiling = !arguments.no_profile;
         }
     } else if matches!(arguments.workload, Workload::SiglipVitBenchmark) {
@@ -917,7 +771,7 @@ fn main() -> Result<()> {
 
         pipeline.profiling = !arguments.no_profile;
         for input in graph.inputs() {
-            pipeline = pipeline.with_automatic_input(input.value, Precision::F16);
+            pipeline = pipeline.with_input(input.value, default_input.clone());
         }
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
@@ -966,9 +820,9 @@ fn main() -> Result<()> {
         };
         graph.set_outputs([output])?;
         pipeline.profiling = !arguments.no_profile;
-        pipeline = pipeline.with_automatic_input(left, Precision::F16);
+        pipeline = pipeline.with_input(left, default_input.clone());
         for weight in right0.into_iter().chain(right1) {
-            pipeline = pipeline.with_automatic_input(weight, Precision::F16);
+            pipeline = pipeline.with_input(weight, default_input.clone());
         }
     } else if matches!(arguments.workload, Workload::GemmBenchmark) {
         validate_benchmark_shape(
@@ -985,38 +839,27 @@ fn main() -> Result<()> {
         graph.set_outputs([output])?;
         pipeline.profiling = !arguments.no_profile;
         pipeline = pipeline
-            .with_automatic_input(left, Precision::F16)
-            .with_automatic_input(right, Precision::F16);
+            .with_input(left, default_input.clone())
+            .with_input(right, default_input.clone());
     }
     if let Some(scale) = arguments.fp8_scale {
         if !(-16..=15).contains(&scale) {
             bail!("FP8 operand scale must be in -16..=15 so the product scale fits the ISA");
         }
-        pipeline
-            .operator_candidates
-            .retain(|candidate| !matches!(candidate.operator(), OperatorFamily::Gemm { .. }));
-        pipeline
-            .operator_candidates
-            .push(ipu_codegen::OperatorCandidate::fp8_gemm(
-                active_tiles,
-                scale,
-            ));
         for input in graph.inputs() {
             if matches!(arguments.workload, Workload::SiglipVitBenchmark)
                 && !input.name.ends_with(".weight")
             {
                 continue;
             }
-            pipeline = pipeline.with_automatic_input(
-                input.value,
-                Precision::F8F143 {
-                    scale_exponent: scale,
-                },
-            );
+            pipeline
+                .inputs
+                .get_mut(&input.value)
+                .context("FP8 input has no boundary format")?
+                .precision = Precision::F8F143 {
+                scale_exponent: scale,
+            };
         }
-    }
-    if let Some(path) = &arguments.reference_calibration {
-        reference_fixture::configure(&graph, &mut pipeline, path)?;
     }
     pipeline.memory_profile_directory = arguments.memory_profile_directory.clone();
     pipeline.tile_mapping = arguments
@@ -1118,7 +961,10 @@ fn main() -> Result<()> {
                     arguments.reference_inferences,
                 )?;
             } else if arguments.reference_run
-                || matches!(arguments.workload, Workload::SiglipVitBenchmark)
+                || matches!(
+                    arguments.workload,
+                    Workload::SiglipVitBenchmark | Workload::ElementwiseSmoke
+                )
             {
                 let (_output, maximum_error) = run_reference(
                     &runtime,

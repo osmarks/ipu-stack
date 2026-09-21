@@ -9,7 +9,6 @@ use crate::package::{
     DiagnosticCheckpoint, PackageBuildResult, active_topology, diagnostic_tensor, package_inputs,
     package_multiply_precisions, package_precisions, validate_tile_count,
 };
-use crate::planner;
 use ipu_elf::Toolchain;
 use std::{path::PathBuf, sync::Arc};
 
@@ -138,10 +137,8 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
             Ok(std::fs::read(artifact.object)?)
         })?;
     let layouts = planner::boundary_layouts(graph, config);
-    let budgets = std::collections::BTreeMap::new();
-    // Planning will assign boundary layouts and operator budgets before construction.
     let mid = tracing::info_span!("construct_mid")
-        .in_scope(|| planner::plan(graph, &layouts, &budgets, config))?;
+        .in_scope(|| planner::plan(graph, &layouts, config, planner::SearchLimits::default()))?;
     memory_profile(graph, config, &mid, "baseline")?;
     let mut cache = crate::ExchangeScheduleCache::default();
     let expansions = Arc::new(crate::storage::GeometryCache::default());
@@ -282,8 +279,6 @@ pub use package::{
 };
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
-pub use planner::ReductionStaging;
-pub use planner::{GemmOrientation, OperatorCandidate, OperatorFamily};
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
 pub use supervisor::*;

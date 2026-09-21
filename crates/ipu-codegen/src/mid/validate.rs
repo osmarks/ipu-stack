@@ -1,7 +1,7 @@
 //! Check executable bindings at construction and rewrite boundaries. Physical
 //! address/access legality is checked later, against concrete kernel calls.
 
-use super::{MidOperation, MidGraph, MidValueId};
+use super::{MidGraph, MidOperation, MidValueId};
 use crate::OperandIndexing;
 use crate::mid::MidOperationKind;
 use std::collections::BTreeSet;
@@ -217,24 +217,64 @@ impl MidGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimate::Ipu21CostModel;
-    use crate::{HighGraph, PipelineConfig, Precision};
+    use crate::{
+        GraphInputKind, Layout, MidInput, MidRegion, MidRepeat, MidValue, OperandIndexing,
+        Precision, TensorType, ValueId,
+    };
 
     fn program(repeated: bool) -> MidGraph {
-        let mut graph = HighGraph::new();
-        let x = graph.host_input("x", [4, 16]).unwrap();
-        let y = if repeated {
-            graph
-                .repeat(3, [x], [], [], |body, args| {
-                    Ok(vec![body.gelu(args.carried[0])?])
-                })
-                .unwrap()[0]
-        } else {
-            graph.gelu(x).unwrap()
+        let id = MidValueId::from_index;
+        let gelu = MidOperation {
+            source: None,
+            inputs: vec![id(if repeated { 2 } else { 0 })],
+            results: vec![id(if repeated { 3 } else { 1 })],
+            kind: MidOperationKind::Gelu,
+            operands: vec![OperandIndexing::Elementwise { result: 0 }],
+            output_aliases: vec![],
+            output_windows: vec![],
         };
-        graph.set_outputs([y]).unwrap();
-        let config = PipelineConfig::new(4).with_automatic_input(x, Precision::F16);
-        crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap()
+        MidGraph {
+            tile_count: 4,
+            values: (0..if repeated { 4 } else { 2 })
+                .map(|i| MidValue {
+                    id: id(i),
+                    origin: ValueId::from_index(i),
+                    storage_group: id(i),
+                    owners: Default::default(),
+                    tensor_type: TensorType::new([4, 16], Precision::F16, Layout::row_sharded(4)),
+                })
+                .collect(),
+            inputs: vec![MidInput {
+                name: "x".into(),
+                kind: GraphInputKind::Host,
+                value: id(0),
+            }],
+            outputs: vec![id(1)],
+            operations: vec![if repeated {
+                MidOperation {
+                    source: None,
+                    inputs: vec![id(0)],
+                    results: vec![id(1)],
+                    kind: MidOperationKind::Repeat(MidRepeat {
+                        count: 3,
+                        carried_inputs: 1,
+                        invariant_inputs: 0,
+                        iterated_inputs: vec![],
+                        body: MidRegion {
+                            arguments: vec![id(2)],
+                            operations: vec![gelu],
+                            yields: vec![id(3)],
+                        },
+                    }),
+                    operands: vec![],
+                    output_aliases: vec![],
+                    output_windows: vec![],
+                }
+            } else {
+                gelu
+            }],
+            ..MidGraph::default()
+        }
     }
 
     #[test]

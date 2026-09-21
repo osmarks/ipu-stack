@@ -1,44 +1,9 @@
 use super::*;
-use crate::estimate::Ipu21CostModel;
 use crate::mid::MidOperationKind;
-use crate::planner::test_support::lower;
 use crate::{
     AccumulationPrecision, HighGraph, KernelRequirements, Layout, MemoryClass, PipelineConfig,
     ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower_to_tiles,
 };
-
-#[test]
-fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
-    let mut graph = HighGraph::new();
-    let x = graph.host_input("x", [8, 4, 32]).unwrap();
-    let bias = graph.host_input("bias", [1, 4, 32]).unwrap();
-    let output = graph.add(x, bias).unwrap();
-    graph.set_outputs([output]).unwrap();
-    let format = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::row_major(TensorTiling::sharded(crate::TensorAxis::FromEnd(1), 4)),
-    };
-    let config = PipelineConfig::new(4)
-        .with_input(x, format.clone())
-        .with_input(bias, format);
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-    let addresses = low
-        .shards
-        .iter()
-        .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
-        .collect();
-    for run in &low.kernel_runs {
-        if matches!(run.kernel, MidOperationKind::Add) {
-            materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
-            assert_eq!(
-                run.inputs[1].extents.last().unwrap().physical_end
-                    - run.inputs[1].extents.last().unwrap().start,
-                8
-            );
-        }
-    }
-}
 
 #[test]
 fn packed_add_keeps_padding_in_dense_operand_view() {
@@ -58,7 +23,13 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
     let config = PipelineConfig::new(2)
         .with_input(x, format.clone())
         .with_input(y, format);
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::plan(
+        &graph,
+        &crate::planner::boundary_layouts(&graph, &config),
+        &config,
+        crate::planner::SearchLimits::default(),
+    )
+    .unwrap();
     let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
     let addresses = low
         .shards
@@ -77,86 +48,6 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
         }
     }
     assert_eq!(packed_adds, 2);
-}
-
-#[test]
-fn fp8_gemms_repack_casts_and_keep_half_outputs() {
-    let fp8 = Precision::F8F143 { scale_exponent: -4 };
-    let mut graph = HighGraph::new();
-    let input = graph.host_input("input", [129, 128]).unwrap();
-    let weights = graph.parameter("weights", [128, 64]).unwrap();
-    let output = graph.gemm(input, weights).unwrap();
-    graph.set_outputs([output]).unwrap();
-    let mut config = PipelineConfig::new(64)
-        .with_input(
-            input,
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left(64, 64),
-            },
-        )
-        .with_automatic_input(weights, fp8);
-    config.operator_candidates = vec![crate::planner::OperatorCandidate::fp8_gemm(64, -4)];
-    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-    let plan = KernelObjects::from_program(&low).unwrap();
-    assert!(plan.compilations.iter().any(|compilation| {
-        compilation
-            .flags
-            .iter()
-            .any(|flag| flag == "-DGEMM_NATIVE_FP8=1")
-    }));
-    let mut casts = 0;
-    let mut gemms = 0;
-    for tile in &low.tiles {
-        for work in tile.work.iter() {
-            let BlockOperation::Compute { run, .. } = work else {
-                continue;
-            };
-            let run = &low.kernel_runs[run.0 as usize];
-            match run.kernel {
-                MidOperationKind::Cast { to, .. } if to == fp8 => {
-                    casts += 1;
-                    assert_eq!(
-                        run.requirements.inputs[0].layout.order,
-                        run.requirements.outputs[0].layout.order
-                    );
-                    assert_ne!(
-                        run.requirements.outputs[0].layout.order,
-                        ElementOrder::RowMajor
-                    );
-                    let abi = run.call(None).unwrap();
-                    assert!(abi.arguments[3] > 0);
-                }
-                MidOperationKind::Gemm {
-                    multiply,
-                    accumulate,
-                    ..
-                } => {
-                    gemms += 1;
-                    assert_eq!(multiply, fp8);
-                    assert_eq!(accumulate, AccumulationPrecision::F16);
-                    assert_eq!(run.requirements.outputs[0].precision, Precision::F16);
-                    assert_eq!(run.call(None).unwrap().arguments, vec![(-8i32) as u32]);
-                    let mut rescaled = run.clone();
-                    let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
-                    if let MidOperationKind::Gemm { multiply, .. } = &mut metadata.kernel {
-                        *multiply = Precision::F8F143 { scale_exponent: 1 };
-                    }
-                    for input in &mut metadata.requirements.inputs {
-                        input.precision = Precision::F8F143 { scale_exponent: 1 };
-                    }
-                    assert_eq!(
-                        run.call(None).unwrap().symbol,
-                        rescaled.call(None).unwrap().symbol
-                    );
-                    assert_eq!(rescaled.call(None).unwrap().arguments, vec![2]);
-                }
-                _ => {}
-            }
-        }
-    }
-    assert!(casts > 0 && gemms > 0);
 }
 
 #[test]
@@ -233,116 +124,6 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
             expected,
             "random case {case}"
         );
-    }
-}
-
-#[test]
-fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
-    let mut random = fastrand::Rng::with_seed(0x7370_6563);
-    for _ in 0..32 {
-        let tiles = 1_u16 << random.u32(0..=3);
-        let rows_per_tile = random.u32(1..=12);
-        let batch = random.u32(1..=4);
-        let mut graph = HighGraph::new();
-        let left = graph
-            .host_input("left", [batch, u32::from(tiles) * rows_per_tile, 64])
-            .unwrap();
-        let right = graph.parameter("right", [64, 64]).unwrap();
-        let result = graph.gemm(left, right).unwrap();
-        graph.set_outputs([result]).unwrap();
-        let mut config = PipelineConfig::new(tiles)
-            .with_active_tile_counts([tiles])
-            .with_input(
-                left,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::amp_left(64, tiles),
-                },
-            )
-            .with_input(
-                right,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::block_major_matrix(64, tiles),
-                },
-            );
-        // This fixture exercises row specialization of a single GEMM family,
-        // independently of changes to the planner's relative strategy costs.
-        config.operator_candidates.retain(|candidate| {
-            matches!(candidate,
-            crate::planner::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
-                crate::planner::operator::OperatorDispatch::BlockedGemm { orientation: crate::planner::operator::GemmOrientation::Normal,
-                    distribution: crate::planner::operator::GemmDistribution::OutputStationary, .. }))
-        });
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(
-            &crate::expand_tiles(&mid).unwrap(),
-            config.diagnostic_checkpoints,
-        );
-        let plan = KernelObjects::from_program(&low).unwrap();
-        let addresses = low
-            .shards
-            .iter()
-            .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
-            .collect::<BTreeMap<_, _>>();
-        let specialization = plan
-            .compilations
-            .iter()
-            .find(|unit| {
-                unit.flags
-                    .iter()
-                    .any(|flag| flag.starts_with("-DGEMM_ROWS="))
-            })
-            .unwrap();
-        assert_eq!(plan.compilations.len(), 3);
-        assert_eq!(
-            plan.compilations
-                .iter()
-                .filter(|unit| unit.name.ends_with("_dispatch"))
-                .count(),
-            1
-        );
-        let planned_rows = low
-            .kernel_runs
-            .iter()
-            .filter(|run| matches!(run.kernel, MidOperationKind::Gemm { .. }))
-            .map(|run| gemm_rows(run.geometry(MemoryOperand::Output(0))).unwrap())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert!(
-            specialization
-                .flags
-                .iter()
-                .any(|flag| flag == &format!("-DGEMM_ROWS={}", planned_rows[0]))
-        );
-        assert!(
-            plan.retained_symbols()
-                .all(|symbol| !symbol.contains("accumulate"))
-        );
-        for run in low
-            .tiles
-            .iter()
-            .flat_map(|tile| tile.work.iter())
-            .filter_map(|work| {
-                if let BlockOperation::Compute { run, .. } = work {
-                    Some(&low.kernel_runs[run.0 as usize])
-                } else {
-                    None
-                }
-            })
-        {
-            let call = run.call(None).unwrap();
-            assert!(
-                plan.retained_symbols()
-                    .any(|symbol| symbol == call.symbol.as_str())
-            );
-            assert!(call.arguments.is_empty());
-            let compute = materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new())
-                .unwrap_or_else(|error| panic!("batch={batch} tiles={tiles} run={run:?}: {error}"));
-            assert_eq!(compute.symbol, call.symbol.as_str());
-            assert_eq!(compute.input_addresses.len(), 2);
-        }
     }
 }
 
@@ -600,64 +381,6 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
             run.requirements.clone(),
         );
         assert!(materialize(&run).is_err(), "offset={offset} bytes={bytes}");
-    }
-}
-
-#[test]
-fn packed_gemm_stores_bind_without_output_copies() {
-    let orientation = crate::planner::operator::GemmOrientation::Normal;
-    {
-        for rows in [17, 96, 129] {
-            let mut graph = HighGraph::new();
-            let left = graph.host_input("left", [1, rows, 64]).unwrap();
-            let right = graph.parameter("right", [64, 80]).unwrap();
-            let output = graph.gemm(left, right).unwrap();
-            graph.set_outputs([output]).unwrap();
-            let format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::row_major(TensorTiling::replicated(1)),
-            };
-            let mut config = PipelineConfig::new(1)
-                .with_input(left, format.clone())
-                .with_input(right, format);
-            config.gemm_output_packing = crate::GemmOutputPacking::Packed;
-            config.operator_candidates.retain(|candidate| matches!(candidate,
-                crate::planner::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
-                    crate::planner::operator::OperatorDispatch::BlockedGemm { orientation: candidate_orientation,
-                        distribution: crate::planner::operator::GemmDistribution::OutputStationary, .. } if candidate_orientation == orientation)));
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-            let addresses = low
-                .shards
-                .iter()
-                .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
-                .collect();
-            let mut products = 0;
-            for run in &low.kernel_runs {
-                if !matches!(run.kernel, MidOperationKind::Gemm { .. }) {
-                    continue;
-                }
-                products += 1;
-                assert!(
-                    gemm_rows(run.geometry(MemoryOperand::Output(0)))
-                        .unwrap()
-                        .is_multiple_of(16)
-                );
-                assert_eq!(
-                    run.requirements.outputs[0].layout.order.gemm_output_group(),
-                    Some(64)
-                );
-                let step =
-                    materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
-                assert!(step.symbol.contains("packed64"));
-                let source = &low.shards[run.outputs[0].shard.index() as usize];
-                assert_eq!(
-                    source.tensor_type.format.layout.order,
-                    run.requirements.outputs[0].layout.order
-                );
-            }
-            assert!(products > 0);
-        }
     }
 }
 

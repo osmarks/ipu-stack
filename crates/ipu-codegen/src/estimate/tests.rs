@@ -1,37 +1,7 @@
 use super::*;
+use crate::TensorAxis;
 use crate::mid::MidOperationKind;
-use crate::planner::operator::{GemmDistribution, OperatorDispatch};
-use crate::{AMP_INNER_BLOCK, TensorAxis};
 use std::collections::BTreeSet;
-
-fn output_stationary_dispatch() -> OperatorDispatch {
-    OperatorDispatch::BlockedGemm {
-        inner_block: AMP_INNER_BLOCK,
-        output_column_block: crate::tensor::AMP_OUTPUT_COLUMN_BLOCK,
-        orientation: crate::planner::operator::GemmOrientation::Normal,
-        distribution: GemmDistribution::OutputStationary,
-    }
-}
-
-fn parallel_reduction_dispatch(
-    row_partitions: u16,
-    column_partitions: u16,
-    inner_partitions: u16,
-) -> OperatorDispatch {
-    let mut dispatch = output_stationary_dispatch();
-    let OperatorDispatch::BlockedGemm { distribution, .. } = &mut dispatch else {
-        unreachable!();
-    };
-    *distribution = GemmDistribution::ParallelReduction {
-        row_partitions,
-        column_partitions,
-        inner_partitions,
-        result_row_partitions: 1,
-        result_column_partitions: 1,
-        reduction_staging: crate::ReductionStaging::Streamed,
-    };
-    dispatch
-}
 
 #[test]
 fn randomized_average_shard_storage_covers_spatial_work() {
@@ -240,64 +210,9 @@ fn randomized_resolved_capacity_matches_physical_storage() {
 }
 
 #[test]
-fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
-    use crate::GridOrder;
-    use crate::planner::operator::GemmOrientation;
-    for orientation in [GemmOrientation::Normal, GemmOrientation::Swapped] {
-        let (shape, layout) = match orientation {
-            GemmOrientation::Normal => (
-                [8, 160],
-                Layout::amp_left_result_grid(16, 4, 1, 4, GridOrder::ColumnsFast),
-            ),
-            GemmOrientation::Swapped => (
-                [160, 8],
-                Layout::amp_transposed_left_result_grid(16, 4, 1, 4, GridOrder::ColumnsFast),
-            ),
-        };
-        let mut output = TensorType::new(shape, Precision::F16, layout);
-        let column_axis = orientation.matrix_axes(2).1;
-        let axis = output
-            .format
-            .layout
-            .tiling
-            .axes
-            .iter_mut()
-            .find(|axis| axis.axis.resolve(2) == Ok(column_axis))
-            .unwrap();
-        axis.shard_padding_multiple = 16;
-        let mut dispatch = parallel_reduction_dispatch(1, 4, 2);
-        let OperatorDispatch::BlockedGemm {
-            orientation: selected,
-            ..
-        } = &mut dispatch
-        else {
-            unreachable!();
-        };
-        *selected = orientation;
-        // The kernel handles up to 64 columns, but the four partials own
-        // 48, 48, 32, and 32 columns. Kernel blocking must not repartition them.
-        let partial = dispatch.gemm_partial_tensor(&output);
-        assert_eq!(maximum_axis_shard_extent(&partial, column_axis), 48);
-        assert_eq!(maximum_shard_bytes(&partial), 8 * 48 * 2);
-        assert_eq!(
-            physical_elements(&partial.shape, &partial.format.layout),
-            8 * 160
-        );
-        assert!(
-            !partial
-                .format
-                .layout
-                .resolve(&partial.shape)
-                .unwrap()
-                .has_empty_shards()
-        );
-    }
-}
-
-#[test]
 fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidGraph, MidValue, ValueId,
+        CoordinateMapping, GraphInputKind, MidGraph, MidInput, MidOperation, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let mut program = MidGraph {
@@ -395,8 +310,8 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
 #[test]
 fn memory_retains_repeat_yields_until_the_backedge() {
     use crate::{
-        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidGraph, MidRegion,
-        MidRepeat, MidValue, ValueId,
+        CoordinateMapping, GraphInputKind, MidGraph, MidInput, MidOperation, MidRegion, MidRepeat,
+        MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let copy = |input, output| MidOperation {

@@ -1,13 +1,17 @@
-//! Choose layouts at high-operation boundaries, then construct executable mid work.
-//! Private temporaries belong to each component's implementation, not this table.
+//! Search a fixed high-operation order using executable mid fragments as edges.
+//! Boundary state is shared by histories; cycles and memory remain Pareto labels.
+//! Construction never calls back into package building, placement or scheduling.
 
 pub(crate) mod budget;
+mod candidates;
+mod search;
 
 use crate::Layout;
 use crate::config::PipelineConfig;
-use crate::graph::{HighGraph, Operation, OperationId, OperationKind, ValueId};
-use crate::mid::{MidGraph, MidValueId};
-use budget::OperationBudget;
+use crate::graph::{HighGraph, Operation, OperationKind, ValueId};
+use crate::mid::MidGraph;
+pub(crate) use budget::SearchLimits;
+use search::Search;
 use std::collections::BTreeMap;
 
 /// One choice per high value, shared by its producer and every consumer.
@@ -51,126 +55,43 @@ pub(crate) fn boundary_layouts(graph: &HighGraph, settings: &PipelineConfig) -> 
 pub enum PlanningError {
     #[error("no layout selected for high value {0:?}")]
     UnassignedLayout(ValueId),
-    #[error("no budget assigned to high operation {0:?}")]
-    UnassignedBudget(OperationId),
+    #[error("no fitting path through high operation boundary {0}")]
+    NoPlan(usize),
+    #[error("invalid planner fragment: {0}")]
+    InvalidFragment(&'static str),
     #[error("{0} construction is not implemented")]
     Unimplemented(&'static str),
+    #[error("memory profile: {0}")]
+    MemoryProfile(String),
 }
 
 pub type PlanningResult<T> = Result<T, PlanningError>;
 
-/// No search or implicit layout selection here. Each component must honor its
-/// boundary choices and append its private copies, computation and temporaries.
+/// Layout entries containing Some constrain the corresponding high boundary.
+/// None leaves it to candidate generation. Inputs currently need explicit formats.
+/// Parameter representations are fixed for this initial implementation; allowing
+/// candidates to resize resident storage needs retroactive memory accounting.
 pub(crate) fn plan(
     graph: &HighGraph,
     layouts: &BoundaryLayouts,
-    budgets: &BTreeMap<OperationId, OperationBudget>,
     settings: &PipelineConfig,
+    limits: SearchLimits,
 ) -> PlanningResult<MidGraph> {
-    for value in boundary_layouts(graph, settings).keys() {
-        if layouts.get(value).and_then(Option::as_ref).is_none() {
-            return Err(PlanningError::UnassignedLayout(*value));
+    let mut search = Search::new(graph, layouts, settings, limits)?;
+    for position in 0..graph.operations().len() {
+        for state in search.take_states(position) {
+            // Once per boundary state, not once per time/memory alternative.
+            for candidate in candidates::generate(graph, position, &state.live, layouts, settings)?
+            {
+                search.extend(position, &state, candidate)?;
+            }
         }
     }
-    let mut construction = Construction {
-        graph,
-        layouts,
-        budgets,
-        settings,
-        mid: MidGraph {
-            tile_count: settings.tile_count,
-            ..MidGraph::default()
-        },
-        values: BTreeMap::new(),
-    };
-    construction.inputs()?;
-    construction.operations(graph.operations())?;
-    construction.mid.outputs = graph
-        .outputs()
-        .iter()
-        .map(|id| construction.values[id])
-        .collect();
-    Ok(construction.mid)
+    search.finish()
 }
 
-/// Shared construction state: helpers bind high boundary IDs to actual mid
-/// values. Algorithm-private temporaries need no high ID or global layout choice.
-struct Construction<'a> {
-    graph: &'a HighGraph,
-    layouts: &'a BoundaryLayouts,
-    budgets: &'a BTreeMap<OperationId, OperationBudget>,
-    settings: &'a PipelineConfig,
-    mid: MidGraph,
-    values: BTreeMap<ValueId, MidValueId>,
-}
-
-impl Construction<'_> {
-    fn operations(&mut self, operations: &[Operation]) -> PlanningResult<()> {
-        for operation in operations {
-            let budget = self
-                .budgets
-                .get(&operation.id)
-                .ok_or(PlanningError::UnassignedBudget(operation.id))?;
-            match &operation.kind {
-                OperationKind::Gemm(_) => self.gemm(operation, budget),
-                OperationKind::Gelu => self.gelu(operation, budget),
-                OperationKind::LayerNorm => self.layer_norm(operation, budget),
-                OperationKind::Add => self.add(operation, budget),
-                OperationKind::View(_) => self.view(operation, budget),
-                OperationKind::Slice(_) => self.slice(operation, budget),
-                OperationKind::FlashAttention(_) => self.attention(operation, budget),
-                OperationKind::Repeat(_) => self.repeat(operation, budget),
-            }?;
-        }
-        Ok(())
-    }
-
-    fn inputs(&mut self) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("graph inputs"))
-    }
-
-    fn gemm(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("GEMM"))
-    }
-
-    fn gelu(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("GeLU"))
-    }
-
-    fn layer_norm(
-        &mut self,
-        _operation: &Operation,
-        _budget: &OperationBudget,
-    ) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("layernorm"))
-    }
-
-    fn add(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("add"))
-    }
-
-    fn view(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("view"))
-    }
-
-    fn slice(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("slice"))
-    }
-
-    fn attention(
-        &mut self,
-        _operation: &Operation,
-        _budget: &OperationBudget,
-    ) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("attention"))
-    }
-
-    // Will bind carried/invariant/iterated arguments, recurse through operations,
-    // and bind yields. It must preserve Repeat rather than unroll its body.
-    fn repeat(&mut self, _operation: &Operation, _budget: &OperationBudget) -> PlanningResult<()> {
-        Err(PlanningError::Unimplemented("Repeat"))
-    }
-}
+#[cfg(test)]
+mod search_tests;
 
 #[cfg(test)]
 mod tests {

@@ -213,8 +213,6 @@ struct Profile {
     total_peak_step: Option<usize>,
     standard_peak_step: Option<usize>,
     interleaved_peak_step: Option<usize>,
-    gemm_output_packing: String,
-    attention_products: String,
     timeline: Timeline,
 }
 
@@ -282,8 +280,6 @@ fn profile(
         interleaved_peak_step: peak_step(|step| {
             step.tile_usage.iter().map(|u| u[1]).max().unwrap_or(0)
         }),
-        gemm_output_packing: format!("{:?}", config.gemm_output_packing),
-        attention_products: format!("{:?}", config.attention_products),
         timeline,
     })
 }
@@ -295,7 +291,7 @@ pub(crate) fn write(
     config: &PipelineConfig,
     program: &crate::MidGraph,
     scope: &str,
-) -> crate::planner::LoweringResult<()> {
+) -> crate::planner::PlanningResult<()> {
     let Some(directory) = &config.memory_profile_directory else {
         return Ok(());
     };
@@ -314,7 +310,9 @@ pub(crate) fn write(
         &program.values,
         &Default::default(),
     )
-    .ok_or(crate::planner::LoweringError::InvalidImplementation)?;
+    .ok_or(crate::planner::PlanningError::InvalidFragment(
+        "memory profile",
+    ))?;
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(directory)?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -330,7 +328,7 @@ pub(crate) fn write(
         std::fs::write(path.with_extension("html"), html)?;
         Ok(path)
     })()
-    .map_err(|error| crate::planner::LoweringError::MemoryProfile(error.to_string()))?;
+    .map_err(|error| crate::planner::PlanningError::MemoryProfile(error.to_string()))?;
     tracing::info!(path = %result.display(), scope,
         peak_step = profile.total_peak_step, effective_peak_bytes = profile.effective_peak_bytes,
         "wrote planner memory profile");
@@ -350,10 +348,27 @@ mod tests {
         let output = graph.gelu(added).unwrap();
         graph.set_outputs([output]).unwrap();
         let config = PipelineConfig::new(4)
-            .with_automatic_input(input, crate::Precision::F16)
-            .with_automatic_input(weight, crate::Precision::F16);
-        let program =
-            crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
+            .with_input(
+                input,
+                crate::TensorFormat {
+                    precision: crate::Precision::F16,
+                    layout: crate::Layout::row_sharded(4),
+                },
+            )
+            .with_input(
+                weight,
+                crate::TensorFormat {
+                    precision: crate::Precision::F16,
+                    layout: crate::Layout::row_sharded(4),
+                },
+            );
+        let program = crate::planner::plan(
+            &graph,
+            &crate::planner::boundary_layouts(&graph, &config),
+            &config,
+            crate::planner::SearchLimits::default(),
+        )
+        .unwrap();
         let mut timeline = Timeline::default();
         mid::analyze_observed(&program, &BTreeMap::new(), &mut timeline).unwrap();
         let parameter = program
@@ -370,148 +385,5 @@ mod tests {
             .root;
         assert!(timeline.steps.len() >= 2);
         assert!(timeline.steps.iter().all(|step| step.live.contains(&root)));
-    }
-
-    #[test]
-    fn timeline_reconstructs_estimates_with_repeat_aliases_and_padding() {
-        let mut graph = HighGraph::new();
-        let input = graph.host_input("state</script>", [1, 8, 32]).unwrap();
-        let weights = (0..3)
-            .map(|i| graph.parameter(format!("w{i}"), [1, 32, 32]).unwrap())
-            .collect::<Vec<_>>();
-        let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
-        let output = graph
-            .repeat(3, [input], [], [sequence], |body, args| {
-                Ok(vec![body.gemm(args.carried[0], args.iterated[0])?])
-            })
-            .unwrap()[0];
-        graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(8).with_automatic_input(input, Precision::F16);
-        for weight in weights {
-            config = config.with_automatic_input(weight, Precision::F16);
-        }
-        let program =
-            crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let initial = program
-            .inputs
-            .iter()
-            .map(|input| input.value)
-            .collect::<Vec<_>>();
-        let report = profile(
-            "test",
-            &graph,
-            &config,
-            &initial,
-            &program.operations,
-            &program.outputs,
-            &program.values,
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        let (_, expected) = mid::analyze(&program, &BTreeMap::new()).unwrap();
-        assert_eq!(report.peak, expected);
-        let mut allocations = BTreeMap::new();
-        for value in &report.timeline.values {
-            assert_eq!(value.bytes, value.aligned_bytes * u64::from(value.copies));
-            let entry = allocations.entry(value.root).or_insert((0, &value.class));
-            entry.0 = entry.0.max(value.bytes);
-            entry.1 = &value.class;
-        }
-        assert!(
-            allocations.len() < report.timeline.values.len(),
-            "Repeat aliases were lost"
-        );
-        assert!(
-            report
-                .timeline
-                .values
-                .iter()
-                .any(|v| v.aligned_bytes > v.shard_bytes)
-        );
-        assert!(report.timeline.steps.iter().any(|s| s.execution_count == 3));
-        for step in &report.timeline.steps {
-            for tile in 0..usize::from(config.tile_count) {
-                let mut usage = step.tile_scratch[tile];
-                for id in &step.live {
-                    let aliases = report
-                        .timeline
-                        .values
-                        .iter()
-                        .filter(|v| v.root == *id)
-                        .collect::<Vec<_>>();
-                    let bytes = aliases.iter().map(|v| v.tile_bytes[tile]).max().unwrap();
-                    let class = usize::from(aliases[0].class == "Ipu21Interleaved");
-                    usage[class] += bytes;
-                }
-                assert_eq!(
-                    usage, step.tile_usage[tile],
-                    "step {}, tile {tile}",
-                    step.index
-                );
-                assert!(usage[0] + usage[1] <= step.coarse_usage.total());
-            }
-        }
-        let peak = &report.timeline.steps[report.total_peak_step.unwrap()];
-        assert_eq!(peak.usage.total(), report.peak.total);
-        assert!(report.timeline.values.iter().any(|v| v.group == "weights"));
-
-        let repeat = program
-            .operations
-            .iter()
-            .find_map(|op| match &op.kind {
-                MidOperationKind::Repeat(repeat) => Some((op, repeat)),
-                _ => None,
-            })
-            .unwrap();
-        let copies = repeat
-            .1
-            .body
-            .arguments
-            .iter()
-            .skip(repeat.0.inputs.len())
-            .copied()
-            .map(|id| (id, 3))
-            .collect();
-        let body = profile(
-            "body",
-            &graph,
-            &config,
-            &repeat.1.body.arguments,
-            &repeat.1.body.operations,
-            &repeat.1.body.yields,
-            &program.values,
-            &copies,
-        )
-        .unwrap();
-        assert!(body.timeline.values.iter().any(|v| v.copies == 3));
-        assert!(
-            body.timeline
-                .steps
-                .iter()
-                .all(|step| step.execution_count == 1)
-        );
-
-        let directory = std::env::temp_dir().join(format!(
-            "ipu-memory-profile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        config.memory_profile_directory = Some(directory.clone());
-        write(&graph, &config, &program, "test").unwrap();
-        for file in std::fs::read_dir(&directory).unwrap() {
-            let path = file.unwrap().path();
-            let text = std::fs::read_to_string(&path).unwrap();
-            if path.extension().unwrap() == "json" {
-                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["peak"]["total"], report.peak.total);
-            } else {
-                assert!(!text.contains("state</script>"));
-                assert!(text.contains("state\\u003c/script>"));
-            }
-        }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

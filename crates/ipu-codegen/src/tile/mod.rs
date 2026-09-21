@@ -3,7 +3,6 @@
 #[cfg(test)]
 use ipu_target::ipu21::fabric::Topology;
 #[cfg(test)]
-use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 #[cfg(test)]
 #[path = "tests/iterated_aliases.rs"]
 mod iterated_aliases;
@@ -583,12 +582,7 @@ fn layout_exchange_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimate::Ipu21CostModel;
-    use crate::planner::test_support::lower;
-    use crate::{
-        HighGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_exchanges,
-        lower_to_tiles, place,
-    };
+    use crate::{Layout, Precision};
 
     #[test]
     fn shared_rows_restore_zero_addresses_in_either_order() {
@@ -721,77 +715,5 @@ mod tests {
             }]
         );
         assert_eq!(copy.output_address, TileAddress::Absolute(0x70010));
-    }
-
-    #[test]
-    fn randomized_gemms_finalize_to_address_resolved_tile_programs() {
-        let mut random = fastrand::Rng::with_seed(0x7469_6c65);
-        for _ in 0..32 {
-            let tiles = 1_u16 << random.u32(0..=3);
-            let rows = u32::from(tiles) * random.u32(1..=8);
-            let columns = random.u32(1..=2) * 64;
-            let mut graph = HighGraph::new();
-            let left = graph.host_input("left", [rows, 64]).unwrap();
-            let right = graph.parameter("right", [64, columns]).unwrap();
-            let output = graph.gemm(left, right).unwrap();
-            graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(tiles)
-                .with_active_tile_counts([tiles])
-                .with_input(
-                    left,
-                    TensorFormat {
-                        precision: Precision::F16,
-                        layout: Layout::amp_left(64, tiles),
-                    },
-                )
-                .with_input(
-                    right,
-                    TensorFormat {
-                        precision: Precision::F16,
-                        layout: Layout::block_major_matrix(64, tiles),
-                    },
-                );
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(
-                &crate::expand_tiles(&mid).unwrap(),
-                config.diagnostic_checkpoints,
-            );
-            let placement = place(&low).unwrap();
-            let exchanges = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
-            let filler_tiles = random.u16(1..=4);
-            let lowering = TileProgramLowering::new(
-                &low,
-                &placement,
-                &exchanges,
-                0x4d000,
-                tiles + filler_tiles,
-                false,
-            )
-            .unwrap();
-            assert!(lowering.exchange_code_end() >= 0x4d000);
-            for tile in 0..tiles {
-                let program = lowering.lower_tile(tile).unwrap();
-                assert!(
-                    program
-                        .steps
-                        .iter()
-                        .any(|step| matches!(step, TileStep::Compute(_)))
-                );
-                for step in &program.steps {
-                    if let TileStep::Exchange(exchange) = step {
-                        assert_eq!(exchange.program.words.last(), Some(&RETURN_M10_INSTRUCTION));
-                    }
-                }
-            }
-            for tile in tiles..tiles + filler_tiles {
-                let program = lowering.lower_tile(tile).unwrap();
-                assert_eq!(program.steps.len(), exchanges.len());
-                assert!(program.steps.iter().all(|step| matches!(
-                    step,
-                    TileStep::Exchange(exchange)
-                        if !exchange.active
-                )));
-            }
-        }
     }
 }

@@ -2,21 +2,12 @@
 
 use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic};
 use crate::graph::TensorShape;
-use crate::planner::operator::OperatorPlan;
 use crate::{CopyPolicy, ElementOrder, Layout, Precision, TensorFormat, TensorType};
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub trait CostModel: Sync {
-    fn operator_cycle_override(
-        &self,
-        _plan: &OperatorPlan,
-        _inputs: &[TensorType],
-        _output: &TensorType,
-    ) -> Option<u64> {
-        None
-    }
     fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64;
     fn rearrangement_cost(
         &self,
@@ -77,14 +68,6 @@ impl<'a, C> MemoizedCostModel<'a, C> {
 }
 
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn operator_cycle_override(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> Option<u64> {
-        self.inner.operator_cycle_override(plan, inputs, output)
-    }
     fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
         self.inner.cast_format_cycles(input, output)
     }
@@ -280,8 +263,6 @@ impl CostModel for Ipu21CostModel {
 mod tests {
     use super::*;
     use crate::estimate::ExchangeEndpointLoad;
-    use crate::planner::operator::OperandRequirement;
-    use crate::planner::operator::OperatorFamily;
 
     const CASES: usize = 32;
 
@@ -422,25 +403,23 @@ mod tests {
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(tiles));
             let unsharded =
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
-            for operator in [OperatorFamily::Gelu, OperatorFamily::Add] {
+            for add in [false, true] {
                 let cycles = |tensor: &TensorType| {
-                    let arity = if operator == OperatorFamily::Add {
-                        2
-                    } else {
-                        1
-                    };
-                    let plan = crate::planner::catalogue::ConcreteOperatorCandidate::new(
-                        operator,
-                        vec![OperandRequirement::new(tensor.format.clone()); arity],
-                        tensor.format.clone(),
+                    let mut graph = crate::HighGraph::new();
+                    let x = graph.host_input("x", tensor.shape.0.clone()).unwrap();
+                    let y = if add { graph.add(x, x) } else { graph.gelu(x) }.unwrap();
+                    graph.set_outputs([y]).unwrap();
+                    let config =
+                        crate::PipelineConfig::new(tiles).with_input(x, tensor.format.clone());
+                    let mut layouts = crate::planner::boundary_layouts(&graph, &config);
+                    layouts.insert(y, Some(tensor.format.layout.clone()));
+                    let program = crate::planner::plan(
+                        &graph,
+                        &layouts,
+                        &config,
+                        crate::planner::SearchLimits::default(),
                     )
-                    .plan;
-                    let program = crate::planner::fragments::build_fragment(
-                        &plan,
-                        &vec![tensor.clone(); arity],
-                        tensor,
-                    )
-                    .expect("supported pointwise work");
+                    .unwrap();
                     program.validate().unwrap();
                     program.estimated_cycles
                 };
