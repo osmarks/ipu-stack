@@ -44,7 +44,7 @@ pub(super) fn grid_fragments(input: &TensorType, output: &TensorType) -> Option<
     for axes in [&mut source, &mut destination] {
         match input.format.layout.order {
             ElementOrder::RowMajor => {}
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output) => {
+            ElementOrder::Amp(AmpOrder::Left) => {
                 let grain = input
                     .format
                     .layout
@@ -197,11 +197,7 @@ mod tests {
 
     #[test]
     fn grid_counts_match_expanded_row_and_panel_intersections() {
-        for order in [
-            ElementOrder::RowMajor,
-            ElementOrder::Amp(AmpOrder::Left),
-            ElementOrder::Amp(AmpOrder::Output),
-        ] {
+        for order in [ElementOrder::RowMajor, ElementOrder::Amp(AmpOrder::Left)] {
             for sr in [1, 2, 4] {
                 for sc in [1, 2, 4] {
                     for dr in [1, 2, 4] {
@@ -227,11 +223,7 @@ mod tests {
             Precision::F16,
             Precision::F32,
         ] {
-            for order in [
-                ElementOrder::RowMajor,
-                ElementOrder::Amp(AmpOrder::Left),
-                ElementOrder::Amp(AmpOrder::Output),
-            ] {
+            for order in [ElementOrder::RowMajor, ElementOrder::Amp(AmpOrder::Left)] {
                 let mut input = tensor(order, 3, 1);
                 let mut output = tensor(order, 2, 4);
                 for tensor in [&mut input, &mut output] {

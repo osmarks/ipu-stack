@@ -15,7 +15,7 @@ fn panel_views(shard: &BlockValue) -> Option<Vec<Vec<ShardExtent>>> {
     let columns = shard.extents[rank - 1];
     let width = match shard.tensor_type.format.layout.order {
         ElementOrder::RowMajor => columns.physical_end - columns.start,
-        ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output) => shard
+        ElementOrder::Amp(AmpOrder::Left) => shard
             .tensor_type
             .format
             .layout

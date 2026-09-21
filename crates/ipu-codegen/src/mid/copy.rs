@@ -642,15 +642,6 @@ mod tests {
         assert_eq!(operations[0].inputs, [MidValueId(0)]);
 
         let (mut operations, mut values) = chain();
-        values[0].tensor_type.format.layout.order =
-            crate::ElementOrder::Amp(crate::AmpOrder::Output);
-        values[2].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
-        values[3].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
-        compose(&mut operations, &values, &[MidValueId(3)]);
-        assert_eq!(operations.len(), 2);
-        assert_eq!(operations[1].inputs, [MidValueId(1)]);
-
-        let (mut operations, mut values) = chain();
         values[1].tensor_type.shape.0[1] += 4;
         values[2].tensor_type.shape.0[1] += 4;
         values[3].tensor_type.shape.0[1] += 4;

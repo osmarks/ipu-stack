@@ -66,11 +66,10 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
         let semantic_rows = random.u32(1..=96);
         let semantic_columns = random.u32(1..=96);
         let transposed = random.bool();
-        let order = match (transposed, random.bool()) {
-            (false, false) => AmpOrder::Output,
-            (false, true) => AmpOrder::Left,
-            (true, false) => AmpOrder::TransposedOutput,
-            (true, true) => AmpOrder::TransposedLeft,
+        let order = if transposed {
+            AmpOrder::TransposedLeft
+        } else {
+            AmpOrder::Left
         };
         let format = TensorFormat {
             precision: Precision::F16,

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    AttentionScale, CompiledPackage, HighGraph, DiagnosticTensor, GemmOptions, Operation,
+    AttentionScale, CompiledPackage, DiagnosticTensor, GemmOptions, HighGraph, Operation,
     OperationId, OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
     logical_view_byte_spans,
 };
@@ -1295,45 +1295,6 @@ mod tests {
                         .sum::<f32>();
                     let observed = accelerated[(row * columns + column) as usize];
                     assert!((observed - scalar).abs() <= 2.0e-5);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn randomized_gelu_reorder_preserves_logical_coordinates() -> Result<()> {
-        let mut random = fastrand::Rng::with_seed(0x4745_4c55_5245_4f52);
-        for _ in 0..100 {
-            let rows = random.u32(1..65);
-            let columns = random.u32(1..9) * 16;
-            let words = rows * columns / 2;
-            let permutation = [0, 4, 1, 5, 2, 6, 3, 7];
-            for worker in 0..6 {
-                let mut base = worker * 8;
-                while base + 8 <= words {
-                    for (source_word, destination_word) in permutation.iter().enumerate() {
-                        for lane in 0..2 {
-                            let source = base + source_word as u32;
-                            let destination = base + destination_word;
-                            let source_coordinates = amp_matrix_coordinates(
-                                AmpOrder::Output,
-                                Precision::F16,
-                                rows,
-                                columns,
-                                source * 2 + lane,
-                            )?;
-                            let destination_coordinates = amp_matrix_coordinates(
-                                AmpOrder::Left,
-                                Precision::F16,
-                                rows,
-                                columns,
-                                destination * 2 + lane,
-                            )?;
-                            assert_eq!(source_coordinates, destination_coordinates);
-                        }
-                    }
-                    base += 48;
                 }
             }
         }

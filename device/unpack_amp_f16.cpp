@@ -4,7 +4,7 @@
 using namespace poplar;
 
 #ifndef UNPACK_SOURCE_ORDER
-#define UNPACK_SOURCE_ORDER 0
+#define UNPACK_SOURCE_ORDER 2
 #endif
 #ifndef UNPACK_LOGICAL_ROWS
 #define UNPACK_LOGICAL_ROWS 16
@@ -29,8 +29,8 @@ using namespace poplar;
 #define UNPACK_COLUMN_BLOCK 16
 #endif
 // Transposed AMP (order 1) has a dedicated word-pair assembly transpose.
-static_assert(UNPACK_SOURCE_ORDER <= 3 && UNPACK_SOURCE_ORDER != 1);
-static_assert(UNPACK_SOURCE_ORDER == 0 || UNPACK_PHYSICAL_ROWS % 16 == 0);
+static_assert(UNPACK_SOURCE_ORDER == 2 || UNPACK_SOURCE_ORDER == 3);
+static_assert(UNPACK_PHYSICAL_ROWS % 16 == 0);
 static_assert(UNPACK_PHYSICAL_COLUMNS % 16 == 0);
 static_assert(UNPACK_PHYSICAL_COLUMNS % 2 == 0);
 
@@ -65,13 +65,6 @@ public:
             if (semanticColumn >= logicalColumnCount)
               continue;
             unsigned physical;
-#if UNPACK_SOURCE_ORDER == 0
-            const unsigned logicalPair = semanticColumn % 16 / 2;
-            const unsigned physicalPair = logicalPair % 4 * 2 + logicalPair / 4;
-            const unsigned physicalColumn = physicalPair * 2 + semanticColumn % 2;
-            physical = (semanticColumn / 16) * physicalRowCount * 16 + row * 16 +
-                       physicalColumn;
-#else
             constexpr bool transposed = UNPACK_SOURCE_ORDER == 3;
             const unsigned r = transposed ? semanticColumn : row;
             const unsigned c = transposed ? row : semanticColumn;
@@ -79,7 +72,6 @@ public:
             const unsigned panel = (r / UNPACK_ROW_BLOCK) * (cols / UNPACK_COLUMN_BLOCK) * (UNPACK_ROW_BLOCK / 16)
                 + (c / UNPACK_COLUMN_BLOCK) * (UNPACK_ROW_BLOCK / 16) + (r % UNPACK_ROW_BLOCK) / 16;
             physical = panel * 16 * UNPACK_COLUMN_BLOCK + (c % UNPACK_COLUMN_BLOCK) * 16 + r % 16;
-#endif
             const unsigned sourceWord = sourceWords[(matrixBase + physical) / 2];
             const unsigned value =
                 (sourceWord >> (((matrixBase + physical) & 1) * 16)) & 0xffff;

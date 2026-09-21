@@ -116,8 +116,7 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::InvalidCopyPlan);
             } else if matches!(
                 source_order,
-                ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
-                    | ElementOrder::BlockMajor(_)
+                ElementOrder::Amp(AmpOrder::TransposedLeft) | ElementOrder::BlockMajor(_)
             ) {
                 let mut provenance = operation_provenance(operation);
                 provenance.reason = WorkReason::LayoutRearrangement;
@@ -196,10 +195,6 @@ impl TileGraphBuilder {
             let compatible = source_view.extents.len() >= 2
                 && source.tensor_type.format.precision == Precision::F16
                 && match source.tensor_type.format.layout.order {
-                    ElementOrder::Amp(AmpOrder::Output) => {
-                        let columns = source_view.extents[source_view.extents.len() - 1];
-                        (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
-                    }
                     ElementOrder::Amp(AmpOrder::TransposedLeft) => {
                         let rows = source_view.extents[source_view.extents.len() - 2];
                         (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)

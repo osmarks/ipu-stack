@@ -7,8 +7,7 @@ use ipu_target::Target;
 // These indices are the device workers' ABI, not another layout representation.
 fn order_index(order: ElementOrder, unpack: bool) -> Option<u32> {
     match (unpack, order) {
-        (true, ElementOrder::Amp(AmpOrder::Output))
-        | (false, ElementOrder::Amp(AmpOrder::Left)) => Some(0),
+        (false, ElementOrder::Amp(AmpOrder::Left)) => Some(0),
         (true, ElementOrder::Amp(AmpOrder::TransposedLeft))
         | (false, ElementOrder::Amp(AmpOrder::TransposedRight)) => Some(1),
         (_, ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })) => Some(2),

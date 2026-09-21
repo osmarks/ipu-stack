@@ -2359,11 +2359,7 @@ mod tests {
             } else {
                 GridOrder::RowsFast
             };
-            let layout = if random.bool() {
-                Layout::amp_output_grid(64, tiles, row_parts, column_parts, order)
-            } else {
-                Layout::amp_left_result_grid(64, tiles, row_parts, column_parts, order)
-            };
+            let layout = Layout::amp_left_result_grid(64, tiles, row_parts, column_parts, order);
             let precision = if random.bool() {
                 Precision::F16
             } else {

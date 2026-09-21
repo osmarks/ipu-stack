@@ -477,7 +477,11 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
         let columns = u32::from(column_partitions) * 64 * random.u32(1..=4);
         let input_format = TensorFormat {
             precision: Precision::F16,
-            layout: Layout::amp_output_replicated_grid(tiles, row_partitions, column_partitions),
+            layout: Layout::amp_left_result_replicated_grid(
+                tiles,
+                row_partitions,
+                column_partitions,
+            ),
         };
         let output_format = TensorFormat {
             precision: Precision::F16,
@@ -822,7 +826,7 @@ fn randomized_gemm_grid_orders_align_operands_and_pair_shared_payloads() {
             let output = TensorType::new(
                 [rows, columns],
                 Precision::F16,
-                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions, order),
+                Layout::amp_left_result_grid(64, tiles, row_partitions, column_partitions, order),
             );
             let left = left.format.layout.shard_extents(&left.shape).unwrap();
             let right = right.format.layout.shard_extents(&right.shape).unwrap();
@@ -1487,9 +1491,7 @@ fn copy_preparation_preserves_order_when_distinct_values_share_storage() {
     let orders = [
         ElementOrder::RowMajor,
         ElementOrder::Amp(crate::AmpOrder::Left),
-        ElementOrder::Amp(crate::AmpOrder::Output),
         ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
-        ElementOrder::Amp(crate::AmpOrder::TransposedOutput),
         ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
             row_block: 16,
             column_block: 32,

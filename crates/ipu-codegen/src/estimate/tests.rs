@@ -219,7 +219,7 @@ fn randomized_average_shard_storage_covers_spatial_work() {
         let tensor = TensorType::new(
             [rows, columns],
             Precision::F16,
-            Layout::amp_output_grid(
+            Layout::amp_left_result_grid(
                 64,
                 tiles,
                 row_partitions,
@@ -306,14 +306,14 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
         let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
         let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
         let shape = TensorShape(vec![rows, columns]);
-        let fragmented_source = Layout::amp_output_grid(
+        let fragmented_source = Layout::amp_left_result_grid(
             64,
             tiles,
             row_partitions,
             column_partitions,
             crate::tensor::GridOrder::ColumnsFast,
         );
-        let aligned_source = Layout::amp_output_grid(
+        let aligned_source = Layout::amp_left_result_grid(
             64,
             tiles,
             column_partitions,
@@ -321,7 +321,7 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
             crate::tensor::GridOrder::ColumnsFast,
         );
         let destination =
-            Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
+            Layout::amp_left_result_replicated_grid(tiles, column_partitions, row_partitions);
         let traffic = |layout: &Layout| {
             let graph = copy_graph(
                 TensorType::new(shape.0.clone(), Precision::F16, layout.clone()),

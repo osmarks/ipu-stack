@@ -47,9 +47,6 @@ pub enum AmpOrder {
     /// Semantic `[key, channel]` storage packed as the right operand of
     /// `query * key.transpose()`.
     TransposedRight,
-    Output,
-    /// A semantic `[M, N]` output packed as the physical output `[N, M]`.
-    TransposedOutput,
 }
 
 /// Ordinary matrix elements grouped into contiguous rectangular blocks.
@@ -121,8 +118,7 @@ impl ElementOrder {
     pub(crate) fn gemm_output_transposed(self) -> bool {
         matches!(
             self,
-            Self::Amp(AmpOrder::TransposedLeft | AmpOrder::TransposedOutput)
-                | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
+            Self::Amp(AmpOrder::TransposedLeft) | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
         )
     }
 
@@ -136,7 +132,7 @@ impl ElementOrder {
             | Self::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
                 Some(MicroPanelOrder::ColumnsThenRows)
             }
-            Self::RowMajor | Self::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => None,
+            Self::RowMajor => None,
         }
     }
 
@@ -150,7 +146,6 @@ impl ElementOrder {
                 Precision::F16 => 16,
                 Precision::F32 => 8,
             }),
-            Self::Amp(AmpOrder::Output) => Some(AMP_COLUMN_MICRO),
             Self::BlockMajor(_) | Self::Amp(_) => None,
         }
     }
@@ -457,19 +452,11 @@ impl Layout {
         )
     }
 
-    pub fn amp_output(tile_count: u16) -> Self {
-        let mut layout = Self::amp_left(AMP_OUTPUT_COLUMN_BLOCK as u16, tile_count);
-        layout.order = ElementOrder::Amp(AmpOrder::Output);
-        layout.memory_class = MemoryClass::Ipu21Interleaved;
-        layout
-    }
-
-    /// F16 AMP result stored in the same within-panel order as a following
-    /// left operand. The GEMM coefficient routing makes the native accumulator
-    /// drain land in this order without a post-compute permutation.
+    /// Native GEMM result: coefficient routing makes the accumulator drain
+    /// use the same within-panel order as a following left operand.
     pub fn amp_left_result(tile_count: u16) -> Self {
-        let mut layout = Self::amp_output(tile_count);
-        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        let mut layout = Self::amp_left(AMP_OUTPUT_COLUMN_BLOCK as u16, tile_count);
+        layout.memory_class = MemoryClass::Ipu21Interleaved;
         layout
     }
 
@@ -655,30 +642,8 @@ impl Layout {
         ))
     }
 
-    /// AMP output distributed over both matrix axes on one tile grid.
-    pub fn amp_output_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        grid_order: GridOrder,
-    ) -> Self {
-        if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
-            && column_partitions == 1
-            && row_partitions == tile_count
-        {
-            return Self::amp_output(tile_count);
-        }
-        Self::amp_output_grid_storage(
-            output_column_block,
-            tile_count,
-            row_partitions,
-            column_partitions,
-            grid_order,
-        )
-    }
-
-    fn amp_output_grid_storage(
+    /// Native GEMM result distributed over both matrix axes.
+    pub fn amp_left_result_grid(
         output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
@@ -686,7 +651,7 @@ impl Layout {
         grid_order: GridOrder,
     ) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Output),
+            order: ElementOrder::Amp(AmpOrder::Left),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
@@ -712,42 +677,6 @@ impl Layout {
         }
     }
 
-    pub fn amp_left_result_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        grid_order: GridOrder,
-    ) -> Self {
-        let mut layout = Self::amp_output_grid(
-            output_column_block,
-            tile_count,
-            row_partitions,
-            column_partitions,
-            grid_order,
-        );
-        layout.order = ElementOrder::Amp(AmpOrder::Left);
-        layout
-    }
-
-    /// A semantic output `[M, N]` packed as the physical AMP output `[N, M]`.
-    pub fn amp_transposed_output_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        grid_order: GridOrder,
-    ) -> Self {
-        Self::amp_output_grid_storage(
-            output_column_block,
-            tile_count,
-            row_partitions,
-            column_partitions,
-            grid_order,
-        )
-        .transpose_matrix_axes(ElementOrder::Amp(AmpOrder::TransposedOutput))
-    }
-
     /// Reinterpret a physical matrix layout with its two logical matrix axes swapped.
     /// The caller supplies the corresponding transposed physical element order.
     fn transpose_matrix_axes(mut self, order: ElementOrder) -> Self {
@@ -769,24 +698,23 @@ impl Layout {
         column_partitions: u16,
         grid_order: GridOrder,
     ) -> Self {
-        let mut layout = Self::amp_transposed_output_grid(
+        Self::amp_left_result_grid(
             output_column_block,
             tile_count,
             row_partitions,
             column_partitions,
             grid_order,
-        );
-        layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
-        layout
+        )
+        .transpose_matrix_axes(ElementOrder::Amp(AmpOrder::TransposedLeft))
     }
 
     /// AMP output storage sharded by rows and replicated across column groups.
-    pub fn amp_output_replicated_grid(
+    pub fn amp_left_result_replicated_grid(
         tile_count: u16,
         row_partitions: u16,
         column_replicas: u16,
     ) -> Self {
-        let mut layout = Self::amp_output(row_partitions);
+        let mut layout = Self::amp_left_result(row_partitions);
         layout.tiling.tile_count = tile_count;
         layout.tiling.replicas = column_replicas;
         layout

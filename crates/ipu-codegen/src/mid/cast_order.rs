@@ -2,7 +2,7 @@
 
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing,
+    CoordinateMapping, MidGraph, MidOperation, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -70,8 +70,7 @@ pub(crate) fn cast_layout(input: &TensorType) -> Option<Layout> {
             axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
             return Some(layout);
         }
-        ElementOrder::RowMajor
-        | ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => {
+        ElementOrder::RowMajor => {
             return Some(layout);
         }
         ElementOrder::Amp(AmpOrder::TransposedRight) => 1,
@@ -232,9 +231,9 @@ fn may_write_existing_storage(op: &MidOperation) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::CopyPolicy;
     use crate::graph::{GraphInputKind, ValueId};
     use crate::mid::{MidInput, MidRegion, MidRepeat, rewrite};
-    use crate::CopyPolicy;
     use crate::tensor::TensorTiling;
 
     use super::*;

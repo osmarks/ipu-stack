@@ -97,9 +97,8 @@ fn digits(shard: TensorStorage<'_>) -> StorageResult<Vec<Digit>> {
         }
         let transposed = matches!(
             shard.format.layout.order,
-            ElementOrder::Amp(
-                AmpOrder::TransposedLeft | AmpOrder::TransposedOutput | AmpOrder::TransposedRight
-            ) | ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+            ElementOrder::Amp(AmpOrder::TransposedLeft | AmpOrder::TransposedRight)
+                | ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
         );
         let (r, c) = if transposed {
             (rank - 1, rank - 2)
@@ -108,24 +107,15 @@ fn digits(shard: TensorStorage<'_>) -> StorageResult<Vec<Digit>> {
         };
         let (rows, cols) = (widths[r], widths[c]);
         let micro = amp_micro_dimension(shard.format.precision);
-        let flatten = matches!(
-            shard.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-        );
+        let flatten = matches!(shard.format.layout.order, ElementOrder::Amp(AmpOrder::Left));
         if !flatten {
             for (axis, &width) in widths[..rank - 2].iter().enumerate() {
                 push(axis, 1, width);
             }
         }
         match shard.format.layout.order {
-            ElementOrder::Amp(
-                role @ (AmpOrder::Left
-                | AmpOrder::TransposedLeft
-                | AmpOrder::Output
-                | AmpOrder::TransposedOutput),
-            ) => {
-                let output = matches!(role, AmpOrder::Output | AmpOrder::TransposedOutput);
-                let grain = if output { AMP_COLUMN_MICRO } else { micro };
+            ElementOrder::Amp(role @ (AmpOrder::Left | AmpOrder::TransposedLeft)) => {
+                let grain = micro;
                 if !cols.is_multiple_of(grain) {
                     return Err(StorageError::AmpBlock { role });
                 }
@@ -136,13 +126,7 @@ fn digits(shard: TensorStorage<'_>) -> StorageResult<Vec<Digit>> {
                     }
                 }
                 push(r, 1, rows);
-                if output {
-                    push(c, 2, 4);
-                    push(c, 8, 2);
-                    push(c, 1, 2);
-                } else {
-                    push(c, 1, grain);
-                }
+                push(c, 1, grain);
             }
             ElementOrder::Amp(AmpOrder::TransposedRight) => {
                 if !rows.is_multiple_of(micro) || !cols.is_multiple_of(AMP_COLUMN_MICRO) {
@@ -852,9 +836,7 @@ mod tests {
         for order in [
             ElementOrder::RowMajor,
             ElementOrder::Amp(AmpOrder::Left),
-            ElementOrder::Amp(AmpOrder::Output),
             ElementOrder::Amp(AmpOrder::TransposedLeft),
-            ElementOrder::Amp(AmpOrder::TransposedOutput),
             ElementOrder::Amp(AmpOrder::TransposedRight),
             ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block: 32,
@@ -1005,9 +987,7 @@ mod tests {
             for order in [
                 ElementOrder::RowMajor,
                 ElementOrder::Amp(AmpOrder::Left),
-                ElementOrder::Amp(AmpOrder::Output),
                 ElementOrder::Amp(AmpOrder::TransposedLeft),
-                ElementOrder::Amp(AmpOrder::TransposedOutput),
                 ElementOrder::Amp(AmpOrder::TransposedRight),
                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                     row_block: 32,

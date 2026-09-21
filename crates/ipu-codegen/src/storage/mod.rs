@@ -133,8 +133,6 @@ fn byte_spans(
     let rank = view.len();
     let (row_fast, lane) = match shard.format.layout.order {
         ElementOrder::RowMajor => (false, u32::MAX),
-        ElementOrder::Amp(AmpOrder::Output) => (false, 2),
-        ElementOrder::Amp(AmpOrder::TransposedOutput) => (true, 2),
         ElementOrder::Amp(AmpOrder::TransposedLeft)
         | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
             (true, amp_micro_dimension(shard.format.precision))
@@ -259,7 +257,7 @@ fn physical_index(
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
                     .ok_or(StorageError::Overflow)
-            } else if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+            } else if matches!(role, AmpOrder::Left) {
                 let flat_rows = widths[..rank - 2].iter().try_fold(rows, |rows, &extent| {
                     rows.checked_mul(extent).ok_or(StorageError::Overflow)
                 })?;
@@ -314,7 +312,6 @@ fn amp_matrix_index(
     row: u32,
     column: u32,
 ) -> StorageResult<u32> {
-    const COLUMN_MICRO: u32 = AMP_COLUMN_MICRO;
     if row >= rows || column >= columns {
         return Err(StorageError::InvalidView);
     }
@@ -333,21 +330,6 @@ fn amp_matrix_index(
         AmpOrder::TransposedRight => right_matrix_index(precision, columns, rows, column, row),
         AmpOrder::TransposedLeft => {
             amp_matrix_index(AmpOrder::Left, precision, columns, rows, column, row)
-        }
-        AmpOrder::Output => {
-            if !columns.is_multiple_of(COLUMN_MICRO) {
-                return Err(StorageError::AmpBlock { role });
-            }
-            let logical_pair = column % COLUMN_MICRO / 2;
-            let physical_pair = logical_pair % 4 * 2 + logical_pair / 4;
-            let physical_column = physical_pair * 2 + column % 2;
-            (column / COLUMN_MICRO)
-                .checked_mul(rows * COLUMN_MICRO)
-                .and_then(|base| base.checked_add(row * COLUMN_MICRO + physical_column))
-                .ok_or(StorageError::Overflow)
-        }
-        AmpOrder::TransposedOutput => {
-            amp_matrix_index(AmpOrder::Output, precision, columns, rows, column, row)
         }
     }
 }
@@ -495,7 +477,7 @@ fn physical_coordinates(
             }
             let rows = widths[rank - 2];
             let columns = widths[rank - 1];
-            if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+            if matches!(role, AmpOrder::Left) {
                 let outer_rows = widths[..rank - 2]
                     .iter()
                     .try_fold(rows, |product, &extent| {
@@ -550,7 +532,6 @@ pub fn amp_matrix_coordinates(
     columns: u32,
     linear: u32,
 ) -> StorageResult<(u32, u32)> {
-    const COLUMN_MICRO: u32 = AMP_COLUMN_MICRO;
     match role {
         AmpOrder::Left => {
             let inner = amp_micro_dimension(precision);
@@ -566,27 +547,6 @@ pub fn amp_matrix_coordinates(
             .map(|(column, row)| (row, column)),
         AmpOrder::TransposedLeft => {
             amp_matrix_coordinates(AmpOrder::Left, precision, columns, rows, linear)
-                .map(|(column, row)| (row, column))
-        }
-        AmpOrder::Output => {
-            if !columns.is_multiple_of(COLUMN_MICRO) {
-                return Err(StorageError::AmpBlock { role });
-            }
-            let panel_elements = rows
-                .checked_mul(COLUMN_MICRO)
-                .ok_or(StorageError::Overflow)?;
-            let panel = linear / panel_elements;
-            let offset = linear % panel_elements;
-            let physical_column = offset % COLUMN_MICRO;
-            let physical_pair = physical_column / 2;
-            let logical_pair = (physical_pair % 2) * 4 + physical_pair / 2;
-            Ok((
-                offset / COLUMN_MICRO,
-                panel * COLUMN_MICRO + logical_pair * 2 + physical_column % 2,
-            ))
-        }
-        AmpOrder::TransposedOutput => {
-            amp_matrix_coordinates(AmpOrder::Output, precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
         }
     }
@@ -793,10 +753,8 @@ mod tests {
             for order in [
                 ElementOrder::RowMajor,
                 ElementOrder::Amp(AmpOrder::Left),
-                ElementOrder::Amp(AmpOrder::Output),
                 ElementOrder::Amp(AmpOrder::TransposedLeft),
                 ElementOrder::Amp(AmpOrder::TransposedRight),
-                ElementOrder::Amp(AmpOrder::TransposedOutput),
                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                     row_block: 64,
                     column_block: 64,
@@ -895,7 +853,7 @@ mod tests {
                     64,
                     64,
                 ),
-                (Layout::amp_output(1), rows, 64),
+                (Layout::amp_left_result(1), rows, 64),
             ] {
                 let shard = shard(layout, &[batches, physical_rows, columns]);
                 let full = ShardView {
