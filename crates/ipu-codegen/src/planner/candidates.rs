@@ -30,6 +30,56 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
+    /// Materialize a selected representation or slice; identical resident
+    /// operands need no copy. This does not change the high-value binding.
+    pub fn copy(
+        &mut self,
+        source: crate::OperationId,
+        input: MidValueId,
+        tensor: TensorType,
+        offsets: Vec<u32>,
+    ) -> MidValueId {
+        let from = &self.graph.values[input.index() as usize];
+        let owners = OwnerMap::default();
+        if from.tensor_type == tensor && from.owners == owners && offsets.iter().all(|&n| n == 0) {
+            return input;
+        }
+        let policy =
+            crate::default_copy_policy(&from.tensor_type.format.layout, &tensor.format.layout);
+        let packing = if from
+            .tensor_type
+            .format
+            .layout
+            .order
+            .micro_panel_order()
+            .is_some()
+            && from.tensor_type.format.layout.order.micro_panel_order()
+                == tensor.format.layout.order.micro_panel_order()
+        {
+            crate::PackingPolicy::Direct
+        } else {
+            crate::PackingPolicy::Staged
+        };
+        let output = self.value(from.origin, tensor, owners);
+        self.graph.operations.push(crate::MidOperation {
+            source: Some(source),
+            inputs: vec![input],
+            results: vec![output],
+            kind: MidOperationKind::Copy {
+                mapping: crate::CoordinateMapping {
+                    offsets,
+                    view: None,
+                },
+                policy,
+                packing,
+            },
+            operands: Vec::new(),
+            output_aliases: Vec::new(),
+            output_windows: Vec::new(),
+        });
+        output
+    }
+
     /// Import the whole live boundary. Unrelated activations become pass-through
     /// outputs when extending the path, so ordinary mid liveness accounts for
     /// residual storage without a separate approximation of its lifetime.
@@ -101,7 +151,15 @@ pub(super) fn generate(
             MidOperationKind::Gelu,
             selectable_parameters,
         ),
-        OperationKind::Gemm(_) => Err(PlanningError::Unimplemented("GEMM candidates")),
+        OperationKind::Gemm(options) => super::gemm::generate(
+            high,
+            position,
+            live,
+            choices,
+            settings,
+            selectable_parameters,
+            options,
+        ),
         OperationKind::LayerNorm => Err(PlanningError::Unimplemented("layernorm candidates")),
         OperationKind::View(_) | OperationKind::Slice(_) => {
             Err(PlanningError::Unimplemented("view/slice candidates"))

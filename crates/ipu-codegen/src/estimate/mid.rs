@@ -607,9 +607,37 @@ pub(crate) fn operation_cost(
                     extents,
                 })
                 .collect::<Vec<_>>();
-            price.total =
+            price.total = if matches!(kernel, MidOperationKind::Gemm { .. }) {
+                crate::kernel::gemm::invocations(
+                    kernel,
+                    [inputs[0].extents, inputs[1].extents, outputs[0].extents],
+                )
+                .map_or(u64::MAX, |calls| {
+                    calls.into_iter().fold(0u64, |cost, (kind, regions)| {
+                        let input = [
+                            crate::storage::TensorStorage {
+                                format: inputs[0].format,
+                                extents: &regions[0],
+                            },
+                            crate::storage::TensorStorage {
+                                format: inputs[1].format,
+                                extents: &regions[1],
+                            },
+                        ];
+                        let output = [crate::storage::TensorStorage {
+                            format: outputs[0].format,
+                            extents: &regions[2],
+                        }];
+                        cost.saturating_add(
+                            crate::kernel::KernelCall::select(target, &kind, &input, &output, None)
+                                .map_or(u64::MAX, |call| call.cycles),
+                        )
+                    })
+                })
+            } else {
                 crate::kernel::KernelCall::select(target, kernel, &inputs, &outputs, None)
-                    .map_or(u64::MAX, |call| call.cycles);
+                    .map_or(u64::MAX, |call| call.cycles)
+            };
         }
     }
     Some((price, scratch, rows))

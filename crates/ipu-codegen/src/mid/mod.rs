@@ -77,6 +77,9 @@ pub enum MidOperationKind {
         /// Copy mappings cover every logical element; only padding needs initialization.
         padding_only: bool,
     },
+    /// Product on the selected distributed operand/output regions. Local
+    /// batch and panel traversal belongs to the GEMM kernel family; independent
+    /// K partitions and their reduction are separate operations in this graph.
     Gemm {
         axes: crate::kernel::GemmAxes,
         multiply: Precision,

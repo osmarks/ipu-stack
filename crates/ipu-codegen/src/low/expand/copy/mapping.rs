@@ -81,8 +81,8 @@ pub(in crate::low::expand) fn split_mapping_at_panel_boundaries(
         || destination_rank < 2
         || source_shard.extents.len() != source_rank
         || destination_shard.extents.len() != destination_rank
-        || outer_elements(&source.extents) != Some(1)
-        || outer_elements(&destination.extents) != Some(1)
+        || outer_elements(&source.extents).is_none()
+        || outer_elements(&source.extents) != outer_elements(&destination.extents)
     {
         return Err(ExpansionError::InvalidOperatorPlan);
     }
@@ -176,24 +176,37 @@ pub(in crate::low::expand) fn split_mapping_at_panel_boundaries(
         destination_panel[1],
     )?;
     let mut pieces = Vec::with_capacity(rows.len().saturating_mul(columns.len()));
-    for (source_row, destination_row) in rows {
-        for &(source_column, destination_column) in &columns {
-            let mut source_extents = source.extents.clone();
-            let mut destination_extents = destination.extents.clone();
-            source_extents[source_row_axis] = source_row;
-            source_extents[source_column_axis] = source_column;
-            destination_extents[destination_row_axis] = destination_row;
-            destination_extents[destination_column_axis] = destination_column;
-            pieces.push((
-                ShardView {
-                    shard: source.shard,
-                    extents: source_extents,
-                },
-                ShardView {
-                    shard: destination.shard,
-                    extents: destination_extents,
-                },
-            ));
+    for batch in 0..outer_elements(&source.extents).unwrap() {
+        for &(source_row, destination_row) in &rows {
+            for &(source_column, destination_column) in &columns {
+                let mut source_extents = source.extents.clone();
+                let mut destination_extents = destination.extents.clone();
+                for extents in [&mut source_extents, &mut destination_extents] {
+                    let rank = extents.len();
+                    let mut index = batch;
+                    for extent in extents[..rank - 2].iter_mut().rev() {
+                        let width = extent.logical_end - extent.start;
+                        extent.start += index % width;
+                        index /= width;
+                        extent.logical_end = extent.start + 1;
+                        extent.physical_end = extent.logical_end;
+                    }
+                }
+                source_extents[source_row_axis] = source_row;
+                source_extents[source_column_axis] = source_column;
+                destination_extents[destination_row_axis] = destination_row;
+                destination_extents[destination_column_axis] = destination_column;
+                pieces.push((
+                    ShardView {
+                        shard: source.shard,
+                        extents: source_extents,
+                    },
+                    ShardView {
+                        shard: destination.shard,
+                        extents: destination_extents,
+                    },
+                ));
+            }
         }
     }
     Ok(pieces)

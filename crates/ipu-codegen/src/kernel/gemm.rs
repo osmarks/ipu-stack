@@ -5,6 +5,103 @@ use crate::mid::MidOperationKind;
 
 use serde::{Deserialize, Serialize};
 
+/// Traverse one selected resident product. Batch matrices occupy separate
+/// panels; this changes kernel calls, not the distributed algorithm or storage.
+/// Costing uses representative extents and lowering uses actual shard extents.
+pub(crate) fn invocations(
+    kernel: &MidOperationKind,
+    extents: [&[crate::ShardExtent]; 3],
+) -> Result<Vec<(MidOperationKind, [Vec<crate::ShardExtent>; 3])>, KernelError> {
+    let MidOperationKind::Gemm {
+        axes,
+        multiply,
+        mode,
+        ..
+    } = *kernel
+    else {
+        return Err(KernelError::RequirementMismatch);
+    };
+    let [left, right, output] = extents;
+    let li = axes
+        .left_inner
+        .resolve(left.len())
+        .map_err(|_| KernelError::RequirementMismatch)?;
+    let ri = axes
+        .right_inner
+        .resolve(right.len())
+        .map_err(|_| KernelError::RequirementMismatch)?;
+    let oc = axes
+        .output_column
+        .resolve(output.len())
+        .map_err(|_| KernelError::RequirementMismatch)?;
+    let rc = 2 * right.len() - 3 - ri;
+    let width = |e: crate::ShardExtent| e.physical_end - e.start;
+    let batches = output[..output.len() - 2]
+        .iter()
+        .map(|&e| width(e))
+        .product::<u32>();
+    let k = width(left[li]);
+    let n = width(output[oc]);
+    if batches == 0 || k == 0 || n == 0 {
+        return Ok(Vec::new());
+    }
+    let kb = if batches > 1 {
+        if multiply == Precision::F16 { 16 } else { 32 }
+    } else {
+        k
+    };
+    let nb = if batches > 1 { 16 } else { n };
+    let slice = |e: &mut crate::ShardExtent, start: u32, count: u32| {
+        e.start += start;
+        e.physical_end = (e.start + count).min(e.physical_end);
+        e.logical_end = e.logical_end.min(e.physical_end).max(e.start);
+    };
+    let mut calls = Vec::new();
+    for column in (0..n).step_by(nb as usize) {
+        for inner in (0..k).step_by(kb as usize) {
+            for batch in 0..batches {
+                let mut regions = [left.to_vec(), right.to_vec(), output.to_vec()];
+                let mut remaining = batch;
+                for axis in (0..output.len() - 2).rev() {
+                    let coordinate = remaining % width(output[axis]);
+                    remaining /= width(output[axis]);
+                    slice(&mut regions[2][axis], coordinate, 1);
+                    for operand in 0..2 {
+                        if let Some(input_axis) =
+                            (axis + regions[operand].len()).checked_sub(output.len())
+                        {
+                            let extent = &mut regions[operand][input_axis];
+                            slice(extent, if width(*extent) == 1 { 0 } else { coordinate }, 1);
+                        }
+                    }
+                }
+                slice(&mut regions[0][li], inner, kb);
+                slice(&mut regions[1][ri], inner, kb);
+                slice(&mut regions[1][rc], column, nb);
+                slice(&mut regions[2][oc], column, nb);
+                let mut call = kernel.clone();
+                if let MidOperationKind::Gemm {
+                    inner_block,
+                    output_columns,
+                    mode: call_mode,
+                    ..
+                } = &mut call
+                {
+                    *inner_block = width(regions[0][li]);
+                    *output_columns = width(regions[2][oc]);
+                    *call_mode = if inner == 0 {
+                        mode
+                    } else {
+                        GemmKernelMode::Accumulate
+                    };
+                }
+                calls.push((call, regions));
+            }
+        }
+    }
+    Ok(calls)
+}
+
 fn cycles(
     multiply: Precision,
     weights: GemmWeightLoad,
@@ -46,7 +143,7 @@ fn cycles(
     )
 }
 
-/// Matrix axes and logical arithmetic bounds for a selected GEMM invocation.
+/// Matrix axes and logical arithmetic bounds for a GEMM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmAxes {
     pub left_inner: crate::TensorAxis,

@@ -1040,7 +1040,6 @@ fn quantize(value: f32, precision: Precision) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
 
     #[test]
     fn diagnostic_selection_preserves_backing_row_strides() -> Result<()> {

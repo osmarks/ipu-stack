@@ -15,8 +15,24 @@ pub(super) fn default_format(
         .operations()
         .iter()
         .find(|op| high.operation_inputs(op).any(|id| id == value));
+    let shape = high
+        .value_shape(value)
+        .ok_or(PlanningError::InvalidFragment("unknown parameter"))?;
     match consumer.map(|op| &op.kind) {
         None | Some(OperationKind::Add | OperationKind::Gelu) => {}
+        Some(OperationKind::Gemm(options)) => {
+            let left = consumer.unwrap().inputs[0] == value;
+            return Ok(super::gemm::parameter_format(
+                shape,
+                left,
+                if left {
+                    options.transpose_left
+                } else {
+                    options.transpose_right
+                },
+                config,
+            ));
+        }
         // Do not guess row-major storage for a future packed-kernel consumer.
         Some(_) => {
             return Err(PlanningError::Unimplemented(
@@ -24,9 +40,6 @@ pub(super) fn default_format(
             ));
         }
     }
-    let shape = high
-        .value_shape(value)
-        .ok_or(PlanningError::InvalidFragment("unknown parameter"))?;
     let mut format = compact_format(shape, config);
     if shape.0.len() >= 2 {
         let rows = shape.0[shape.0.len() - 2];

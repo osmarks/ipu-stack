@@ -226,6 +226,8 @@ enum Workload {
     GemmSmoke,
     /// Numerically verify an F16 GEMM with batched activations.
     BatchedGemmSmoke,
+    /// Verify transposed operands, independent batch broadcasting and padded tails.
+    TransposedGemmSmoke,
     /// Numerically verify GEMM-GeLU-GEMM-GeLU with Gaussian data.
     MlpSmoke,
     /// Verify planned Add/GeLU, residual lifetimes, fusion and redistribution.
@@ -346,6 +348,7 @@ fn main() -> Result<()> {
             arguments.workload,
             Workload::GemmSmoke
                 | Workload::BatchedGemmSmoke
+                | Workload::TransposedGemmSmoke
                 | Workload::MlpSmoke
                 | Workload::ElementwiseSmoke
                 | Workload::GemmBenchmark
@@ -561,6 +564,27 @@ fn main() -> Result<()> {
                     layout: Layout::block_major_matrix(64, active_tiles),
                 },
             );
+    } else if matches!(arguments.workload, Workload::TransposedGemmSmoke) {
+        let left = graph.host_input("left", [2, 1, 47, 7])?;
+        let right = graph.parameter("right", [1, 3, 34, 47])?;
+        let output = graph.gemm_with_options(
+            left,
+            right,
+            ipu_codegen::GemmOptions {
+                transpose_left: true,
+                transpose_right: true,
+            },
+        )?;
+        graph.set_outputs([output])?;
+        for input in [left, right] {
+            pipeline = pipeline.with_input(
+                input,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::row_sharded(1),
+                },
+            );
+        }
     } else if matches!(arguments.workload, Workload::ElementwiseSmoke) {
         // Different input ownership requires movement; 104 columns exercises
         // worker tails. The first sum escapes fusion through the residual,
@@ -999,7 +1023,9 @@ fn main() -> Result<()> {
                 )?;
             } else if matches!(
                 arguments.workload,
-                Workload::MlpSmoke | Workload::SiglipAttentionBenchmark
+                Workload::MlpSmoke
+                    | Workload::TransposedGemmSmoke
+                    | Workload::SiglipAttentionBenchmark
             ) {
                 let (_, maximum_error) = run_reference(
                     &runtime,

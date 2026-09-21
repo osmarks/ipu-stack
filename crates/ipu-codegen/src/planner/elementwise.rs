@@ -5,10 +5,7 @@ use super::candidates::{Candidate, LiveValues};
 use super::{BoundaryLayouts, PlanningError, PlanningResult};
 use crate::config::PipelineConfig;
 use crate::graph::{HighGraph, OperationKind, ValueId};
-use crate::mid::{
-    CoordinateMapping, MidOperation, MidOperationKind, OperandIndexing, PackingPolicy,
-    default_copy_policy,
-};
+use crate::mid::{MidOperation, MidOperationKind, OperandIndexing};
 use crate::tensor::{Layout, OwnerMap, Precision, TensorType};
 use std::collections::BTreeMap;
 
@@ -148,28 +145,7 @@ fn build(
             continue;
         }
         let original = candidate.bindings[&input];
-        let from = &candidate.graph.values[original.index() as usize];
-        let value = if from.tensor_type == tensor && from.owners == owners {
-            original
-        } else {
-            let policy =
-                default_copy_policy(&from.tensor_type.format.layout, &tensor.format.layout);
-            let copied = candidate.value(input, tensor.clone(), owners.clone());
-            candidate.graph.operations.push(MidOperation {
-                source: Some(op.id),
-                inputs: vec![original],
-                results: vec![copied],
-                kind: MidOperationKind::Copy {
-                    mapping: CoordinateMapping::default(),
-                    policy,
-                    packing: PackingPolicy::Staged,
-                },
-                operands: Vec::new(),
-                output_aliases: Vec::new(),
-                output_windows: Vec::new(),
-            });
-            copied
-        };
+        let value = candidate.copy(op.id, original, tensor.clone(), Vec::new());
         inputs.push(value);
         prepared.insert(input, value);
     }

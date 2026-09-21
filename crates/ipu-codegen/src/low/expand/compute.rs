@@ -1,5 +1,5 @@
 //! Bind executable mid computations to resident tensor regions. Algorithm
-//! construction and iteration are complete before this stage.
+//! choices are complete before this stage; kernel families traverse local panels.
 
 use super::*;
 use crate::OperandIndexing;
@@ -117,22 +117,43 @@ impl TileGraphBuilder {
             {
                 continue;
             }
-            let mut kind = kernel.clone();
-            if let MidOperationKind::Gemm {
-                axes,
-                inner_block,
-                output_columns,
-                ..
-            } = &mut kind
-            {
-                let li = axes.left_inner.resolve(inputs[0].extents.len())?;
-                let oc = axes.output_column.resolve(results[0].extents.len())?;
-                *inner_block = inputs[0].extents[li].physical_end - inputs[0].extents[li].start;
-                *output_columns =
-                    results[0].extents[oc].physical_end - results[0].extents[oc].start;
+            if matches!(kernel, MidOperationKind::Gemm { .. }) {
+                for (kind, extents) in crate::kernel::gemm::invocations(
+                    kernel,
+                    [&inputs[0].extents, &inputs[1].extents, &results[0].extents],
+                )? {
+                    let [left, right, output] = extents;
+                    let call_inputs = vec![
+                        ShardView {
+                            shard: inputs[0].shard,
+                            extents: left,
+                        },
+                        ShardView {
+                            shard: inputs[1].shard,
+                            extents: right,
+                        },
+                    ];
+                    let call_outputs = vec![ShardView {
+                        shard: results[0].shard,
+                        extents: output,
+                    }];
+                    let run = self.bind_kernel(
+                        operation_provenance(operation),
+                        kind,
+                        call_inputs,
+                        call_outputs,
+                    )?;
+                    self.append_kernel(body, tile, run)?;
+                }
+            } else {
+                let run = self.bind_kernel(
+                    operation_provenance(operation),
+                    kernel.clone(),
+                    inputs,
+                    results,
+                )?;
+                self.append_kernel(body, tile, run)?;
             }
-            let run = self.bind_kernel(operation_provenance(operation), kind, inputs, results)?;
-            self.append_kernel(body, tile, run)?;
         }
         Ok(())
     }

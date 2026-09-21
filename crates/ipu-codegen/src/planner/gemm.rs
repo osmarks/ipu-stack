@@ -1,0 +1,393 @@
+//! GEMM alternatives are explicit M/N/K grids. Preparation, independent partial
+//! products, and their reduction are emitted here, before costing or lowering.
+
+use super::candidates::{Candidate, LiveValues};
+use super::{BoundaryLayouts, PlanningError, PlanningResult};
+use crate::graph::{GemmOptions, HighGraph, ValueId};
+use crate::kernel::{AccumulationPrecision, GemmAxes, GemmKernelMode, GemmWeightLoad};
+use crate::mid::{MidOperation, MidOperationKind, OperandIndexing};
+use crate::{
+    AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, MemoryClass, OwnerMap, Padding,
+    PipelineConfig, Precision, TensorAxis, TensorFormat, TensorShape, TensorTiling, TensorType,
+};
+
+fn partitions(extent: u32, tiles: u16) -> Vec<u16> {
+    let maximum = extent.min(u32::from(tiles)) as u16;
+    let mut result = vec![maximum];
+    let mut n = 1u16;
+    while n < maximum {
+        result.push(n);
+        let Some(next) = n.checked_mul(2) else {
+            break;
+        };
+        n = next;
+    }
+    result.sort_unstable();
+    result
+}
+
+/// Packed, unreplicated initial storage. Choose a balanced two-axis partition;
+/// the consumer's compute grid may subsequently request replicas or regrouping.
+pub(super) fn parameter_format(
+    shape: &TensorShape,
+    left: bool,
+    transposed: bool,
+    config: &PipelineConfig,
+) -> TensorFormat {
+    let rank = shape.0.len();
+    let inner = rank - if left != transposed { 1 } else { 2 };
+    let outer = if inner == rank - 1 {
+        rank - 2
+    } else {
+        rank - 1
+    };
+    let mut best = None;
+    for p in partitions(
+        shape.0[outer].div_ceil(if left { 1 } else { 16 }),
+        config.tile_count,
+    ) {
+        let q = (shape.0[inner].div_ceil(16)).min(u32::from(config.tile_count / p)) as u16;
+        let mut layout = operand_layout(left, transposed, p * q, p, q, 1, 16, 16);
+        layout.memory_class = MemoryClass::Ipu21Standard;
+        let score = layout.resolve(shape).unwrap().maximum_tile_elements();
+        if best.as_ref().is_none_or(|(old, _)| score < *old) {
+            best = Some((score, layout));
+        }
+    }
+    TensorFormat {
+        precision: Precision::F16,
+        layout: best.unwrap().1,
+    }
+}
+
+fn operand_layout(
+    left: bool,
+    transposed: bool,
+    tiles: u16,
+    outer: u16,
+    inner: u16,
+    replicas: u16,
+    k: u32,
+    n: u32,
+) -> Layout {
+    let (outer_axis, inner_axis) = if left != transposed { (2, 1) } else { (1, 2) };
+    let order = if left {
+        ElementOrder::Amp(if transposed {
+            AmpOrder::TransposedLeft
+        } else {
+            AmpOrder::Left
+        })
+    } else if transposed {
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+            row_block: k as u16,
+            column_block: 16,
+        })
+    } else {
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: k as u16,
+            column_block: 16,
+        })
+    };
+    Layout {
+        order,
+        tiling: TensorTiling {
+            tile_count: tiles,
+            replicas,
+            axes: vec![
+                AxisTiling::new(
+                    TensorAxis::FromEnd(outer_axis),
+                    outer,
+                    if left { 1 } else { n },
+                    Padding::Zero,
+                )
+                .with_tile_stride(if left { inner * replicas } else { 1 }),
+                AxisTiling::new(TensorAxis::FromEnd(inner_axis), inner, k, Padding::Zero)
+                    .with_tile_stride(if left { replicas } else { outer }),
+            ],
+        },
+        memory_class: if left {
+            MemoryClass::Ipu21Standard
+        } else {
+            MemoryClass::Ipu21Interleaved
+        },
+    }
+}
+
+pub(super) fn generate(
+    high: &HighGraph,
+    position: usize,
+    live: &LiveValues,
+    choices: &BoundaryLayouts,
+    config: &PipelineConfig,
+    selectable: &[ValueId],
+    options: GemmOptions,
+) -> PlanningResult<Vec<Candidate>> {
+    let op = &high.operations()[position];
+    let sources = [&live[&op.inputs[0]].tensor, &live[&op.inputs[1]].tensor];
+    let precision = match (sources[0].format.precision, sources[1].format.precision) {
+        (Precision::F16, p) | (p, Precision::F16) if p != Precision::F32 => p,
+        (a @ Precision::F8F143 { .. }, b) if a == b => a,
+        _ => {
+            return Err(PlanningError::Unimplemented(
+                "FP32 GEMM or independent FP8 operand scales",
+            ));
+        }
+    };
+    let shape = high.value_shape(op.results[0]).unwrap();
+    let rank = shape.0.len();
+    let m = shape.0[rank - 2];
+    let n = shape.0[rank - 1];
+    let k =
+        sources[0].shape.0[sources[0].shape.0.len() - if options.transpose_left { 2 } else { 1 }];
+    let grain = if precision == Precision::F16 { 16 } else { 32 };
+    let mut candidates = Vec::new();
+    for rows in partitions(m, config.tile_count) {
+        for columns in partitions(n.div_ceil(16), config.tile_count / rows) {
+            for inner in partitions(k.div_ceil(grain), config.tile_count / rows / columns) {
+                let tiles = rows * columns * inner;
+                let kw = k.div_ceil(grain).div_ceil(u32::from(inner)) * grain;
+                let nw = n.div_ceil(16).div_ceil(u32::from(columns)) * 16;
+                if kw > u32::from(u16::MAX) {
+                    continue;
+                }
+                let operands = [
+                    TensorType {
+                        shape: sources[0].shape.clone(),
+                        format: TensorFormat {
+                            precision,
+                            layout: operand_layout(
+                                true,
+                                options.transpose_left,
+                                tiles,
+                                rows,
+                                inner,
+                                columns,
+                                kw,
+                                nw,
+                            ),
+                        },
+                    },
+                    TensorType {
+                        shape: sources[1].shape.clone(),
+                        format: TensorFormat {
+                            precision,
+                            layout: operand_layout(
+                                false,
+                                options.transpose_right,
+                                tiles,
+                                columns,
+                                inner,
+                                rows,
+                                kw,
+                                nw,
+                            ),
+                        },
+                    },
+                ];
+                let mut homes = vec![Vec::new()];
+                for (i, &id) in op.inputs.iter().enumerate() {
+                    if !selectable.contains(&id)
+                        || op.inputs[..i].contains(&id)
+                        || sources[i] == &operands[i]
+                    {
+                        continue;
+                    }
+                    for j in 0..homes.len() {
+                        let mut home = homes[j].clone();
+                        let mut resident = operands[i].clone();
+                        resident.format.precision = sources[i].format.precision;
+                        home.push((id, resident));
+                        homes.push(home);
+                    }
+                }
+                for home in homes {
+                    let candidate = build(
+                        high,
+                        position,
+                        live,
+                        config.tile_count,
+                        options,
+                        &operands,
+                        [rows, columns, inner],
+                        kw,
+                        nw,
+                        &home,
+                        choices.get(&op.results[0]).and_then(Option::as_ref),
+                    );
+                    if candidate.graph.validate().is_ok() {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn build(
+    high: &HighGraph,
+    position: usize,
+    live: &LiveValues,
+    tile_count: u16,
+    options: GemmOptions,
+    operands: &[TensorType; 2],
+    [rows, columns, inner]: [u16; 3],
+    kw: u32,
+    nw: u32,
+    homes: &[(ValueId, TensorType)],
+    output_layout: Option<&Layout>,
+) -> Candidate {
+    let op = &high.operations()[position];
+    let origin = op.results[0];
+    let shape = high.value_shape(origin).unwrap();
+    let mut candidate = Candidate::inputs(high, live, tile_count, position + 1);
+    for (id, tensor) in homes {
+        let input = candidate.bindings[id];
+        candidate.graph.values[input.index() as usize].tensor_type = tensor.clone();
+    }
+    let inputs = op
+        .inputs
+        .iter()
+        .zip(operands)
+        .enumerate()
+        .map(|(operand, (id, tensor))| {
+            let mut input = candidate.bindings[id];
+            let from = candidate.graph.values[input.index() as usize]
+                .tensor_type
+                .format
+                .precision;
+            let mut preparation = tensor.clone();
+            preparation.format.precision = from;
+            // Pack before distribution when logical cuts are not word-aligned.
+            // Exchange then moves complete native panels.
+            if ((operand == 0 && options.transpose_left)
+                || !(tensor.shape.0.last().unwrap() * tensor.format.precision.bytes() as u32)
+                    .is_multiple_of(4))
+                && candidate.graph.values[input.index() as usize]
+                    .tensor_type
+                    .format
+                    .layout
+                    .order
+                    != tensor.format.layout.order
+            {
+                let mut packed = preparation.clone();
+                packed.format.layout.tiling.tile_count = 1;
+                packed.format.layout.tiling.replicas = 1;
+                for axis in &mut packed.format.layout.tiling.axes {
+                    axis.partitions = 1;
+                    axis.tile_stride = Some(1);
+                }
+                input = candidate.copy(op.id, input, packed, Vec::new());
+            }
+            input = candidate.copy(op.id, input, preparation, Vec::new());
+            if from != tensor.format.precision {
+                let output = candidate.value(*id, tensor.clone(), OwnerMap::default());
+                candidate.graph.operations.push(MidOperation {
+                    source: Some(op.id),
+                    inputs: vec![input],
+                    results: vec![output],
+                    kind: MidOperationKind::Cast {
+                        from,
+                        to: tensor.format.precision,
+                    },
+                    operands: vec![OperandIndexing::local()],
+                    output_aliases: Vec::new(),
+                    output_windows: Vec::new(),
+                });
+                input = output;
+            }
+            input
+        })
+        .collect::<Vec<_>>();
+    let rank = shape.0.len();
+    let mut result_type = TensorType {
+        shape: shape.clone(),
+        format: TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::amp_left_result_grid(
+                nw,
+                rows * columns,
+                rows,
+                columns,
+                crate::GridOrder::ColumnsFast,
+            ),
+        },
+    };
+    let mut partial_type = result_type.clone();
+    if inner > 1 {
+        partial_type.shape.0.insert(0, u32::from(inner));
+        partial_type.format.layout.tiling.tile_count *= inner;
+        for axis in &mut partial_type.format.layout.tiling.axes {
+            if axis.axis == TensorAxis::FromEnd(2) {
+                axis.tile_stride = Some(columns * inner);
+            }
+        }
+        partial_type.format.layout.tiling.axes.push(
+            AxisTiling::new(TensorAxis::FromStart(0), inner, 1, Padding::Reject)
+                .with_tile_stride(columns),
+        );
+    }
+    let axes = GemmAxes {
+        left_inner: TensorAxis::FromEnd(if options.transpose_left { 2 } else { 1 }),
+        right_inner: TensorAxis::FromEnd(if options.transpose_right { 1 } else { 2 }),
+        output_column: TensorAxis::FromEnd(1),
+        valid_inner: None,
+        valid_columns: None,
+    };
+    let mut result = candidate.value(origin, partial_type, OwnerMap::default());
+    candidate.graph.operations.push(MidOperation {
+        source: Some(op.id),
+        inputs,
+        results: vec![result],
+        kind: MidOperationKind::Gemm {
+            axes,
+            multiply: operands[0].format.precision,
+            accumulate: if operands[0].format.precision == Precision::F16 {
+                AccumulationPrecision::F32
+            } else {
+                AccumulationPrecision::F16
+            },
+            mode: GemmKernelMode::Initialize,
+            weights: GemmWeightLoad::Interleaved,
+            inner_block: kw,
+            output_columns: nw,
+        },
+        operands: vec![OperandIndexing::local(); 2],
+        output_windows: Vec::new(),
+        output_aliases: Vec::new(),
+    });
+    if inner > 1 {
+        // Row-major contributor stacks make the reduction's contiguous access
+        // contract explicit. Packing/reduction fusion is a separate optimization.
+        result_type.format.layout.order = ElementOrder::RowMajor;
+        result_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
+        let mut receive = result_type.clone();
+        receive.shape.0.insert(0, 1);
+        let seed = candidate.copy(op.id, result, receive.clone(), Vec::new());
+        receive.shape.0[0] = u32::from(inner - 1);
+        let mut offsets = vec![0; rank + 1];
+        offsets[0] = 1;
+        let rest = candidate.copy(op.id, result, receive, offsets);
+        let reduced = candidate.value(origin, result_type.clone(), OwnerMap::default());
+        candidate.graph.operations.push(MidOperation {
+            source: Some(op.id),
+            inputs: vec![seed, rest],
+            results: vec![reduced],
+            kind: MidOperationKind::ReductionSum { partials: inner },
+            operands: vec![OperandIndexing::local(); 2],
+            output_aliases: Vec::new(),
+            output_windows: Vec::new(),
+        });
+        result = reduced;
+    }
+    if let Some(layout) = output_layout {
+        result_type.format.layout = layout.clone();
+        result = candidate.copy(op.id, result, result_type, Vec::new());
+    }
+    candidate.bindings.insert(origin, result);
+    candidate
+}
+
+#[cfg(test)]
+#[path = "gemm_tests.rs"]
+mod tests;
