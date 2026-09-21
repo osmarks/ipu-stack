@@ -3,6 +3,12 @@
 include!(concat!(env!("OUT_DIR"), "/runtime_layout.rs"));
 pub const RUNTIME_STATE_BYTES: u32 =
     WORKER_STACK_HEADROOM + super::WORKER_CONTEXTS * WORKER_SYNC_STRIDE;
+pub const PROFILE_START_CYCLE: u32 = RUNTIME_STATE_BASE + 4;
+pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
+pub const APPLICATION_ENTRY_BYTES: u32 = 8;
+pub const SUPPORT_START: u32 = super::loader_abi::APPLICATION_LOAD_BASE + APPLICATION_ENTRY_BYTES;
+pub const RUNTIME_EXECUTABLE_START: u32 = (RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES)
+    .next_multiple_of(super::memory::TILE_MEMORY_ELEMENT_SIZE);
 pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
 pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
 pub const COMPLETED_SYMBOL: &str = "ipu_stack_static_completed";

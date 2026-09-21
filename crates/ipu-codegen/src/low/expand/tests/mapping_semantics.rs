@@ -5,6 +5,7 @@ use crate::{
     AxisTiling, CoordinateMapping, GraphInputKind, MidInput, MidValue, Padding, TensorAxis,
     TensorShape, ValueId,
 };
+use ipu_target::Target;
 
 fn coordinates(mut index: u32, shape: &[u32]) -> Vec<u32> {
     let mut result = vec![0; shape.len()];
@@ -118,10 +119,13 @@ fn check_bytes(
     shapes: &[TensorShape],
     mappings: &[CoordinateMapping],
 ) -> Result<(), String> {
-    let graph = expand_tiles(mid, false).map_err(|error| format!("expansion: {error:?}"))?;
+    let graph =
+        expand_tiles(Target::Ipu21, mid, false).map_err(|error| format!("expansion: {error:?}"))?;
     let low = crate::low::lower_to_tiles(&graph, false);
-    let placement = crate::place(&low).map_err(|error| format!("placement: {error:?}"))?;
+    let placement =
+        crate::place(Target::Ipu21, &low).map_err(|error| format!("placement: {error:?}"))?;
     let exchange = crate::exchange::lower_exchanges(
+        Target::Ipu21,
         &low,
         &placement,
         &ipu_target::ipu21::fabric::Topology::c600(),

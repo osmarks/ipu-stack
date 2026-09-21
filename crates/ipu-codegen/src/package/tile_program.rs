@@ -1,5 +1,6 @@
 //! Package already resolved tile programs for low-level diagnostics.
 use super::*;
+use ipu_target::Target;
 use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 
 /// Builds an application from address-resolved tile programs.
@@ -12,12 +13,15 @@ use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 /// Initial values in the host aperture are staged and copied in after this
 /// rendezvous, before the supplied device steps execute.
 pub fn build_tile_program_package(
+    target: Target,
     programs: &[TileProgram],
     data: &[TileProgramData],
     outputs: &[Binding],
     toolchain: &Toolchain,
     runtime_source: &std::path::Path,
 ) -> PackageBuildResult<Application> {
+    let Target::Ipu21 = target;
+
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
     if programs.len() > usize::from(execution_tiles)
@@ -40,7 +44,7 @@ pub fn build_tile_program_package(
     }
 
     let (mut data, aperture) = split_aperture_data(data)?;
-    let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
+    let runtime_artifact = toolchain.compile(target, runtime_source, "static_runtime", &[])?;
     let objects = vec![fs::read(runtime_artifact.object)?];
     let kernels = KernelObjects::default();
     let mut retained_runtime = vec![
@@ -64,8 +68,8 @@ pub fn build_tile_program_package(
             steps: Vec::new(),
         }),
     );
-    let layout = link_runtime(&objects, 0, 0, 0, &kernels, &retained_runtime)?;
-    let mut memory = TileMemoryMap::new();
+    let layout = link_runtime(target, &objects, 0, 0, 0, &kernels, &retained_runtime)?;
+    let mut memory = TileMemoryMap::new(target);
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     // Explicit tile programs bring fixed data addresses; protect linked code
     // before admitting those externally supplied ranges.
@@ -107,7 +111,7 @@ pub fn build_tile_program_package(
     // cannot hold executable code and its reservations precede host metadata.
     for mut segment in aperture {
         let tile = usize::from(segment.tile);
-        let mut scratch = TileMemoryMap::new();
+        let mut scratch = TileMemoryMap::new(target);
         for (start, end) in crate::memory::merge_ranges(
             tile_data[tile]
                 .iter()
@@ -203,6 +207,7 @@ pub fn build_tile_program_package(
     )?;
     let provisional_ranges = memory.free_ranges(host_bounds.clone());
     let provisional_host = host::plan(
+        target,
         &[],
         std::slice::from_ref(&launch),
         &run_outputs,
@@ -218,6 +223,7 @@ pub fn build_tile_program_package(
     protect_executable_elements(&mut memory, [host_code.range.clone()])?;
     let host_ranges = memory.free_ranges(host_bounds);
     let host = host::plan(
+        target,
         &[],
         std::slice::from_ref(&launch),
         &run_outputs,
@@ -248,6 +254,7 @@ pub fn build_tile_program_package(
     let maximum_bytes = programs.iter().try_fold(0u32, |maximum, program| {
         let physical = topology.physical(program.tile)?;
         let generated = emit(
+            target,
             program,
             &layout.symbols,
             &host.programs[usize::from(physical)],
@@ -272,6 +279,7 @@ pub fn build_tile_program_package(
         .map(|program| {
             let physical = topology.physical(program.tile)?;
             Ok(emit(
+                target,
                 program,
                 &layout.symbols,
                 &host.programs[usize::from(physical)],
@@ -297,6 +305,7 @@ pub fn build_tile_program_package(
         segments[physical].extend(host_segments.iter().cloned());
     }
     let context = TileBuildContext {
+        target,
         objects: &objects,
         kernel_plan: &kernels,
         retained_runtime: &retained_runtime,
@@ -314,7 +323,7 @@ pub fn build_tile_program_package(
             &context,
         )?);
     }
-    let mut application = assemble_application(tiles, Vec::new(), &layout, host)?;
+    let mut application = assemble_application(target, tiles, Vec::new(), &layout, host)?;
     for (logical, program) in generated.iter().enumerate() {
         let physical = u32::from(topology.physical(u16::try_from(logical)?)?);
         add_generated_debug_map(&mut application, physical, code_address, program)?;

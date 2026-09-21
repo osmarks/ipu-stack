@@ -3,25 +3,29 @@
 
 use super::*;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 use crate::MidGraph;
 
 /// Price complete replacement sequences with the same overflow and missing-cost rules.
 pub(crate) fn operation_cycles<'a>(
+    target: Target,
     operations: impl IntoIterator<Item = &'a MidOperation>,
     values: &[MidValue],
     tile_count: u16,
 ) -> Option<u64> {
     operations.into_iter().try_fold(0u64, |sum, op| {
-        operation_cost(op, values, tile_count).map(|(cost, _, _)| sum.saturating_add(cost.total))
+        operation_cost(target, op, values, tile_count)
+            .map(|(cost, _, _)| sum.saturating_add(cost.total))
     })
 }
 
 pub(crate) fn analyze(
+    target: Target,
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    analyze_observed(program, copies, &mut ())
+    analyze_observed(target, program, copies, &mut ())
 }
 
 /// The normal estimator uses the zero-cost observer. Diagnostics record the
@@ -55,11 +59,12 @@ pub(super) trait MemoryObserver {
 impl MemoryObserver for () {}
 
 pub(super) fn analyze_observed(
+    target: Target,
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    analyze_storage::<true>(program, copies, observer)
+    analyze_storage::<true>(target, program, copies, observer)
 }
 
 /// A fitting upper bound needs no refinement. Every failed capacity screen is
@@ -69,7 +74,7 @@ pub(crate) fn analyze_with_budget(
     copies: &BTreeMap<MidValueId, u32>,
     config: &crate::PipelineConfig,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let bound = analyze_storage::<false>(program, copies, &mut ())?;
+    let bound = analyze_storage::<false>(config.target, program, copies, &mut ())?;
     if bound.1.fits_with_budget(
         config.target,
         config.standard_memory_reservation_bytes,
@@ -77,11 +82,12 @@ pub(crate) fn analyze_with_budget(
     ) {
         Some(bound)
     } else {
-        analyze(program, copies)
+        analyze(config.target, program, copies)
     }
 }
 
 fn analyze_storage<const PER_TILE: bool>(
+    target: Target,
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
@@ -169,9 +175,9 @@ fn analyze_storage<const PER_TILE: bool>(
         let count = copies.get(&value.id).copied().unwrap_or(1);
         let alignment = if element[id] {
             u64::from(if class == MemoryClass::Ipu21Interleaved {
-                ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
+                target.interleaved_memory_element_bytes()
             } else {
-                ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
+                target.standard_memory_element_bytes()
             })
         } else {
             1
@@ -285,7 +291,7 @@ fn analyze_storage<const PER_TILE: bool>(
             live[roots[value.index() as usize]] = true;
         }
         let (price, scratch, row_bytes) =
-            operation_cost(operation, &program.values, program.tile_count)?;
+            operation_cost(target, operation, &program.values, program.tile_count)?;
         tracing::debug!(index, source = ?operation.source, count,
             cycles = price.total, exchange = price.exchange,
             "estimated mid operation");
@@ -371,6 +377,7 @@ fn analyze_storage<const PER_TILE: bool>(
 }
 
 pub(crate) fn operation_cost(
+    target: Target,
     operation: &MidOperation,
     values: &[MidValue],
     tile_count: u16,
@@ -425,7 +432,8 @@ pub(crate) fn operation_cost(
                     if policy == crate::CopyPolicy::LocalKernel {
                         return None;
                     }
-                    price.exchange = super::cycles::exchange_endpoint_cycles(&traffic.exchange, 1);
+                    price.exchange =
+                        super::cycles::exchange_endpoint_cycles(target, &traffic.exchange, 1);
                     let fragments = if mapping.is_identity() {
                         super::movement::grid_fragments(input, output).unwrap_or(0)
                     } else {
@@ -433,6 +441,7 @@ pub(crate) fn operation_cost(
                     }
                     .max(traffic.exchange.maximum_fragments());
                     let (fragment_cycles, footprint) = exchange_fragment_price(
+                        target,
                         traffic.exchange.maximum_payload_bytes(),
                         1,
                         fragments,
@@ -474,16 +483,14 @@ pub(crate) fn operation_cost(
                     .unwrap_or_else(|| {
                         payload.div_ceil(movement_fragment_bytes(input, output).max(1))
                     });
-                let (exchange, footprint) = exchange_fragment_price(payload, 1, fragments);
+                let (exchange, footprint) = exchange_fragment_price(target, payload, 1, fragments);
                 price.exchange = exchange;
                 rows = footprint;
             }
             price.total = price
                 .exchange
-                .saturating_add(local_bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
-                .saturating_add(
-                    local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles),
-                );
+                .saturating_add(local_bytes.div_ceil(target.costs().local_copy_bytes_per_cycle))
+                .saturating_add(local_calls.saturating_mul(target.costs().local_copy_call_cycles));
             if *packing == crate::PackingPolicy::Staged
                 && input.format.precision == output.format.precision
                 && input.format.layout.order != output.format.layout.order
@@ -505,6 +512,7 @@ pub(crate) fn operation_cost(
                     price.total = price
                         .total
                         .saturating_add(crate::kernel::rearrange::estimate(
+                            target,
                             from,
                             crate::storage::TensorStorage {
                                 format: &output.format,
@@ -552,8 +560,9 @@ pub(crate) fn operation_cost(
                     extents,
                 })
                 .collect::<Vec<_>>();
-            price.total = crate::kernel::KernelCall::select(kernel, &inputs, &outputs, None)
-                .map_or(u64::MAX, |call| call.cycles);
+            price.total =
+                crate::kernel::KernelCall::select(target, kernel, &inputs, &outputs, None)
+                    .map_or(u64::MAX, |call| call.cycles);
         }
     }
     Some((price, scratch, rows))

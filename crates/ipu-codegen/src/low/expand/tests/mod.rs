@@ -4,13 +4,14 @@ use super::copy::{
 };
 use crate::mid::MidOperationKind;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
+use ipu_target::Target;
 fn lower_to_tiles(
     graph: &crate::MidGraph,
     checkpoints: bool,
 ) -> super::ExpansionResult<crate::LowGraph> {
     let mut graph = graph.clone();
     graph.compose_copies();
-    let expanded = super::expand_tiles_cached(&graph, true, false, Arc::default())?;
+    let expanded = super::expand_tiles_cached(Target::Ipu21, &graph, true, false, Arc::default())?;
     Ok(crate::low::lower_to_tiles(&expanded, checkpoints))
 }
 use super::*;
@@ -36,7 +37,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             let input = graph.host_input("input", [16, 16]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(4).with_input(input, format(1));
+            let config = PipelineConfig::new(Target::Ipu21, 4).with_input(input, format(1));
             let mid = crate::planner::plan(
                 &graph,
                 &crate::planner::boundary_layouts(&graph, &config),
@@ -44,7 +45,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 crate::planner::SearchLimits::default(),
             )
             .unwrap();
-            let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
+            let mut builder = TileGraphBuilder::new(Target::Ipu21, &mid, Arc::default()).unwrap();
             let mut ids = vec![builder.program.shards[0].id];
             for tile in [1, 2, 1] {
                 let mut shard = builder.program.shards[0].clone();
@@ -176,7 +177,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         let mut graph = HighGraph::new();
         let input = graph.host_input("input", [16, 16]).unwrap();
         graph.set_outputs([input]).unwrap();
-        let config = PipelineConfig::new(3).with_input(input, format(1));
+        let config = PipelineConfig::new(Target::Ipu21, 3).with_input(input, format(1));
         let mid = crate::planner::plan(
             &graph,
             &crate::planner::boundary_layouts(&graph, &config),
@@ -184,7 +185,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             crate::planner::SearchLimits::default(),
         )
         .unwrap();
-        let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
+        let mut builder = TileGraphBuilder::new(Target::Ipu21, &mid, Arc::default()).unwrap();
         let source = builder.full_view(builder.program.shards[0].id);
         let mut mappings = Vec::new();
         for tile in 0..=remote_count {
@@ -234,6 +235,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             let low = crate::low::lower_to_tiles(&Arc::new(graph), false);
             // Force standard storage into the shared upper region as well.
             let placement = crate::place::place_with_ranges(
+                Target::Ipu21,
                 &low,
                 &[
                     (
@@ -271,7 +273,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
     let mut graph = HighGraph::new();
     let input = graph.host_input("input", [1, 4, 32]).unwrap();
     graph.set_outputs([input]).unwrap();
-    let config = PipelineConfig::new(1).with_input(input, format(1));
+    let config = PipelineConfig::new(Target::Ipu21, 1).with_input(input, format(1));
     let mid = crate::planner::plan(
         &graph,
         &crate::planner::boundary_layouts(&graph, &config),
@@ -279,7 +281,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
         crate::planner::SearchLimits::default(),
     )
     .unwrap();
-    let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
+    let mut builder = TileGraphBuilder::new(Target::Ipu21, &mid, Arc::default()).unwrap();
     let source = builder.program.shards[0].id;
     let mut source_view = builder.full_view(source);
     source_view.extents = crate::OperandWindow(vec![(1, 0, 2)])
@@ -435,7 +437,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles).with_input(input, tensor_format);
+        let config = PipelineConfig::new(Target::Ipu21, tiles).with_input(input, tensor_format);
 
         let mid = crate::planner::plan(
             &graph,
@@ -491,7 +493,7 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles).with_input(input, input_format);
+        let config = PipelineConfig::new(Target::Ipu21, tiles).with_input(input, input_format);
         let mut layouts = crate::planner::boundary_layouts(&graph, &config);
         layouts.insert(output, Some(output_format.layout));
         let mid = crate::planner::plan(
@@ -560,7 +562,7 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         let input = graph.host_input("input", [rows, columns]).unwrap();
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles).with_input(input, input_format);
+        let config = PipelineConfig::new(Target::Ipu21, tiles).with_input(input, input_format);
         let mut layouts = crate::planner::boundary_layouts(&graph, &config);
         layouts.insert(output, Some(target_format.layout));
         let mid = crate::planner::plan(
@@ -989,7 +991,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
         let right = graph.host_input("right", [rows, columns]).unwrap();
         let output = graph.add(left, right).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(tiles)
+        let config = PipelineConfig::new(Target::Ipu21, tiles)
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = crate::planner::plan(
@@ -1006,7 +1008,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
             for work in tile.work.iter() {
                 if let BlockOperation::Compute { run, .. } = work {
                     let run = &low.kernel_runs[run.0 as usize];
-                    run.call(None).unwrap();
+                    run.call(Target::Ipu21, None).unwrap();
                     assert_eq!(
                         low.shards[run.outputs[0].shard.index() as usize].tile,
                         tile.tile
@@ -1099,7 +1101,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
         ..MidGraph::default()
     };
     let low = lower_to_tiles(&mid, false).unwrap();
-    let placement = crate::place(&low).unwrap();
+    let placement = crate::place(Target::Ipu21, &low).unwrap();
     let repeat = &low.repeat_runs[0];
     let target = placement.shard_addresses[&repeat.binding.carried[0].result];
     assert!(
@@ -1212,7 +1214,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let input = graph.host_input("input", [3, 17, 32]).unwrap();
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
-    let config = PipelineConfig::new(4).with_input(input, format.clone());
+    let config = PipelineConfig::new(Target::Ipu21, 4).with_input(input, format.clone());
     let mut layouts = crate::planner::boundary_layouts(&graph, &config);
     layouts.insert(output, Some(format.layout));
     let mut mid = crate::planner::plan(
@@ -1237,6 +1239,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
 #[test]
 fn complete_panel_grid_stays_one_logical_exchange() {
     let mut state = TileGraphBuilder::new(
+        Target::Ipu21,
         &MidGraph {
             tile_count: 2,
             ..MidGraph::default()
@@ -1331,6 +1334,7 @@ fn complete_panel_grid_stays_one_logical_exchange() {
 #[test]
 fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
     let mut state = TileGraphBuilder::new(
+        Target::Ipu21,
         &MidGraph {
             tile_count: 3,
             ..MidGraph::default()

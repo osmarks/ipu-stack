@@ -1,6 +1,7 @@
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::{Precision, TensorFormat};
+use ipu_target::Target;
 
 const EXACT: SearchLimits = SearchLimits {
     states_per_boundary: None,
@@ -16,7 +17,7 @@ fn fixture() -> (HighGraph, PipelineConfig) {
     let residual = high.add(gelu, x).unwrap();
     let output = high.gelu(residual).unwrap();
     high.set_outputs([output]).unwrap();
-    let mut config = PipelineConfig::new(4);
+    let mut config = PipelineConfig::new(Target::Ipu21, 4);
     config.standard_memory_reservation_bytes = 0;
     for input in [x, bias] {
         config.inputs.insert(
@@ -106,7 +107,7 @@ fn dp_matches_exhaustive_boundary_choices_and_preserves_residual_computation() {
     assert_eq!(execute(&selected), reference.unwrap());
     selected.validate().unwrap();
     // Exercise real binding/lowering, not only the abstract scalar interpreter.
-    crate::low::expand::expand_tiles(&selected, false).unwrap();
+    crate::low::expand::expand_tiles(Target::Ipu21, &selected, false).unwrap();
     for op in &selected.operations {
         assert!(op.source.is_some());
     }
@@ -120,7 +121,7 @@ fn unfused_chain_matches_the_exhaustive_layout_minimum() {
     let b = high.gelu(a).unwrap();
     let c = high.gelu(b).unwrap();
     high.set_outputs([c]).unwrap();
-    let config = PipelineConfig::new(4).with_input(
+    let config = PipelineConfig::new(Target::Ipu21, 4).with_input(
         x,
         TensorFormat {
             precision: Precision::F16,
@@ -183,7 +184,7 @@ fn empty_graph_keeps_identity_outputs_and_checks_memory() {
     let mut high = HighGraph::new();
     let x = high.host_input("x", [16, 16]).unwrap();
     high.set_outputs([x, x]).unwrap();
-    let mut config = PipelineConfig::new(1).with_input(
+    let mut config = PipelineConfig::new(Target::Ipu21, 1).with_input(
         x,
         TensorFormat {
             precision: Precision::F16,
@@ -207,7 +208,7 @@ fn invalid_proposed_layout_does_not_discard_valid_vector_plan() {
     let x = high.host_input("vector", [16]).unwrap();
     let y = high.gelu(x).unwrap();
     high.set_outputs([y]).unwrap();
-    let config = PipelineConfig::new(4).with_input(
+    let config = PipelineConfig::new(Target::Ipu21, 4).with_input(
         x,
         TensorFormat {
             precision: Precision::F16,
@@ -215,5 +216,5 @@ fn invalid_proposed_layout_does_not_discard_valid_vector_plan() {
         },
     );
     let graph = plan(&high, &boundary_layouts(&high, &config), &config, EXACT).unwrap();
-    crate::low::expand::expand_tiles(&graph, false).unwrap();
+    crate::low::expand::expand_tiles(Target::Ipu21, &graph, false).unwrap();
 }

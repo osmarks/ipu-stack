@@ -379,6 +379,7 @@ name = "ipu-elf"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "ipu-target",
  "object",
  "serde",
  "serde_json",

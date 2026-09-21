@@ -12,6 +12,8 @@ use crate::config::PipelineConfig;
 use crate::graph::{HighGraph, Operation, OperationKind, ValueId};
 use crate::mid::MidGraph;
 pub(crate) use budget::SearchLimits;
+#[cfg(test)]
+use ipu_target::Target;
 use search::Search;
 use std::collections::BTreeMap;
 
@@ -121,7 +123,7 @@ mod tests {
         let output = graph.add(input, repeated).unwrap();
         graph.set_outputs([output]).unwrap();
         let fixed = Layout::row_major(TensorTiling::replicated(2));
-        let settings = PipelineConfig::new(2).with_input(
+        let settings = PipelineConfig::new(Target::Ipu21, 2).with_input(
             input,
             TensorFormat {
                 precision: Precision::F16,

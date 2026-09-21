@@ -1,6 +1,7 @@
 //! Device object collection and shared compilation/wrapper construction.
 
 use super::*;
+use ipu_target::Target;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelCompilation {
@@ -18,12 +19,12 @@ pub struct KernelObjects {
 
 impl KernelObjects {
     /// Family construction registers objects directly; this collector only deduplicates them.
-    pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelError> {
+    pub fn from_program(target: Target, program: &crate::TileGraph) -> Result<Self, KernelError> {
         let mut plan = Self::default();
         for work in program.body.walk() {
             match work {
                 BlockOperation::Compute { run, .. } => {
-                    program.kernel_runs[run.0 as usize].call(Some(&mut plan))?;
+                    program.kernel_runs[run.0 as usize].call(target, Some(&mut plan))?;
                 }
                 BlockOperation::Copy { copy, .. } => {
                     plan.symbols

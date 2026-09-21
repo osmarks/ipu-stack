@@ -3,6 +3,7 @@ use ipu_package::{
     Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice, SEGMENT_EXECUTE,
     SEGMENT_READ, Segment,
 };
+use ipu_target::Target;
 use ipu_target::ipu21::runtime_layout::{
     HOST_CLOSE_ADDRESS, HOST_PACKET_ADDRESS, HOST_STAGING_ADDRESS,
 };
@@ -44,6 +45,7 @@ pub(crate) struct HostPackagePlan {
 }
 
 pub(crate) fn plan(
+    target: Target,
     weights: &[Binding],
     inputs: &[Binding],
     outputs: &[Binding],
@@ -51,6 +53,8 @@ pub(crate) fn plan(
     base: u32,
     data_ranges: &[Vec<(u32, u32)>],
 ) -> PackageBuildResult<HostPackagePlan> {
+    let Target::Ipu21 = target;
+
     if data_ranges.len() != usize::from(execution_tiles) {
         return Err(invalid("host plan has no data ranges for every tile"));
     }

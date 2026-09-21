@@ -1,4 +1,5 @@
 use super::*;
+use ipu_target::Target;
 
 fn symbols() -> BTreeMap<String, u32> {
     [
@@ -51,6 +52,7 @@ fn emits_resolved_exchange_and_compute_steps() {
         ],
     };
     let generated = emit(
+        Target::Ipu21,
         &program,
         &symbols(),
         &HostProgram::default(),
@@ -106,6 +108,7 @@ fn rejects_unresolved_or_malformed_inputs() {
     };
     assert!(matches!(
         emit(
+            Target::Ipu21,
             &program,
             &symbols(),
             &HostProgram::default(),
@@ -130,6 +133,7 @@ fn rejects_unresolved_or_malformed_inputs() {
     // even when symbols are missing as well.
     assert!(matches!(
         emit(
+            Target::Ipu21,
             &program,
             &BTreeMap::new(),
             &HostProgram::default(),
@@ -140,6 +144,7 @@ fn rejects_unresolved_or_malformed_inputs() {
     program.steps.clear();
     assert!(matches!(
         emit(
+            Target::Ipu21,
             &program,
             &symbols(),
             &HostProgram::default(),
@@ -218,6 +223,7 @@ fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
             })],
         };
         let generated = emit(
+            Target::Ipu21,
             &program,
             &symbols(),
             &HostProgram::default(),
@@ -257,6 +263,7 @@ fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
             step: 0xffffc000,
         };
         let generated = emit(
+            Target::Ipu21,
             &program,
             &symbols(),
             &HostProgram::default(),
@@ -292,6 +299,7 @@ fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
         });
         for base in [0x52000, 0x80000] {
             let mixed = emit(
+                Target::Ipu21,
                 &program,
                 &symbols(),
                 &HostProgram::default(),
@@ -325,6 +333,7 @@ fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
         exchange.repeat_patches[1].word_offset = 0;
         assert!(
             emit(
+                Target::Ipu21,
                 &program,
                 &symbols(),
                 &HostProgram::default(),

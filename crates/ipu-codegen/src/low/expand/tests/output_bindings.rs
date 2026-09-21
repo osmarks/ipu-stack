@@ -1,5 +1,6 @@
 use super::*;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 use crate::{
     CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandIndexing, TensorAxis, ValueId,
@@ -57,7 +58,7 @@ fn copy_alias_preserves_destination_coordinates_at_a_source_offset() {
     if let MidOperationKind::Copy { mapping, .. } = &mut mid.operations[0].kind {
         mapping.offsets = vec![1, 0];
     }
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let input = graph.value_views(mid.inputs[0].value)[0].shard;
     let mut output = graph.value_views(mid.outputs[0])[0].clone();
     assert_eq!(output.extents[0].start, 0);
@@ -76,7 +77,7 @@ fn copy_alias_preserves_destination_coordinates_at_a_source_offset() {
         &(32..48).collect::<Vec<_>>()
     );
     let low = crate::low::lower_to_tiles(&graph, false);
-    let placement = crate::place(&low).unwrap();
+    let placement = crate::place(Target::Ipu21, &low).unwrap();
     assert_eq!(
         placement.shard_addresses[&output.shard] - placement.shard_addresses[&input],
         64
@@ -88,7 +89,7 @@ fn distributed_copy_borrows_local_storage_and_materializes_remote_storage() {
     let mut mid = copied_columns(16);
     mid.tile_count = 2;
     mid.values[1].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let input = graph.value_views(mid.inputs[0].value)[0].shard;
     let outputs = graph.value_views(mid.outputs[0]);
     assert_eq!(outputs.len(), 2);
@@ -114,7 +115,7 @@ fn distributed_copy_borrows_local_storage_and_materializes_remote_storage() {
             );
         }
     }
-    crate::place(&crate::low::lower_to_tiles(&graph, false)).unwrap();
+    crate::place(Target::Ipu21, &crate::low::lower_to_tiles(&graph, false)).unwrap();
 }
 
 #[test]
@@ -138,7 +139,7 @@ fn copy_elimination_preserves_values_across_in_place_writes() {
             output_windows: vec![],
         });
         mid.outputs.push(MidValueId::from_index(2));
-        let graph = expand_tiles(&mid, false).unwrap();
+        let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
         let input = graph.value_views(MidValueId::from_index(0))[0].shard;
         let output = graph.value_views(MidValueId::from_index(1))[0].shard;
         assert_ne!(
@@ -158,7 +159,7 @@ fn copy_elimination_preserves_values_across_in_place_writes() {
 fn exported_copies_have_complete_storage_and_preserve_values() {
     for columns in [8, 16] {
         let mid = copied_columns(columns);
-        let graph = expand_tiles(&mid, false).unwrap();
+        let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         let input = low.value_views(low.inputs[0].value)[0].shard;
         let output = low.value_views(low.outputs[0])[0].shard;
@@ -166,7 +167,7 @@ fn exported_copies_have_complete_storage_and_preserve_values() {
             low.shards[output.index() as usize].tensor_type.shape.0,
             [4, columns]
         );
-        let placement = crate::place(&low).unwrap();
+        let placement = crate::place(Target::Ipu21, &low).unwrap();
         assert!(placement.shard_addresses.contains_key(&output));
         let source = (0..64u32).collect::<Vec<_>>();
         let actual = if crate::low::storage::storage_root(&low.shards, output) == input {
@@ -220,12 +221,13 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
         crate::AxisTiling::new(TensorAxis::FromEnd(2), 1, 16, crate::Padding::Zero);
     mid.values[0].tensor_type.format.layout = source_layout;
     mid.values[1].tensor_type.format.layout = Layout::logical_linear(4, 4);
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
-    let placement = crate::place(&low).unwrap();
+    let placement = crate::place(Target::Ipu21, &low).unwrap();
     // Each output slice is eight bytes, but the AMP panel interleaves its
     // useful halfwords with padded rows. Raw sends cannot read it.
     let snapshot = crate::exchange::lower_exchanges(
+        Target::Ipu21,
         &low,
         &placement,
         &ipu_target::ipu21::fabric::Topology::c600(),
@@ -289,7 +291,7 @@ fn intersection_conversions_read_materialized_crops() {
         mid.outputs.push(value.id);
         mid.values.push(value);
     }
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
     let source = low.value_views(low.inputs[0].value)[0].shard;
     let borrowed = &low.value_views(mid.values[1].id)[0];
@@ -327,7 +329,7 @@ fn intersection_conversions_read_materialized_crops() {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
     }
-    crate::place(&low).unwrap();
+    crate::place(Target::Ipu21, &low).unwrap();
 }
 
 #[test]
@@ -342,10 +344,11 @@ fn shifted_halfword_crops_pack_before_physical_exchange() {
         unreachable!()
     };
     mapping.offsets = vec![0, 1];
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
-    let placement = crate::place(&low).unwrap();
+    let placement = crate::place(Target::Ipu21, &low).unwrap();
     let snapshot = crate::exchange::lower_exchanges(
+        Target::Ipu21,
         &low,
         &placement,
         &ipu_target::ipu21::fabric::Topology::c600(),
@@ -384,14 +387,14 @@ fn copied_scalar_keeps_its_semantic_broadcast_shape() {
         output_windows: Vec::new(),
     });
     mid.values.push(result);
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     assert!(graph.local_copies.is_empty());
     let run = graph
         .kernel_runs
         .iter()
         .find(|run| run.kernel == MidOperationKind::Add)
         .unwrap();
-    run.call(None).unwrap();
+    run.call(Target::Ipu21, None).unwrap();
     let scalar = &run.inputs[1];
     assert_eq!(
         crate::low::storage::storage_root(&graph.shards, scalar.shard),
@@ -459,15 +462,16 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
             ..MidGraph::default()
         };
         mid.validate().unwrap();
-        let graph = expand_tiles(&mid, false).unwrap();
+        let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        let placement = crate::place(&low).unwrap();
+        let placement = crate::place(Target::Ipu21, &low).unwrap();
         let mut covered = std::collections::BTreeSet::new();
         for run in low.kernel_calls() {
             if run.kernel != MidOperationKind::AddLayerNormMoments {
                 continue;
             }
             crate::materialize_kernel_run(
+                Target::Ipu21,
                 run,
                 &low.shards,
                 &placement.shard_addresses,
@@ -520,7 +524,7 @@ fn writable_aliases_require_complete_copy_buffers() {
         output_windows: vec![],
     });
     mid.values.push(result);
-    let graph = expand_tiles(&mid, false).unwrap();
+    let graph = expand_tiles(Target::Ipu21, &mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
     let copied = low
         .value_views(mid.values[1].id)
@@ -528,9 +532,9 @@ fn writable_aliases_require_complete_copy_buffers() {
         .map(|view| view.shard)
         .collect::<Vec<_>>();
     for run in &low.kernel_runs {
-        run.call(None).unwrap();
+        run.call(Target::Ipu21, None).unwrap();
     }
-    let placement = crate::place(&low).unwrap();
+    let placement = crate::place(Target::Ipu21, &low).unwrap();
     for &shard in &copied {
         let source = low
             .value_views(low.inputs[0].value)

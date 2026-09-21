@@ -1,6 +1,7 @@
 use super::*;
 use crate::TensorAxis;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 use std::collections::BTreeSet;
 
 pub(super) fn copy_graph(input: TensorType, output: TensorType, tiles: u16) -> crate::MidGraph {
@@ -137,7 +138,7 @@ fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
         {
             *selected = mapping;
         }
-        let cost = operation_cost(&graph.operations[0], &graph.values, 16).unwrap();
+        let cost = operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 16).unwrap();
         assert_eq!(cost.0.exchange == 0, incoming.iter().all(|&n| n == 0));
     }
 }
@@ -160,14 +161,16 @@ fn local_copy_cost_accumulates_all_shards_on_each_tile() {
             conversion_traffic(&graph.values[0], &graph.values[1], &Default::default(), 1).unwrap();
         assert_eq!(traffic.maximum_local_bytes, u64::from(rows * columns * 2));
         assert!(traffic.maximum_local_intersections >= u64::from(rows));
-        let (cost, _, rows) = operation_cost(&graph.operations[0], &graph.values, 1).unwrap();
+        let (cost, _, rows) =
+            operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 1).unwrap();
         assert_eq!((cost.exchange, rows), (0, 0));
         assert_eq!(
             cost.total,
             traffic
                 .maximum_local_bytes
-                .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-                + traffic.maximum_local_intersections * IPU21_TARGET_COSTS.local_copy_call_cycles
+                .div_ceil(Target::Ipu21.costs().local_copy_bytes_per_cycle)
+                + traffic.maximum_local_intersections
+                    * Target::Ipu21.costs().local_copy_call_cycles
         );
     }
 }
@@ -189,14 +192,14 @@ fn remote_copy_charges_local_zero_extension_and_staging() {
             traffic.exchange.maximum_payload_bytes(),
             u64::from(width * 2)
         );
-        let direct = operation_cost(&graph.operations[0], &graph.values, 2)
+        let direct = operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 2)
             .unwrap()
             .0;
         assert!(direct.total > direct.exchange);
         if let MidOperationKind::Copy { policy, .. } = &mut graph.operations[0].kind {
             *policy = crate::CopyPolicy::StageLogicalThenTransform;
         }
-        let staged = operation_cost(&graph.operations[0], &graph.values, 2)
+        let staged = operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 2)
             .unwrap()
             .0;
         assert_eq!(staged.exchange, direct.exchange);
@@ -465,7 +468,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
         ..MidGraph::default()
     };
     let peak = |program: &MidGraph| {
-        let (_, peak) = analyze_mid(program, &BTreeMap::new()).unwrap();
+        let (_, peak) = analyze_mid(Target::Ipu21, program, &BTreeMap::new()).unwrap();
         peak.total
     };
     // Each allocation has 256 bytes on two owners. {7,0}, {1,2}, {3,4}
@@ -477,7 +480,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     }
     explicit.validate().unwrap();
     assert_eq!(peak(&explicit), peak(&program));
-    let mut config = crate::PipelineConfig::new(8);
+    let mut config = crate::PipelineConfig::new(Target::Ipu21, 8);
     config.standard_memory_reservation_bytes = 0;
     let mut screened_peak = |budget| {
         config.tile_memory_budget_bytes = budget;
@@ -495,7 +498,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
         "refine before rejecting a fitting plan"
     );
     program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
-    let (_, separate_classes) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+    let (_, separate_classes) = analyze_mid(Target::Ipu21, &program, &BTreeMap::new()).unwrap();
     assert_eq!(separate_classes.standard, 256);
     assert_eq!(separate_classes.interleaved, 256);
     assert_eq!(peak(&program), 256);
@@ -516,7 +519,8 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     copy.results = vec![id(3)];
     program.operations.push(copy);
     program.outputs = vec![id(2), id(3)];
-    let (_, resident) = analyze_mid(&program, &BTreeMap::from([(id(0), 3)])).unwrap();
+    let (_, resident) =
+        analyze_mid(Target::Ipu21, &program, &BTreeMap::from([(id(0), 3)])).unwrap();
     assert_eq!(resident.total, 6 * 256);
 }
 
@@ -581,7 +585,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         }];
-        let (_, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+        let (_, peak) = analyze_mid(Target::Ipu21, &program, &BTreeMap::new()).unwrap();
         // Both carried buffers, the earlier yield, and the final copy's input
         // and output coexist. The earlier yield is used by the loop backedge.
         assert_eq!(peak.total, 5 * 512, "repeat count {count}");
@@ -590,7 +594,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
     program.operations.clear();
     program.outputs = vec![id(0), id(1)];
     program.values.truncate(2);
-    let (cycles, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+    let (cycles, peak) = analyze_mid(Target::Ipu21, &program, &BTreeMap::new()).unwrap();
     assert_eq!(cycles.total, 0);
     assert_eq!(
         peak.total,
@@ -634,7 +638,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             output_aliases: Vec::new(),
             output_windows: Vec::new(),
         };
-        let (cost, _, rows) = operation_cost(&op, &values, 4).unwrap();
+        let (cost, _, rows) = operation_cost(Target::Ipu21, &op, &values, 4).unwrap();
         (cost.total, cost.exchange, rows)
     };
     assert_eq!(cost(vec![]), cost(vec![0, 0]));

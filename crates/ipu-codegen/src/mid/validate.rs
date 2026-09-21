@@ -4,6 +4,8 @@
 use super::{MidGraph, MidOperation, MidValueId};
 use crate::OperandIndexing;
 use crate::mid::MidOperationKind;
+#[cfg(test)]
+use ipu_target::Target;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -318,7 +320,7 @@ mod tests {
                     crate::tensor::LayoutError::InvalidOwnerMap { .. }
                 ))
             ));
-            assert!(crate::low::expand::expand_tiles(&bad, false).is_err());
+            assert!(crate::low::expand::expand_tiles(Target::Ipu21, &bad, false).is_err());
         }
     }
 

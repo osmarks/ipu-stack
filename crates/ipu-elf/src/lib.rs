@@ -1,3 +1,4 @@
+use ipu_target::Target;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind, SymbolSection,
 };
@@ -70,7 +71,6 @@ pub enum ElfError {
 pub struct Toolchain {
     pub popc: PathBuf,
     pub pop_objdump: PathBuf,
-    pub target: String,
 }
 
 impl Toolchain {
@@ -79,12 +79,12 @@ impl Toolchain {
         Self {
             popc: bin.join("popc"),
             pop_objdump: bin.join("pop-objdump"),
-            target: "ipu21".into(),
         }
     }
 
     pub fn compile(
         &self,
+        target: Target,
         source: impl AsRef<Path>,
         name: &str,
         flags: &[String],
@@ -95,7 +95,7 @@ impl Toolchain {
             effective_flags.push("-O2");
         }
         effective_flags.extend(flags.iter().map(String::as_str));
-        let cache = self.cached_artifact(source, &effective_flags)?;
+        let cache = self.cached_artifact(target, source, &effective_flags)?;
         fs::create_dir_all(cache.gp.parent().unwrap())?;
         // A completed artifact is immutable. Serialize cache misses so another
         // process cannot inspect or overwrite partially generated files.
@@ -117,11 +117,11 @@ impl Toolchain {
         info!(
             source = %source.display(),
             name,
-            target = %self.target,
+            target = target.name(),
             "compiling kernel"
         );
         let mut command = Command::new(&self.popc);
-        command.arg("--target").arg(&self.target);
+        command.arg("--target").arg(target.name());
         // popc compiles C++ through a temporary file, so quoted local headers
         // also need the original source directory on its include path.
         if let Some(parent) = source.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -137,7 +137,7 @@ impl Toolchain {
         for (operation, path) in [("extract", &cache.object), ("metadata", &cache.metadata)] {
             let mut dump = Command::new(&self.pop_objdump);
             dump.arg(operation)
-                .arg(&self.target)
+                .arg(target.name())
                 .arg(&cache.gp)
                 .stdout(Stdio::from(fs::File::create(path)?));
             run(&mut dump, &format!("pop-objdump {operation}"))?;
@@ -151,10 +151,15 @@ impl Toolchain {
         Ok(cache)
     }
 
-    fn cached_artifact(&self, source: &Path, flags: &[&str]) -> Result<KernelArtifact, ElfError> {
+    fn cached_artifact(
+        &self,
+        target: Target,
+        source: &Path,
+        flags: &[&str],
+    ) -> Result<KernelArtifact, ElfError> {
         let mut digest = Sha256::new();
         digest.update(b"ipu-stack-kernel-cache-v1\0");
-        digest.update(self.target.as_bytes());
+        digest.update(target.name().as_bytes());
         digest.update([0]);
         hash_local_source(&mut digest, source, &mut HashSet::new())?;
         for flag in flags {
@@ -319,6 +324,7 @@ pub fn inspect_object(bytes: &[u8]) -> Result<ObjectSummary, ElfError> {
 
 #[derive(Clone, Debug)]
 pub struct LinkOptions<'a> {
+    pub target: Target,
     /// Architectural base used by image-relative relocations. For IPU21 this
     /// is `TMEM_REGION0_BASE_ADDR` (0x4c000), regardless of section placement.
     pub image_base: u32,
@@ -355,6 +361,7 @@ struct PlacedSection {
 }
 
 pub fn link(objects: &[Vec<u8>], options: &LinkOptions<'_>) -> Result<LinkedImage, ElfError> {
+    let Target::Ipu21 = options.target;
     debug!(
         objects = objects.len(),
         relocation_base = format_args!("0x{:x}", options.image_base),

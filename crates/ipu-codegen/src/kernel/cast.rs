@@ -3,8 +3,8 @@
 //! Whether the extra prefix saves storage belongs to the low donation pass.
 
 use super::*;
-use crate::estimate::IPU21_TARGET_COSTS;
 use crate::mid::MidOperationKind;
+use ipu_target::ipu21::costs::COSTS;
 
 pub(super) fn access(
     from: Precision,
@@ -47,10 +47,10 @@ pub(super) fn stream_cycles(elements: u64, input_bytes: u64, output_bytes: u64) 
     if (input_bytes, output_bytes) == (4, 2) {
         return 330 + elements.div_ceil(12).saturating_mul(48);
     }
-    IPU21_TARGET_COSTS.kernel_launch_cycles
+    COSTS.kernel_launch_cycles
         + elements
             .saturating_mul(input_bytes + output_bytes)
-            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+            .div_ceil(COSTS.local_copy_bytes_per_cycle)
 }
 
 /// Packed FP16-to-FP8 calls carry the readable prefix and physical row bounds used by the

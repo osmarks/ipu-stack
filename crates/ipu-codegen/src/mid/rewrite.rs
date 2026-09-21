@@ -2,6 +2,7 @@
 use crate::estimate::operation_cycles;
 use crate::graph::OperationId;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 use crate::CopyPolicy;
 use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
@@ -168,6 +169,7 @@ pub(crate) fn producer_through_copies(
 }
 
 pub(crate) fn fusion_pays<'a>(
+    target: Target,
     fusion: &'static str,
     source: Option<OperationId>,
     before: impl IntoIterator<Item = &'a MidOperation>,
@@ -175,8 +177,8 @@ pub(crate) fn fusion_pays<'a>(
     values: &[MidValue],
     tile_count: u16,
 ) -> bool {
-    let separate_cycles = operation_cycles(before, values, tile_count);
-    let fused_cycles = operation_cycles(after, values, tile_count);
+    let separate_cycles = operation_cycles(target, before, values, tile_count);
+    let fused_cycles = operation_cycles(target, after, values, tile_count);
     let keep = separate_cycles
         .zip(fused_cycles)
         .is_some_and(|(a, b)| b < a);

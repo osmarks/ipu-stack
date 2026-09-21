@@ -2,15 +2,16 @@
 
 use crate::mid::MidOperationKind;
 use crate::mid::{
-    CoordinateMapping, MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing,
+    CoordinateMapping, MidGraph, MidOperation, MidValue, MidValueId, OperandIndexing,
 };
 use crate::tensor::{
     AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
     TensorTiling, TensorType,
 };
+use ipu_target::Target;
 
 impl MidGraph {
-    pub(crate) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
+    pub(crate) fn with_distributed_packing(&self, target: Target, rows: u16) -> Option<Self> {
         let mut result = self.clone();
         if !distribute_region(
             &mut result.operations,
@@ -20,7 +21,7 @@ impl MidGraph {
         ) {
             return None;
         }
-        result.refresh_estimates()?;
+        result.refresh_estimates(target)?;
         Some(result)
     }
 }
@@ -256,12 +257,12 @@ mod tests {
             };
             let candidates = [32, 64, 128, 256]
                 .into_iter()
-                .filter_map(|rows| program.with_distributed_packing(rows))
+                .filter_map(|rows| program.with_distributed_packing(Target::Ipu21, rows))
                 .collect::<Vec<_>>();
             assert!(!candidates.is_empty() && candidates.len() <= 4);
             for packed in candidates {
                 let low = crate::lower_to_tiles(
-                    &crate::low::expand::expand_tiles(&packed, false).unwrap(),
+                    &crate::low::expand::expand_tiles(Target::Ipu21, &packed, false).unwrap(),
                     false,
                 );
                 let mut packs = 0;
@@ -275,7 +276,7 @@ mod tests {
                                 ..
                             })
                         ));
-                        run.call(None).unwrap();
+                        run.call(Target::Ipu21, None).unwrap();
                         packs += 1;
                     }
                 }

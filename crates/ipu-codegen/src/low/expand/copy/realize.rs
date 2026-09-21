@@ -501,7 +501,7 @@ impl TileGraphBuilder {
                 }
             })
             .peekable();
-        let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
+        let launch_bytes = self.target.costs().kernel_launch_cycles * 48;
         while let Some(mut range) = ranges.next() {
             while let Some(next) = ranges.peek()
                 && u64::from(next.offset.saturating_sub(range.offset + range.bytes)) <= launch_bytes

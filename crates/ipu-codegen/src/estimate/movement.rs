@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::{AmpOrder, ShardExtent};
+#[cfg(test)]
+use ipu_target::Target;
 
 type Bounds = Vec<(u32, u32)>;
 
@@ -278,11 +280,17 @@ mod tests {
         // The old payload-only heuristic priced this as 111 fragments.
         assert_eq!(maximum_shard_bytes(&output).div_ceil(256), 111);
         let graph = crate::estimate::tests::copy_graph(input.clone(), output.clone(), 1458);
-        let (cost, _, _) =
-            operation_cost(&graph.operations[0], &graph.values, graph.tile_count).unwrap();
+        let (cost, _, _) = operation_cost(
+            Target::Ipu21,
+            &graph.operations[0],
+            &graph.values,
+            graph.tile_count,
+        )
+        .unwrap();
         assert!(
             cost.exchange
                 >= super::exchange_fragment_price(
+                    Target::Ipu21,
                     conversion_traffic(
                         &graph.values[0],
                         &graph.values[1],
@@ -298,8 +306,13 @@ mod tests {
                 .0
         );
         let graph = crate::estimate::tests::copy_graph(input.clone(), input.clone(), 1458);
-        let (local, _, _) =
-            operation_cost(&graph.operations[0], &graph.values, graph.tile_count).unwrap();
+        let (local, _, _) = operation_cost(
+            Target::Ipu21,
+            &graph.operations[0],
+            &graph.values,
+            graph.tile_count,
+        )
+        .unwrap();
         assert_eq!(local.exchange, 0);
         // Replicating each consumer panel adds multicast recipients, not sends.
         output.format.layout.tiling.tile_count *= 24;

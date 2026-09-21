@@ -66,7 +66,7 @@ fn build_package_with_checkpoints(
     }
     let built = compile_graph(graph, &config)?;
     let low = &built.program;
-    let topology = active_topology(low.tile_count)?;
+    let topology = active_topology(config.pipeline.target, low.tile_count)?;
     let inputs = package_inputs(low, &built.placement, &topology)?;
     let outputs = low
         .outputs
@@ -127,13 +127,15 @@ fn build_package_with_checkpoints(
 
 fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResult<Compilation> {
     let config = &package.pipeline;
-    validate_tile_count(u32::from(config.tile_count))?;
+    validate_tile_count(config.target, u32::from(config.tile_count))?;
     let runtime =
         tracing::info_span!("compile_runtime").in_scope(|| -> PackageBuildResult<_> {
-            let artifact =
-                package
-                    .toolchain
-                    .compile(&package.runtime_source, "static_runtime", &[])?;
+            let artifact = package.toolchain.compile(
+                config.target,
+                &package.runtime_source,
+                "static_runtime",
+                &[],
+            )?;
             Ok(std::fs::read(artifact.object)?)
         })?;
     let layouts = planner::boundary_layouts(graph, config);
@@ -143,19 +145,22 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
     let mut cache = crate::ExchangeScheduleCache::default();
     let expansions = Arc::new(crate::storage::GeometryCache::default());
     let expanded = crate::low::expand::expand_tiles_cached(
+        config.target,
         &mid,
         config.diagnostic_checkpoints,
         config.reuse_cast_inputs && !config.diagnostic_checkpoints,
         Arc::clone(&expansions),
     )?;
     let program = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
-    let provisional_placement = tracing::info_span!("place_provisional_storage")
-        .in_scope(|| -> PackageBuildResult<_> { Ok(crate::place::place(&program)?) })?;
+    let provisional_placement = tracing::info_span!("place_provisional_storage").in_scope(
+        || -> PackageBuildResult<_> { Ok(crate::place::place(config.target, &program)?) },
+    )?;
 
-    let topology = active_topology(program.tile_count)?;
+    let topology = active_topology(config.target, program.tile_count)?;
     let provisional_exchanges = tracing::info_span!("schedule_provisional_exchanges").in_scope(
         || -> PackageBuildResult<_> {
             Ok(crate::exchange::lower_exchanges_cached(
+                config.target,
                 &program,
                 &provisional_placement,
                 &topology,
@@ -164,13 +169,16 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
             )?)
         },
     )?;
-    let kernel_plan = tracing::info_span!("plan_kernels")
-        .in_scope(|| -> PackageBuildResult<_> { Ok(KernelObjects::from_program(&program)?) })?;
+    let kernel_plan =
+        tracing::info_span!("plan_kernels").in_scope(|| -> PackageBuildResult<_> {
+            Ok(KernelObjects::from_program(config.target, &program)?)
+        })?;
     let objects =
         tracing::info_span!("compile_kernels").in_scope(|| -> PackageBuildResult<_> {
             let mut objects = vec![runtime];
             for compilation in &kernel_plan.compilations {
                 let artifact = package.toolchain.compile(
+                    config.target,
                     package.kernel_source_directory.join(compilation.source),
                     &compilation.name,
                     &compilation.flags,
@@ -193,6 +201,7 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
     let placement =
         tracing::info_span!("place_storage").in_scope(|| -> PackageBuildResult<_> {
             Ok(crate::place::place_with_auxiliary(
+                config.target,
                 &program,
                 &support.available_ranges,
                 0,
@@ -202,6 +211,7 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
     let exchanges =
         tracing::info_span!("lower_exchanges").in_scope(|| -> PackageBuildResult<_> {
             Ok(crate::exchange::lower_exchanges_cached(
+                config.target,
                 &program,
                 &placement,
                 &topology,
@@ -209,7 +219,8 @@ fn compile_graph(graph: &HighGraph, package: &PackageConfig) -> PackageBuildResu
                 &mut cache,
             )?)
         })?;
-    let final_cost = crate::estimate::scheduled_program_cycles(&program.program, &exchanges)?;
+    let final_cost =
+        crate::estimate::scheduled_program_cycles(config.target, &program.program, &exchanges)?;
     tracing::info!(
         final_cycles = final_cost.total,
         final_exchange = final_cost.exchange,

@@ -5,6 +5,7 @@ use ipu_codegen::{
     ComputeStep, StepProfile, TileAddress, TileProgram, TileProgramData, TileStep,
     build_tile_program_package,
 };
+use ipu_target::Target;
 
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
@@ -194,6 +195,7 @@ fn main() -> Result<()> {
         ipu_tests::cycle_binding(cases.len().try_into()?, 0x7f000),
     ];
     let application = build_tile_program_package(
+        Target::Ipu21,
         &programs,
         &data,
         &outputs,

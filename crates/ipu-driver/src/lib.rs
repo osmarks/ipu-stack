@@ -1,4 +1,5 @@
 use ipu_package::{Application, HostCall, HostExchange};
+use ipu_target::Target;
 use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
 use object::{Object, ObjectSegment};
 use std::collections::HashMap;
@@ -1242,6 +1243,7 @@ impl<'a> Loader<'a> {
     }
 
     pub fn load(&self, app: &Application, final_mark: u32) -> Result<(), DriverError> {
+        let Target::Ipu21 = app.target;
         app.validate()?;
         let tile_count = app.tiles.len();
         info!(tile_count, final_mark, "loading application");

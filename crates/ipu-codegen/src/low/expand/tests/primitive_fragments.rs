@@ -1,5 +1,6 @@
 use super::*;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 use crate::{GraphInputKind, MidInput, MidValue, OperandIndexing, ValueId};
 
@@ -50,14 +51,14 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 }],
                 ..MidGraph::default()
             };
-            let expanded = expand_tiles(&mid, false).unwrap();
+            let expanded = expand_tiles(Target::Ipu21, &mid, false).unwrap();
             assert!(expanded.kernel_runs.len() > usize::from(tiles));
             for run in &expanded.kernel_runs {
                 assert_eq!(
                     run.inputs[0].extents, run.outputs[0].extents,
                     "shape {shape:?}, tiles {tiles}"
                 );
-                run.call(None).unwrap();
+                run.call(Target::Ipu21, None).unwrap();
             }
             if shape == [8, 16] && tiles != 3 {
                 let mut norm = mid;
@@ -85,10 +86,10 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 norm.operations[0].kind = MidOperationKind::LayerNorm;
                 norm.operations[0].operands = vec![OperandIndexing::local(); 3];
                 norm.operations[0].output_aliases = vec![];
-                let expanded = expand_tiles(&norm, false).unwrap();
+                let expanded = expand_tiles(Target::Ipu21, &norm, false).unwrap();
                 for run in &expanded.kernel_runs {
                     assert_eq!(run.inputs[0].extents, run.outputs[0].extents);
-                    run.call(None).unwrap();
+                    run.call(Target::Ipu21, None).unwrap();
                 }
             }
         }

@@ -1,6 +1,7 @@
-//! Analytical IPU21 cycle estimation used during operator planning.
+//! Price exchange resource work using the selected architecture.
 
 use crate::estimate::ExchangeEndpointTraffic;
+use ipu_target::Target;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExchangeFootprint {
@@ -11,7 +12,9 @@ pub struct ExchangeFootprint {
 }
 
 impl ExchangeFootprint {
-    pub const fn estimated_row_bytes(self) -> u64 {
+    pub const fn estimated_row_bytes(self, target: Target) -> u64 {
+        // This fallback describes the current IPU21 exchange row encoding.
+        let Target::Ipu21 = target;
         if let Some(bytes) = self.encoded_row_bytes {
             return bytes;
         }
@@ -27,63 +30,53 @@ impl ExchangeFootprint {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ipu21TargetCosts {
-    pub exchange_bytes_per_cycle: u64,
-    pub local_copy_bytes_per_cycle: u64,
-    pub local_copy_call_cycles: u64,
-    pub exchange_phase_cycles: u64,
-    pub kernel_launch_cycles: u64,
-}
-
-// Target::getExchangeBytesPerCycle.
-pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
-    exchange_bytes_per_cycle: 4,
-    local_copy_bytes_per_cycle: 8,
-    // A finalized six-worker local-copy invocation, including supervisor and
-    // worker rendezvous overhead, takes 288 tile cycles on IPU21.
-    local_copy_call_cycles: crate::kernel::copy::WORKER_CALL_CYCLES,
-    // Target::getGlobalSyncCycles.
-    exchange_phase_cycles: 600,
-    // popops::internal::basicOpSupervisorOverhead(false).
-    kernel_launch_cycles: 11,
-};
-
 // An ordinary receive needs source selection, neutralization and (unless
 // contiguous) a pointer write. These issue alongside the independent payload
 // stream, not as a route-latency penalty per fragment. Mid geometry cannot yet
 // prove pointer continuation; low geometry counts it explicitly.
-pub(crate) const EXCHANGE_FRAGMENT_CONTROLS: u64 = 3;
-
 // Resource-work estimate, not a conflict-free schedule or a guaranteed bound:
 // route latency, bank conflicts and dependency chains remain unpriced here.
-pub(crate) fn exchange_work_cycles(bytes: u64, controls: u64) -> u64 {
+pub(crate) fn exchange_work_cycles(target: Target, bytes: u64, controls: u64) -> u64 {
     bytes
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        .div_ceil(target.costs().exchange_bytes_per_cycle)
         .max(controls)
 }
 
-pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
+pub(super) fn exchange_endpoint_cycles(
+    target: Target,
+    traffic: &ExchangeEndpointTraffic,
+    phases: u64,
+) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
     }
-    exchange_work_cycles(traffic.maximum_payload_bytes(), traffic.maximum_controls())
-        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
+    exchange_work_cycles(
+        target,
+        traffic.maximum_payload_bytes(),
+        traffic.maximum_control_cycles(target),
+    )
+    .saturating_add(phases.saturating_mul(target.costs().exchange_phase_cycles))
 }
 
-pub(super) fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -> (u64, u64) {
+pub(super) fn exchange_fragment_price(
+    target: Target,
+    bytes: u64,
+    phases: u64,
+    fragments: u64,
+) -> (u64, u64) {
     if bytes == 0 || phases == 0 {
         return (0, 0);
     }
     let fragments = fragments.max(phases);
-    let cycles = exchange_work_cycles(bytes, fragments.saturating_mul(EXCHANGE_FRAGMENT_CONTROLS))
-        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles));
+    let controls = target.costs().receive_control_cycles + target.costs().receive_pointer_cycles;
+    let cycles = exchange_work_cycles(target, bytes, fragments.saturating_mul(controls))
+        .saturating_add(phases.saturating_mul(target.costs().exchange_phase_cycles));
     let rows = ExchangeFootprint {
         phases,
         maximum_transfer_chunks_per_tile: fragments,
         encoded_row_bytes: None,
     }
-    .estimated_row_bytes();
+    .estimated_row_bytes(target);
     (cycles, rows)
 }
 
@@ -114,13 +107,13 @@ mod tests {
             let (outgoing, outgoing_fragments) = maxima(&traffic.outgoing_lanes);
             let (incoming, incoming_fragments) = maxima(&traffic.incoming_tiles);
             let phases = random.u64(1..=32);
-            let fixed = phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles);
-            let cycles = exchange_endpoint_cycles(&traffic, phases);
+            let fixed = phases.saturating_mul(Target::Ipu21.costs().exchange_phase_cycles);
+            let cycles = exchange_endpoint_cycles(Target::Ipu21, &traffic, phases);
             assert_eq!(
                 cycles.saturating_sub(fixed),
                 outgoing
                     .max(incoming)
-                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
+                    .div_ceil(Target::Ipu21.costs().exchange_bytes_per_cycle),
                 "case {case}"
             );
             let reversed_traffic = ExchangeEndpointTraffic::from_maxima(
@@ -129,7 +122,7 @@ mod tests {
                 incoming_fragments,
                 outgoing_fragments,
             );
-            let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
+            let reversed = exchange_endpoint_cycles(Target::Ipu21, &reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
         }
     }
@@ -139,19 +132,34 @@ mod tests {
         let mut traffic = ExchangeEndpointTraffic::default();
         // Many short writes: source+neutral controls, one initial pointer.
         traffic.add_receive(0, 400, 100, 1);
-        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 201);
+        assert_eq!(
+            exchange_endpoint_cycles(Target::Ipu21, &traffic, 1),
+            600 + 201
+        );
         traffic.add_outgoing(0, 400, 100);
-        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 401);
+        assert_eq!(
+            exchange_endpoint_cycles(Target::Ipu21, &traffic, 1),
+            600 + 401
+        );
         // A neighbor has its own TX lane and its own issue slots.
         traffic.add_outgoing(1, 1600, 1);
-        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 401);
+        assert_eq!(
+            exchange_endpoint_cycles(Target::Ipu21, &traffic, 1),
+            600 + 401
+        );
         // Strided writes require a pointer for each receive.
         let mut strided = ExchangeEndpointTraffic::default();
         strided.add_receive(0, 400, 100, 100);
-        assert_eq!(exchange_endpoint_cycles(&strided, 1), 600 + 300);
+        assert_eq!(
+            exchange_endpoint_cycles(Target::Ipu21, &strided, 1),
+            600 + 300
+        );
         // Long payloads hide these control costs, rather than paying them serially.
         strided.add_receive(0, 4000, 1, 1);
-        assert_eq!(exchange_endpoint_cycles(&strided, 1), 600 + 1100);
+        assert_eq!(
+            exchange_endpoint_cycles(Target::Ipu21, &strided, 1),
+            600 + 1100
+        );
     }
 
     #[test]
@@ -171,8 +179,8 @@ mod tests {
                     let x = graph.host_input("x", tensor.shape.0.clone()).unwrap();
                     let y = if add { graph.add(x, x) } else { graph.gelu(x) }.unwrap();
                     graph.set_outputs([y]).unwrap();
-                    let config =
-                        crate::PipelineConfig::new(tiles).with_input(x, tensor.format.clone());
+                    let config = crate::PipelineConfig::new(ipu_target::Target::Ipu21, tiles)
+                        .with_input(x, tensor.format.clone());
                     let mut layouts = crate::planner::boundary_layouts(&graph, &config);
                     layouts.insert(y, Some(tensor.format.layout.clone()));
                     let program = crate::planner::plan(

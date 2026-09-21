@@ -1,8 +1,11 @@
 //! Each family constructs its ABI, cost and padding contract together.
 //! `binding` shares operand checks; `build` collects object definitions and
 //! supplies compilation/wrapper helpers. Placement only supplies addresses.
+//! Family implementations currently emit IPU21 code; `KernelCall::select`
+//! dispatches the caller's target before entering them.
 
 use crate::storage::TensorStorage;
+use ipu_target::Target;
 
 pub mod abi;
 pub mod copy;
@@ -60,11 +63,15 @@ impl KernelCall {
     /// The only operation-to-kernel dispatch. Both estimation and bound calls
     /// select a concrete ABI from local geometry, before addresses exist.
     pub(crate) fn select(
+        target: Target,
         kernel: &crate::mid::MidOperationKind,
         inputs: &[TensorStorage<'_>],
         outputs: &[TensorStorage<'_>],
         mut build: Option<&mut KernelObjects>,
     ) -> Result<Self, KernelError> {
+        // The family implementations below emit IPU21 worker code. Exhaustive
+        // dispatch prevents another architecture from falling through to it.
+        let Target::Ipu21 = target;
         use crate::mid::MidOperationKind::*;
         let call = match kernel {
             Gemm { .. } => gemm::call(kernel, inputs, outputs, build.as_deref_mut()),
@@ -96,12 +103,13 @@ impl KernelCall {
 /// Layout conversion supplies byte offsets; family construction supplies the
 /// entry-point name and ABI scalar values independently of object collection.
 pub fn materialize_kernel_run(
+    target: Target,
     run: &KernelRun,
     shards: &[BlockValue],
     shard_addresses: &BTreeMap<BlockValueId, u32>,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelError> {
-    let call = run.call(None)?;
+    let call = run.call(target, None)?;
     let symbol = call.symbol;
     let resolve = |operand: MemoryOperand| -> Result<TileAddress, KernelError> {
         let view = run

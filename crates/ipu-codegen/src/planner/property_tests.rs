@@ -7,6 +7,7 @@ use super::*;
 use crate::graph::{GraphInputKind, OperationKind, ValueId};
 use crate::mid::{MidInput, MidOperation, MidOperationKind, MidValue, MidValueId, OperandIndexing};
 use crate::tensor::{Layout, MemoryClass, OwnerMap, Precision, TensorFormat, TensorType};
+use ipu_target::Target;
 use std::collections::BTreeSet;
 
 const EXACT: SearchLimits = SearchLimits {
@@ -173,7 +174,7 @@ fn enumerate(
         if position == high.operations().len() {
             let mut graph = graph;
             graph.outputs = high.outputs().iter().map(|id| bindings[id]).collect();
-            graph.refresh_estimates().unwrap();
+            graph.refresh_estimates(config.target).unwrap();
             complete.push(graph);
             assert!(
                 complete.len() < 20_000,
@@ -464,7 +465,7 @@ fn random_fixture(rng: &mut fastrand::Rng) -> (HighGraph, PipelineConfig, Bounda
         available[rng.usize(..available.len())],
     ])
     .unwrap();
-    let mut config = PipelineConfig::new(tiles);
+    let mut config = PipelineConfig::new(Target::Ipu21, tiles);
     config.standard_memory_reservation_bytes = 0;
     for input in [x, weight, other] {
         let mut layout = Layout::logical_linear(1, 1);
@@ -528,7 +529,7 @@ fn randomized_dp_matches_complete_path_enumeration() {
                 previous = Some(mid.estimated_cycles);
                 check_semantics(&high, &mid, &mut rng);
                 mid.validate().unwrap();
-                crate::low::expand::expand_tiles(&mid, false)
+                crate::low::expand::expand_tiles(Target::Ipu21, &mid, false)
                     .unwrap_or_else(|e| panic!("seed={seed}, budget={budget}: {e:?}"));
                 for (&value, layout) in &choices {
                     if let Some(layout) = layout {
@@ -576,7 +577,7 @@ fn randomized_memory_tradeoffs_match_exhaustive_paths() {
             output = high.gelu(output).unwrap();
         }
         high.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(1).with_input(
+        let mut config = PipelineConfig::new(Target::Ipu21, 1).with_input(
             x,
             TensorFormat {
                 precision: Precision::F16,
@@ -635,7 +636,7 @@ fn interleaved_capacity_is_enforced_even_when_total_storage_fits() {
         let x = high.host_input("x", [4, 16]).unwrap();
         let y = high.gelu(x).unwrap();
         high.set_outputs([y]).unwrap();
-        let mut config = PipelineConfig::new(1).with_input(
+        let mut config = PipelineConfig::new(Target::Ipu21, 1).with_input(
             x,
             TensorFormat {
                 precision: Precision::F16,

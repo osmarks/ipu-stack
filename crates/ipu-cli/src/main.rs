@@ -9,6 +9,7 @@ use ipu_profile::{
     phase_work, query,
 };
 use ipu_runtime::Runtime;
+use ipu_target::Target;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
@@ -29,6 +30,8 @@ enum Command {
     },
     KernelCompile {
         source: PathBuf,
+        #[arg(long, default_value = "ipu21")]
+        target: Target,
         #[arg(long)]
         name: Option<String>,
         #[arg(long, env = "POPLAR_SDK_ENABLED")]
@@ -40,6 +43,8 @@ enum Command {
         object: PathBuf,
     },
     ObjectLink {
+        #[arg(long, default_value = "ipu21")]
+        target: Target,
         #[arg(required = true)]
         objects: Vec<PathBuf>,
         #[arg(short, long)]
@@ -224,6 +229,7 @@ fn main() -> Result<()> {
         }
         Command::KernelCompile {
             source,
+            target,
             name,
             sdk,
             flags,
@@ -235,7 +241,7 @@ fn main() -> Result<()> {
                     .to_string_lossy()
                     .into_owned()
             });
-            let artifact = Toolchain::from_sdk(sdk).compile(&source, &name, &flags)?;
+            let artifact = Toolchain::from_sdk(sdk).compile(target, &source, &name, &flags)?;
             let summary = artifact.inspect()?;
             println!("object={}", artifact.object.display());
             println!("metadata={}", artifact.metadata.display());
@@ -251,6 +257,7 @@ fn main() -> Result<()> {
             );
         }
         Command::ObjectLink {
+            target,
             objects,
             output,
             base,
@@ -264,6 +271,7 @@ fn main() -> Result<()> {
             let image = link(
                 &objects,
                 &LinkOptions {
+                    target,
                     image_base: ipu_target::ipu21::memory::TILE_MEMORY_BASE,
                     regions: vec![(
                         base,

@@ -2,6 +2,8 @@
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::{HighGraph, PipelineConfig};
+#[cfg(test)]
+use ipu_target::Target;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -234,7 +236,7 @@ fn profile(
         }
     }
     let mut timeline = Timeline::default();
-    let (_, peak) = mid::analyze_observed(&program, copies, &mut timeline)?;
+    let (_, peak) = mid::analyze_observed(config.target, &program, copies, &mut timeline)?;
     let names = names(graph);
     for value in &mut timeline.values {
         (value.name, value.group) = names.get(&value.origin).cloned().unwrap_or_else(|| {
@@ -348,7 +350,7 @@ mod tests {
         let added = graph.add(input, weight).unwrap();
         let output = graph.gelu(added).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(4)
+        let config = PipelineConfig::new(Target::Ipu21, 4)
             .with_input(
                 input,
                 crate::TensorFormat {
@@ -371,7 +373,7 @@ mod tests {
         )
         .unwrap();
         let mut timeline = Timeline::default();
-        mid::analyze_observed(&program, &BTreeMap::new(), &mut timeline).unwrap();
+        mid::analyze_observed(Target::Ipu21, &program, &BTreeMap::new(), &mut timeline).unwrap();
         let parameter = program
             .inputs
             .iter()

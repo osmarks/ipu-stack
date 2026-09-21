@@ -1,6 +1,7 @@
 //! Address-independent exchange traffic and GEMM communication geometry.
 
 use super::*;
+use ipu_target::Target;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
@@ -15,7 +16,7 @@ pub(crate) struct ConversionTraffic {
 pub(crate) struct ExchangeEndpointLoad {
     pub bytes: u64,
     pub fragments: u64,
-    pub controls: u64,
+    pub pointer_resets: u64,
 }
 
 /// Resource-indexed work for one or more transfers which share an exchange
@@ -43,13 +44,7 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn add_outgoing(&mut self, tile: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(
-            &mut self.outgoing_lanes,
-            tile,
-            bytes,
-            fragments,
-            fragments.saturating_mul(2),
-        );
+        add_endpoint_load(&mut self.outgoing_lanes, tile, bytes, fragments, 0);
     }
 
     pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
@@ -57,21 +52,27 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn add_receive(&mut self, tile: u16, bytes: u64, fragments: u64, resets: u64) {
-        add_endpoint_load(
-            &mut self.incoming_tiles,
-            tile,
-            bytes,
-            fragments,
-            fragments.saturating_mul(2).saturating_add(resets),
-        );
+        add_endpoint_load(&mut self.incoming_tiles, tile, bytes, fragments, resets);
     }
 
-    pub(crate) fn maximum_controls(&self) -> u64 {
+    pub(crate) fn maximum_control_cycles(&self, target: Target) -> u64 {
         // TX/RX payload lanes are independent, but share supervisor issue slots.
         (0..self.outgoing_lanes.len().max(self.incoming_tiles.len()))
             .map(|i| {
-                self.outgoing_lanes.get(i).map_or(0, |l| l.controls)
-                    + self.incoming_tiles.get(i).map_or(0, |l| l.controls)
+                self.outgoing_lanes
+                    .get(i)
+                    .map_or(0, |l| {
+                        l.fragments
+                            .saturating_mul(target.costs().send_control_cycles)
+                    })
+                    .saturating_add(self.incoming_tiles.get(i).map_or(0, |l| {
+                        l.fragments
+                            .saturating_mul(target.costs().receive_control_cycles)
+                            .saturating_add(
+                                l.pointer_resets
+                                    .saturating_mul(target.costs().receive_pointer_cycles),
+                            )
+                    }))
             })
             .max()
             .unwrap_or(0)
@@ -105,9 +106,9 @@ fn add_endpoint_load(
     endpoint: u16,
     bytes: u64,
     fragments: u64,
-    controls: u64,
+    pointer_resets: u64,
 ) {
-    if bytes == 0 && fragments == 0 && controls == 0 {
+    if bytes == 0 && fragments == 0 && pointer_resets == 0 {
         return;
     }
     loads.resize(
@@ -117,7 +118,7 @@ fn add_endpoint_load(
     let load = &mut loads[usize::from(endpoint)];
     load.bytes = load.bytes.saturating_add(bytes);
     load.fragments = load.fragments.saturating_add(fragments);
-    load.controls = load.controls.saturating_add(controls);
+    load.pointer_resets = load.pointer_resets.saturating_add(pointer_resets);
 }
 
 pub(crate) fn conversion_traffic(

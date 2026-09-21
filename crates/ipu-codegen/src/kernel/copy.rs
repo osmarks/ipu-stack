@@ -6,6 +6,7 @@ use super::*;
 use crate::low::storage::{StorageAccess, bind_storage};
 use crate::mid::MidOperationKind;
 use crate::{BlockValue, BlockValueId, CopyOperation, CopyPattern, LocalCopy};
+use ipu_target::Target;
 
 #[cfg(test)]
 use crate::storage::ByteSpan;
@@ -14,7 +15,7 @@ use crate::storage::{CopyPair, StorageResult};
 use ipu_target::ipu21::WORKER_CONTEXTS;
 
 /// Coarse launch allowance when mid has not selected a local helper yet.
-pub(crate) const WORKER_CALL_CYCLES: u64 = 288;
+pub(crate) const WORKER_CALL_CYCLES: u64 = ipu_target::ipu21::costs::COSTS.local_copy_call_cycles;
 
 /// A local copy in the executable low graph. The descriptor and helper cannot
 /// be mutated independently: coalescing constructs another checked binding.
@@ -135,7 +136,8 @@ impl CopyRun {
         }
     }
 
-    pub(crate) fn call(&self) -> KernelCall {
+    pub(crate) fn call(&self, target: Target) -> KernelCall {
+        let Target::Ipu21 = target;
         let words = self.movement.bytes / self.word_bytes;
         let (arguments, cycles) = match self.movement.pattern {
             CopyPattern::Strided {
@@ -203,7 +205,7 @@ pub(super) fn fill_call(
     Ok(KernelCall::new(
         FILL_ZERO_U64_SYMBOL,
         vec![bytes / 8 / 6, bytes / 8 % 6],
-        u64::from(bytes / 8).div_ceil(6) + crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles,
+        u64::from(bytes / 8).div_ceil(6) + ipu_target::ipu21::costs::COSTS.kernel_launch_cycles,
     ))
 }
 
@@ -803,7 +805,7 @@ mod tests {
             let shards = buffers(&[bytes + 8, bytes + 8]);
             let run = CopyRun::bind(copy.clone(), &shards).unwrap();
             let symbol = run.symbol();
-            let arguments = run.call().arguments;
+            let arguments = run.call(Target::Ipu21).arguments;
             if symbol == crate::kernel::copy::COPY_U64_SYMBOL {
                 assert!(copy.source_offset.is_multiple_of(8));
                 assert!(copy.destination_offset.is_multiple_of(8));
@@ -847,7 +849,7 @@ mod tests {
                 let shards = buffers(&[offset + rows * source_stride, rows * destination_stride]);
                 let run = CopyRun::bind(copies[0].clone(), &shards).unwrap();
                 let symbol = run.symbol();
-                let args = run.call().arguments;
+                let args = run.call(Target::Ipu21).arguments;
                 assert_eq!(symbol, crate::kernel::copy::COPY_STRIDED_U32_SYMBOL);
                 assert_eq!(args, [width / 4, rows, source_stride, destination_stride]);
                 let source = (0..offset + rows * source_stride)

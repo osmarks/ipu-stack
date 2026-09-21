@@ -3,6 +3,8 @@ use super::{MidGraph, MidOperation, MidValue, MidValueId};
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidOperationKind;
 use crate::tensor::OwnerMap;
+#[cfg(test)]
+use ipu_target::Target;
 
 /// Inputs keep their existing ownership groups; new groups use the working
 /// embedding and the fragment's relative rotations. Result homes are chosen by
@@ -294,7 +296,7 @@ mod tests {
         let inputs = program.values[..3].to_vec();
         super::super::ownership::bind_owners(&mut program.operations, &mut program.values).unwrap();
         program.validate().unwrap();
-        crate::low::expand::expand_tiles(&program, false).unwrap();
+        crate::low::expand::expand_tiles(Target::Ipu21, &program, false).unwrap();
         assert_eq!(program.values[..3], inputs);
         let MidOperationKind::Repeat(repeat) = &program.operations[0].kind else {
             unreachable!()
@@ -371,7 +373,7 @@ mod tests {
             OwnerMap::embedded(vec![10])
         );
         bound.validate().unwrap();
-        crate::low::expand::expand_tiles(&bound, false).unwrap();
+        crate::low::expand::expand_tiles(Target::Ipu21, &bound, false).unwrap();
 
         let mut invalid = original.clone();
         assert!(
@@ -422,7 +424,7 @@ mod tests {
             )
             .unwrap();
             bound.validate().unwrap();
-            crate::low::expand::expand_tiles(&bound, false).unwrap();
+            crate::low::expand::expand_tiles(Target::Ipu21, &bound, false).unwrap();
             let mut before = vec![0; fragment.values.len()];
             before[..3].copy_from_slice(&[3, 5, 7]);
             let mut after = vec![0; bound.values.len()];

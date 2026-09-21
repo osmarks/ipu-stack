@@ -1,12 +1,17 @@
 //! Price executable work and compose per-tile timelines across barriers/repeats.
 
-use super::{IPU21_TARGET_COSTS as TARGET, *};
+use super::*;
 use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph};
+use ipu_target::Target;
 // Contracts are already interned by expansion. Keep the few physical shape
 // variants under each contract, comparing borrowed widths without allocation.
 type KernelCosts<'a> =
     std::collections::HashMap<*const crate::low::KernelRunMetadata, Vec<(&'a KernelRun, u64)>>;
-fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> u64 {
+fn cached_kernel_cycles<'a>(
+    target: Target,
+    run: &'a KernelRun,
+    costs: &mut KernelCosts<'a>,
+) -> u64 {
     fn shapes(run: &KernelRun) -> impl Iterator<Item = &[crate::ShardExtent]> {
         run.inputs
             .iter()
@@ -27,10 +32,13 @@ fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> 
     });
     if let Some((_, cycles)) = found {
         #[cfg(test)]
-        assert_eq!(*cycles, run.call(None).map_or(u64::MAX, |call| call.cycles));
+        assert_eq!(
+            *cycles,
+            run.call(target, None).map_or(u64::MAX, |call| call.cycles)
+        );
         return *cycles;
     }
-    let cycles = run.call(None).map_or(u64::MAX, |call| call.cycles);
+    let cycles = run.call(target, None).map_or(u64::MAX, |call| call.cycles);
     variants.push((run, cycles));
     cycles
 }
@@ -43,15 +51,16 @@ pub(crate) struct ProgramCycles {
 
 /// Exact exchange horizons composed with the emitted compute/copy timeline.
 pub(crate) fn scheduled_program_cycles(
+    target: Target,
     program: &TileGraph,
     phases: &[crate::PhysicalExchangePhase],
 ) -> ExpansionResult<ProgramCycles> {
     let mut cycles = vec![0; program.exchange_phases.len()];
     for phase in phases {
         cycles[phase.id.index() as usize] =
-            u64::from(phase.event_cycles).saturating_add(TARGET.exchange_phase_cycles);
+            u64::from(phase.event_cycles).saturating_add(target.costs().exchange_phase_cycles);
     }
-    program_cycles(program, Some(&cycles))
+    program_cycles(target, program, Some(&cycles))
 }
 
 /// Prefix and tail are tile-local. The middle starts at the first barrier and
@@ -137,6 +146,7 @@ fn maximum(values: &[u64]) -> u64 {
 }
 
 pub(crate) fn program_cycles(
+    target: Target,
     program: &TileGraph,
     exchange: Option<&[u64]>,
 ) -> ExpansionResult<ProgramCycles> {
@@ -149,17 +159,18 @@ pub(crate) fn program_cycles(
             .exchange_phases
             .iter()
             .map(|phase| {
-                let traffic = geometry_traffic(program, phase, None, &geometry)?;
-                let cycles = super::cycles::exchange_endpoint_cycles(&traffic, 1);
+                let traffic = geometry_traffic(target, program, phase, None, &geometry)?;
+                let cycles = super::cycles::exchange_endpoint_cycles(target, &traffic, 1);
                 tracing::debug!(phase = phase.id.index(), source = ?phase.provenance.operation,
                     bytes = traffic.maximum_payload_bytes(), fragments = traffic.maximum_fragments(),
-                    controls = traffic.maximum_controls(), cycles, "estimated logical exchange");
+                    controls = traffic.maximum_control_cycles(target), cycles, "estimated logical exchange");
                 Ok(cycles)
             })
             .collect::<ExpansionResult<Vec<_>>>()?;
         &estimated
     };
     fn region<'a>(
+        target: Target,
         program: &'a TileGraph,
         body: &BlockRegion,
         phases: &[u64],
@@ -170,18 +181,18 @@ pub(crate) fn program_cycles(
             match operation {
                 BlockOperation::Compute { tile, run } => timeline.local(
                     usize::from(*tile),
-                    cached_kernel_cycles(&program.kernel_runs[run.0 as usize], kernels),
+                    cached_kernel_cycles(target, &program.kernel_runs[run.0 as usize], kernels),
                 ),
                 BlockOperation::Copy { tile, copy } => timeline.local(
                     usize::from(*tile),
-                    program.local_copies[copy.0 as usize].call().cycles,
+                    program.local_copies[copy.0 as usize].call(target).cycles,
                 ),
                 BlockOperation::Exchange(phase) => {
                     let cycles = phases[phase.index() as usize];
                     timeline.barrier(cycles, cycles);
                 }
                 BlockOperation::Repeat(repeat) => timeline.repeat(
-                    region(program, &repeat.body, phases, kernels),
+                    region(target, program, &repeat.body, phases, kernels),
                     u64::from(repeat.count),
                 ),
                 BlockOperation::Checkpoint(..) => {}
@@ -190,6 +201,7 @@ pub(crate) fn program_cycles(
         timeline
     }
     Ok(region(
+        target,
         program,
         &program.body,
         phases,
@@ -199,11 +211,13 @@ pub(crate) fn program_cycles(
 }
 
 fn geometry_traffic(
+    target: Target,
     program: &TileGraph,
     phase: &crate::ExchangePhase,
     mut storage: Option<&mut ExchangeStoragePhase>,
     geometry: &GeometryCache,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
+    let Target::Ipu21 = target;
     #[cfg(test)]
     let mut expected_storage = storage.as_deref().cloned();
     let mut traffic = ExchangeEndpointTraffic::default();
@@ -279,12 +293,16 @@ fn geometry_traffic(
 }
 
 #[cfg(test)]
-pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
-    program_footprint_analyzed(program, &GeometryCache::default())
+pub(crate) fn program_footprint(
+    target: Target,
+    program: &TileGraph,
+) -> ExpansionResult<ExchangeFootprint> {
+    program_footprint_analyzed(target, program, &GeometryCache::default())
 }
 
 #[cfg(test)]
 pub(crate) fn program_footprint_analyzed(
+    target: Target,
     program: &TileGraph,
     geometry: &GeometryCache,
 ) -> ExpansionResult<ExchangeFootprint> {
@@ -312,7 +330,7 @@ pub(crate) fn program_footprint_analyzed(
     let mut table = ExchangeStorageEstimator::new(program.tile_count);
     for phase in &program.exchange_phases {
         let mut storage = ExchangeStoragePhase::new(program.tile_count);
-        let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
+        let traffic = geometry_traffic(target, program, phase, Some(&mut storage), geometry)?;
         for transfer in &phase.transfers {
             if iterated.contains(&transfer.source.shard) {
                 storage
@@ -452,13 +470,16 @@ mod tests {
             checkpoints: vec![],
         };
         assert_eq!(
-            program_cycles(&program, Some(&[123])).unwrap(),
+            program_cycles(Target::Ipu21, &program, Some(&[123])).unwrap(),
             ProgramCycles {
                 total: 861,
                 exchange: 861
             }
         );
-        assert_eq!(program_footprint(&program).unwrap().phases, 1);
+        assert_eq!(
+            program_footprint(Target::Ipu21, &program).unwrap().phases,
+            1
+        );
 
         // Identical payloads with many routing fragments must not receive the
         // same analytical price. Scheduled prices replace that approximation.
@@ -493,11 +514,11 @@ mod tests {
             order: crate::CopyOrder::Physical,
         };
         program.exchange_phases[0].transfers = vec![transfer(full)];
-        let footprint = program_footprint(&program).unwrap();
+        let footprint = program_footprint(Target::Ipu21, &program).unwrap();
         // A contiguous 8 KiB span needs one transfer, not the 32 fragments
         // assumed by the mid cycle heuristic's 256-byte payload.
         assert_eq!(footprint.maximum_transfer_chunks_per_tile, 1);
-        assert_eq!(footprint.estimated_row_bytes(), 24);
+        assert_eq!(footprint.estimated_row_bytes(Target::Ipu21), 24);
         let mut distributed = program.clone();
         distributed.tile_count = 4;
         for tile in 2..4 {
@@ -511,19 +532,22 @@ mod tests {
         other.transfers[0].source.shard = BlockValueId::from_index(2);
         other.transfers[0].destinations[0].shard = BlockValueId::from_index(3);
         distributed.exchange_phases.push(other);
-        let distributed_rows = program_footprint(&distributed).unwrap();
+        let distributed_rows = program_footprint(Target::Ipu21, &distributed).unwrap();
         assert_eq!(distributed_rows.maximum_transfer_chunks_per_tile, 1);
-        assert_eq!(distributed_rows.estimated_row_bytes(), 32);
+        assert_eq!(distributed_rows.estimated_row_bytes(Target::Ipu21), 32);
         let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
             unreachable!()
         };
         repeat.count = 1000;
-        assert_eq!(program_footprint(&program).unwrap(), footprint);
+        assert_eq!(
+            program_footprint(Target::Ipu21, &program).unwrap(),
+            footprint
+        );
         let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
             unreachable!()
         };
         repeat.count = 7;
-        let contiguous = program_cycles(&program, None).unwrap();
+        let contiguous = program_cycles(Target::Ipu21, &program, None).unwrap();
         program.exchange_phases[0].transfers = (0..2048)
             .map(|i| {
                 transfer(vec![ShardExtent {
@@ -534,8 +558,13 @@ mod tests {
                 }])
             })
             .collect();
-        assert!(program_cycles(&program, None).unwrap().total > contiguous.total);
-        assert_eq!(program_cycles(&program, Some(&[123])).unwrap().total, 861);
+        assert!(program_cycles(Target::Ipu21, &program, None).unwrap().total > contiguous.total);
+        assert_eq!(
+            program_cycles(Target::Ipu21, &program, Some(&[123]))
+                .unwrap()
+                .total,
+            861
+        );
     }
 
     #[test]

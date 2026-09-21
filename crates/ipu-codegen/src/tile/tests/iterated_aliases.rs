@@ -1,5 +1,6 @@
 use super::*;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 use crate::*;
 
@@ -73,6 +74,7 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
     };
     let kernel = MidOperationKind::Gelu;
     let run = KernelRun::bind(
+        Target::Ipu21,
         WorkProvenance {
             operation: None,
             value: None,
@@ -85,7 +87,8 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         &mut vec![],
     )
     .unwrap();
-    let call = materialize_kernel_run(&run, &shards, &addresses, &overrides).unwrap();
+    let call =
+        materialize_kernel_run(Target::Ipu21, &run, &shards, &addresses, &overrides).unwrap();
     assert_eq!(
         call.input_addresses,
         [TileAddress::RepeatPointer {

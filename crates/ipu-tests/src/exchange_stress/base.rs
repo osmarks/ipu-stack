@@ -1,5 +1,6 @@
 use super::*;
 use ipu_codegen::{RepeatPointer, RepeatStep};
+use ipu_target::Target;
 use ipu_target::ipu21::instruction::{encode_delay_m, encode_put_special_m, encode_setzi_m};
 
 /// Exercise exact payloads on every Repeat iteration, then an absolute row to
@@ -318,8 +319,14 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         }
     }
     let outputs = readback_bindings(&readbacks, &topology)?;
-    let application =
-        build_tile_program_package(&programs, &data, &outputs, toolchain, runtime_source)?;
+    let application = build_tile_program_package(
+        Target::Ipu21,
+        &programs,
+        &data,
+        &outputs,
+        toolchain,
+        runtime_source,
+    )?;
     Ok(StressPackage {
         application,
         active_tiles: 4,

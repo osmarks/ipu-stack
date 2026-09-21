@@ -7,6 +7,7 @@ use crate::graph::{GraphInputKind, OperationId, ValueId};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode, GemmWeightLoad};
 use crate::tensor::{Layout, Precision};
 use crate::tensor::{OwnerMap, TensorType};
+use ipu_target::Target;
 use std::collections::BTreeMap;
 pub(crate) mod cast_order;
 mod compute;
@@ -26,9 +27,10 @@ pub use validate::ProgramError;
 
 #[cfg(test)]
 pub(crate) fn expand_tiles(
+    target: Target,
     program: &MidGraph,
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
-    crate::low::expand::expand_tiles(program, true)
+    crate::low::expand::expand_tiles(target, program, true)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);
@@ -190,9 +192,9 @@ pub struct MidGraph {
 }
 
 impl MidGraph {
-    pub(crate) fn refresh_estimates(&mut self) -> Option<()> {
+    pub(crate) fn refresh_estimates(&mut self, target: Target) -> Option<()> {
         self.validate().ok()?;
-        let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
+        let (cycles, peak) = crate::estimate::analyze_mid(target, self, &BTreeMap::new())?;
         self.estimated_cycles = cycles.total;
         self.estimated_exchange_cycles = cycles.exchange;
         self.peak_memory = peak;

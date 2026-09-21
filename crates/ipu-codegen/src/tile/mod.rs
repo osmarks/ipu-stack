@@ -1,8 +1,8 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
+use ipu_target::Target;
 #[cfg(test)]
 use ipu_target::ipu21::fabric::Topology;
-#[cfg(test)]
 #[cfg(test)]
 #[path = "tests/iterated_aliases.rs"]
 mod iterated_aliases;
@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Package generation uses this to emit and discard each logical tile program
 /// instead of retaining every tile's expanded instruction steps at once.
 pub struct TileProgramLowering<'a> {
+    target: Target,
     program: &'a LowGraph,
     placement: &'a Placement,
     exchanges: &'a [PhysicalExchangePhase],
@@ -77,6 +78,7 @@ struct PlacedExchange {
 
 impl<'a> TileProgramLowering<'a> {
     pub fn new(
+        target: Target,
         program: &'a LowGraph,
         placement: &'a Placement,
         exchanges: &'a [PhysicalExchangePhase],
@@ -84,6 +86,7 @@ impl<'a> TileProgramLowering<'a> {
         execution_tile_count: u16,
         validate_exchange_placement: bool,
     ) -> Result<Self, TileLoweringError> {
+        let Target::Ipu21 = target;
         if execution_tile_count < program.tile_count {
             return Err(TileLoweringError::MissingExecutionTiles {
                 scheduled: program.tile_count,
@@ -110,6 +113,7 @@ impl<'a> TileProgramLowering<'a> {
             .map(|phase| (phase.id, phase))
             .collect::<BTreeMap<_, _>>();
         Ok(Self {
+            target,
             program,
             placement,
             exchanges,
@@ -144,6 +148,7 @@ impl<'a> TileProgramLowering<'a> {
             return Ok(TileProgram {
                 tile,
                 steps: lower_work(
+                    self.target,
                     self.program,
                     work,
                     self.placement,
@@ -170,6 +175,7 @@ impl<'a> TileProgramLowering<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn lower_work(
+    target: Target,
     program: &LowGraph,
     tile: &TileWorkList,
     placement: &Placement,
@@ -231,11 +237,12 @@ fn lower_work(
                     symbol: run.symbol().into(),
                     output_address: resolve(copy.destination, copy.destination_offset)?,
                     input_addresses: vec![resolve(copy.source, copy.source_offset)?],
-                    arguments: run.call().arguments,
+                    arguments: run.call(target).arguments,
                     profile: StepProfile::default(),
                 })
             }
             BlockOperation::Compute { run, .. } => TileStep::Compute(materialize_kernel_run(
+                target,
                 &program.kernel_runs[run.0 as usize],
                 &program.shards,
                 &placement.shard_addresses,
@@ -247,6 +254,7 @@ fn lower_work(
                     return Err(TileLoweringError::NestedRepeat);
                 }
                 TileStep::Repeat(lower_repeat(
+                    target,
                     program,
                     repeat,
                     placement,
@@ -268,6 +276,7 @@ fn lower_work(
 }
 
 fn lower_repeat(
+    target: Target,
     program: &LowGraph,
     repeat: &RepeatRun,
     placement: &Placement,
@@ -294,6 +303,7 @@ fn lower_repeat(
         });
     }
     let body = lower_work(
+        target,
         program,
         &repeat.body,
         placement,
@@ -695,6 +705,7 @@ mod tests {
             },
         )]);
         let steps = lower_work(
+            Target::Ipu21,
             &program,
             &program.tiles[0],
             &placement,

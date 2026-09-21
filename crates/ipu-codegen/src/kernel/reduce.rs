@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::mid::MidOperationKind;
+#[cfg(test)]
+use ipu_target::Target;
 
 pub(super) fn call(
     kernel: &MidOperationKind,
@@ -108,6 +110,7 @@ mod tests {
                 extents: &extents,
             };
             let call = KernelCall::select(
+                Target::Ipu21,
                 &MidOperationKind::ReductionSum { partials: 1 },
                 &[geometry],
                 &[geometry],

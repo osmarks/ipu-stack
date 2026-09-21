@@ -1,8 +1,7 @@
+use ipu_target::Target;
 use std::ops::Range;
 
-use ipu_target::ipu21::runtime_layout::RUNTIME_STATE_BASE;
-pub const PROFILE_START_CYCLE: u32 = RUNTIME_STATE_BASE + 4;
-pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
+pub use ipu_target::ipu21::runtime_layout::{PROFILE_END_CYCLE, PROFILE_START_CYCLE};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {
@@ -49,13 +48,8 @@ impl TileMemoryMap {
         &self.allocations
     }
 
-    pub(crate) fn new() -> Self {
-        let free = std::iter::once(
-            ipu_target::ipu21::memory::TILE_MEMORY_BASE
-                ..ipu_target::ipu21::memory::TILE_MEMORY_BASE
-                    + ipu_target::ipu21::memory::TILE_MEMORY_SIZE,
-        )
-        .collect();
+    pub(crate) fn new(target: Target) -> Self {
+        let free = std::iter::once(target.tile_memory()).collect();
         Self {
             free,
             allocations: Vec::new(),
@@ -214,7 +208,7 @@ mod tests {
     fn randomized_memory_requests_are_aligned_bounded_and_disjoint() {
         let mut random = fastrand::Rng::with_seed(0x6d65_6d6f_7279);
         for _ in 0..128 {
-            let mut map = TileMemoryMap::new();
+            let mut map = TileMemoryMap::new(Target::Ipu21);
             map.reserve("fixed", 0x50000..0x58000).unwrap();
             for _ in 0..random.usize(1..=24) {
                 let alignment = 1 << random.u32(2..=14);

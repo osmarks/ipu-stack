@@ -16,6 +16,7 @@ use crate::memory::{
 };
 use crate::{CodegenOptions, PipelineConfig, TileProgramLowering, emit};
 use ipu_elf::LinkedImage;
+use ipu_target::Target;
 use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 use rayon::prelude::*;
@@ -50,13 +51,22 @@ pub(crate) fn size_support(
     kernel_plan: KernelObjects,
     invocations: u32,
 ) -> PackageBuildResult<PackageSupport> {
-    let topology = active_topology(program.tile_count)?;
+    let Target::Ipu21 = config.target;
+    let topology = active_topology(config.target, program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = tracing::info_span!("link_runtime").in_scope(|| -> PackageBuildResult<_> {
-        link_runtime(&objects, 0, 0, 0, &kernel_plan, &retained_runtime)
+        link_runtime(
+            config.target,
+            &objects,
+            0,
+            0,
+            0,
+            &kernel_plan,
+            &retained_runtime,
+        )
     })?;
     let linked_end = linked_end(&layout)?;
-    let mut memory = TileMemoryMap::new();
+    let mut memory = TileMemoryMap::new(config.target);
     reserve_linked_image(&mut memory, &layout, "linked runtime and kernels")?;
     reserve_fixed_runtime_memory(&mut memory)?;
 
@@ -151,6 +161,7 @@ pub(crate) fn size_support(
         usize::from(execution_tile_count)
     ];
     let provisional_host = host::plan(
+        config.target,
         &provisional_bindings.weights,
         &provisional_bindings.inputs,
         &provisional_bindings.outputs,
@@ -177,6 +188,7 @@ pub(crate) fn size_support(
         .as_ref()
         .map_or(sizing_host_base, |code| code.range.start);
     let provisional_host = host::plan(
+        config.target,
         &provisional_bindings.weights,
         &provisional_bindings.inputs,
         &provisional_bindings.outputs,
@@ -185,6 +197,7 @@ pub(crate) fn size_support(
         &provisional_auxiliary_ranges,
     )?;
     let provisional_finalizer = TileProgramLowering::new(
+        config.target,
         program,
         provisional_placement,
         provisional_exchanges,
@@ -221,6 +234,7 @@ pub(crate) fn size_support(
                     // optional setup call through the same emitter used below.
                     reserve_exchange_setup(&mut tile_program.steps);
                     let generated = emit(
+                        config.target,
                         &tile_program,
                         &layout.symbols,
                         host,

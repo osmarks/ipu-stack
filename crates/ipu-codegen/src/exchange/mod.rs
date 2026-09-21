@@ -14,6 +14,7 @@
 //! for instruction compatibility. Policy comparison and acceptance stay here.
 //! Tests invoke the same algorithms rather than maintaining implementations.
 
+use ipu_target::Target;
 use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::memory::effective_memory_elements;
 pub mod diagnostic;
@@ -190,11 +191,13 @@ pub enum ExchangeLoweringError {
 
 #[cfg(test)]
 pub(crate) fn lower_exchanges(
+    target: Target,
     program: &LowGraph,
     placement: &Placement,
     topology: &Topology,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
     lower_exchanges_cached(
+        target,
         program,
         placement,
         topology,
@@ -204,12 +207,15 @@ pub(crate) fn lower_exchanges(
 }
 
 pub(crate) fn lower_exchanges_cached(
+    target: Target,
     program: &LowGraph,
     placement: &Placement,
     topology: &Topology,
     stream_words: Option<std::num::NonZeroU32>,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+    let Target::Ipu21 = target;
+
     let repeat_inputs = repeat_source_bases(program, placement)?;
     // Each barrier-delimited phase has independent scheduling state. Keep its
     // relocation recipe local to the worker, then restore the cache in order.

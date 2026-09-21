@@ -5,6 +5,7 @@ use crate::low::{KernelRun, ShardView};
 use crate::low::{KernelRunMetadata, WorkProvenance};
 use crate::mid::MidOperationKind;
 use crate::tensor::TensorFormat;
+use ipu_target::Target;
 use std::sync::Arc;
 
 // Kernel-specific arithmetic on address-free local storage geometry.
@@ -130,6 +131,7 @@ impl KernelRun {
     /// the kernel owner establishes all address-independent call requirements.
     /// Metadata interning shares operand formats and element constraints across tile calls.
     pub(crate) fn bind(
+        target: Target,
         provenance: WorkProvenance,
         kernel: MidOperationKind,
         inputs: Vec<ShardView>,
@@ -187,7 +189,7 @@ impl KernelRun {
             inputs,
             outputs,
         };
-        run.call(None)?;
+        run.call(target, None)?;
         if matches!(run.kernel, MidOperationKind::Gemm { .. }) {
             run.product_flops = Some(gemm::product_flops(&run)?);
         }
@@ -270,6 +272,7 @@ impl KernelCall {
 impl KernelRun {
     pub(crate) fn call(
         &self,
+        target: Target,
         build: Option<&mut KernelObjects>,
     ) -> Result<KernelCall, KernelError> {
         if self.inputs.len() != self.requirements.inputs.len()
@@ -289,7 +292,7 @@ impl KernelRun {
         let outputs = (0..self.outputs.len())
             .map(|index| self.geometry(MemoryOperand::Output(index as u16)))
             .collect::<Vec<_>>();
-        KernelCall::select(&self.kernel, &inputs, &outputs, build)
+        KernelCall::select(target, &self.kernel, &inputs, &outputs, build)
     }
 }
 

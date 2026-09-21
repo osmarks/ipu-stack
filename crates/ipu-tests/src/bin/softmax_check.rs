@@ -8,6 +8,7 @@ use ipu_codegen::{
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
+use ipu_target::Target;
 use std::{fs, path::PathBuf};
 #[derive(Parser)]
 struct Arguments {
@@ -209,6 +210,7 @@ fn main() -> Result<()> {
         slices,
     }];
     let application = build_tile_program_package(
+        Target::Ipu21,
         &programs,
         &data,
         &outputs,

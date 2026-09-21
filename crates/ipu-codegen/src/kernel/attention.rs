@@ -387,7 +387,7 @@ fn flash(shape: AttentionKernelShape, build: Option<&mut KernelObjects>) -> Kern
         .saturating_mul(u64::from(shape.query_dimension) + u64::from(shape.value_dimension))
         .saturating_mul(4)
         .div_ceil(6)
-        .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles);
+        .saturating_add(ipu_target::ipu21::costs::COSTS.kernel_launch_cycles);
     KernelCall::new(call_symbol, Vec::new(), cycles)
 }
 

@@ -122,7 +122,7 @@ impl<'a> Search<'a> {
         initial.graph.outputs = initial.bindings.values().copied().collect();
         initial
             .graph
-            .refresh_estimates()
+            .refresh_estimates(settings.target)
             .ok_or(PlanningError::InvalidFragment("initial storage"))?;
         let peak = initial.graph.peak_memory;
         let mut states = (0..=exit).map(|_| HashMap::default()).collect::<Vec<_>>();
@@ -225,7 +225,7 @@ impl<'a> Search<'a> {
         candidate.graph.outputs = live.keys().map(|id| candidate.bindings[id]).collect();
         candidate
             .graph
-            .refresh_estimates()
+            .refresh_estimates(self.settings.target)
             .ok_or(PlanningError::InvalidFragment("uncostable mid fragment"))?;
         let end = candidate.end;
         let candidate = Rc::new(candidate);
@@ -321,7 +321,7 @@ impl<'a> Search<'a> {
         }
         graph.outputs = self.high.outputs().iter().map(|id| bindings[id]).collect();
         graph
-            .refresh_estimates()
+            .refresh_estimates(self.settings.target)
             .ok_or(PlanningError::InvalidFragment("selected graph"))?;
         if !graph.peak_memory.fits_with_budget(
             self.settings.target,

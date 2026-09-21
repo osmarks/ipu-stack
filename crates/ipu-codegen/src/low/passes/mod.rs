@@ -6,8 +6,13 @@ mod padding;
 
 use super::{ExpansionResult, TileGraph};
 use crate::low::storage::storage_root;
+use ipu_target::Target;
 
-pub(super) fn run(program: &mut TileGraph, reuse_cast_inputs: bool) -> ExpansionResult<()> {
+pub(super) fn run(
+    target: Target,
+    program: &mut TileGraph,
+    reuse_cast_inputs: bool,
+) -> ExpansionResult<()> {
     movement::eliminate_copies(program)?;
     let grouped = movement::group_exchanges(
         &mut program.body,
@@ -37,8 +42,8 @@ pub(super) fn run(program: &mut TileGraph, reuse_cast_inputs: bool) -> Expansion
     drop(old);
     drop(roots);
     if reuse_cast_inputs {
-        cast::donate(program)?;
+        cast::donate(target, program)?;
     }
-    padding::eliminate(program)?;
+    padding::eliminate(target, program)?;
     Ok(())
 }

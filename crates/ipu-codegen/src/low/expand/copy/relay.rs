@@ -3,6 +3,8 @@
 use crate::low::storage::storage_root;
 use crate::low::*;
 use crate::{AmpOrder, CopyOrder, ElementOrder, MemoryClass, ShardExtent};
+#[cfg(test)]
+use ipu_target::Target;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn panel_views(shard: &BlockValue) -> Option<Vec<Vec<ShardExtent>>> {
@@ -290,7 +292,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        (*crate::low::expand::expand_tiles(&program, false).unwrap()).clone()
+        (*crate::low::expand::expand_tiles(Target::Ipu21, &program, false).unwrap()).clone()
     }
 
     fn execute(program: &TileGraph) -> BTreeMap<(BlockValueId, u32), (BlockValueId, u32)> {

@@ -10,6 +10,7 @@ use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding};
 use ipu_runtime::Runtime;
+use ipu_target::Target;
 use ipu_tests::completion::{diagnose_completion, summarize_states, supervisor_states};
 use rand_distr::{Distribution, StandardNormal};
 use rand_xoshiro::{SplitMix64, rand_core::SeedableRng};
@@ -512,7 +513,7 @@ fn main() -> Result<()> {
     }
 
     let mut graph = HighGraph::default();
-    let mut pipeline = PipelineConfig::new(active_tiles);
+    let mut pipeline = PipelineConfig::new(Target::Ipu21, active_tiles);
     // The planner currently requires explicit boundary formats. Benchmark
     // graphs without dedicated formats start from a distributed linear layout.
     let default_input = TensorFormat {
@@ -2443,7 +2444,7 @@ mod tests {
             let mut application = Application {
                 inputs: vec![binding.clone()],
                 outputs: vec![binding],
-                ..Default::default()
+                ..Application::new(Target::Ipu21)
             };
             let (_, packed) = diagnostic::pack_inputs(&application, &[tensor.clone()], &values)?;
             // Changing enumeration and physical tile numbers must not change logical I/O.

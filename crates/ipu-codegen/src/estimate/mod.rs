@@ -1,5 +1,5 @@
 //! Estimates share one vocabulary: tensor geometry and traffic describe work;
-//! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
+//! memory evaluates allocations/liveness, and cycles applies target prices.
 
 use crate::storage::GeometryCache;
 mod cycles;
@@ -34,7 +34,6 @@ use crate::{
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 
-pub use cycles::IPU21_TARGET_COSTS;
 pub(crate) use memory::*;
 pub use memory::{MemoryPeaks, MemoryUsage};
 pub(crate) use tensor::*;

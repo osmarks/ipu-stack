@@ -3,6 +3,7 @@ use ipu_codegen::exchange::{
     PhaseProgramBuilder, PhaseTransferTiming, patch_receiver_address, patch_sender_address,
     scheduled_receiver_timing,
 };
+use ipu_target::Target;
 
 use ipu_codegen::{
     CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
@@ -408,6 +409,7 @@ pub(crate) fn build_wide(
 
     let output_bindings = readback_bindings(&readbacks, &topology)?;
     let application = build_tile_program_package(
+        Target::Ipu21,
         &programs,
         &data,
         &output_bindings,
@@ -796,7 +798,14 @@ pub(crate) fn build(
             data,
         })
         .collect::<Vec<_>>();
-    let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
+    let application = build_tile_program_package(
+        Target::Ipu21,
+        &programs,
+        &data,
+        &[],
+        toolchain,
+        runtime_source,
+    )?;
     eprintln!(
         "exchangeStress seed={seed:#x} pattern={} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
         if loopback {
@@ -1046,7 +1055,14 @@ fn build_physical_phase_replay(
                 .push((u16::try_from(tile)?, address));
         }
     }
-    let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
+    let application = build_tile_program_package(
+        Target::Ipu21,
+        &programs,
+        &data,
+        &[],
+        toolchain,
+        runtime_source,
+    )?;
     let overlapping_tiles = phase
         .activities
         .iter()

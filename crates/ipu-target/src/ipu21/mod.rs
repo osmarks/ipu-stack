@@ -1,4 +1,5 @@
 //! IPU21 architecture and the shared runtime/loader contracts used on this target.
+pub mod costs;
 pub mod fabric;
 pub mod instruction;
 pub mod loader_abi;

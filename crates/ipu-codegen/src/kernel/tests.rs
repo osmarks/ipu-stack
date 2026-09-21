@@ -4,6 +4,7 @@ use crate::{
     AccumulationPrecision, HighGraph, KernelRequirements, Layout, MemoryClass, PipelineConfig,
     ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower_to_tiles,
 };
+use ipu_target::Target;
 
 #[test]
 fn packed_add_keeps_padding_in_dense_operand_view() {
@@ -20,7 +21,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
         precision: Precision::F16,
         layout,
     };
-    let config = PipelineConfig::new(2)
+    let config = PipelineConfig::new(Target::Ipu21, 2)
         .with_input(x, format.clone())
         .with_input(y, format);
     let mid = crate::planner::plan(
@@ -30,7 +31,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
         crate::planner::SearchLimits::default(),
     )
     .unwrap();
-    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+    let low = lower_to_tiles(&crate::expand_tiles(Target::Ipu21, &mid).unwrap(), false);
     let addresses = low
         .shards
         .iter()
@@ -44,7 +45,14 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
                 ElementOrder::Amp(AmpOrder::Left)
             );
             packed_adds += 1;
-            materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
+            materialize_kernel_run(
+                Target::Ipu21,
+                run,
+                &low.shards,
+                &addresses,
+                &BTreeMap::new(),
+            )
+            .unwrap();
         }
     }
     assert_eq!(packed_adds, 2);
@@ -229,6 +237,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             })
             .collect::<Vec<_>>();
         let run = KernelRun::bind(
+            Target::Ipu21,
             WorkProvenance {
                 operation: None,
                 value: None,
@@ -241,7 +250,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             &mut Vec::new(),
         )
         .unwrap();
-        let call = run.call(Some(&mut plan)).unwrap();
+        let call = run.call(Target::Ipu21, Some(&mut plan)).unwrap();
         assert_eq!(call.arguments, expected);
         calls.push(call);
     }
@@ -356,6 +365,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
     let addresses = BTreeMap::from([(shard.id, 0x60000)]);
     let materialize = |run: &KernelRun| {
         materialize_kernel_run(
+            Target::Ipu21,
             run,
             std::slice::from_ref(&shard),
             &addresses,
@@ -367,7 +377,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         compute.output_address,
         TileAddress::Absolute(0x60000 + 32 + 16)
     );
-    assert_eq!(run.call(None).unwrap().arguments, vec![1, 1]);
+    assert_eq!(run.call(Target::Ipu21, None).unwrap().arguments, vec![1, 1]);
     for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
         let run = KernelRun::new(
             run.provenance,
@@ -419,7 +429,7 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
                 distinct_elements: Vec::new(),
             },
         );
-        let call = run.call(Some(&mut plan)).unwrap();
+        let call = run.call(Target::Ipu21, Some(&mut plan)).unwrap();
         assert_eq!(call.arguments, [count]);
         assert!(
             plan.retained_symbols()
@@ -512,7 +522,10 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
             vec![view],
             requirements,
         );
-        assert_eq!(run.call(None), Err(KernelError::Unavailable(kernel)));
+        assert_eq!(
+            run.call(Target::Ipu21, None),
+            Err(KernelError::Unavailable(kernel))
+        );
     }
 }
 
@@ -551,10 +564,13 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
             distinct_elements: vec![],
         },
     );
-    run.call(None).unwrap();
+    run.call(Target::Ipu21, None).unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
     run.inputs[1] = view(1, [2, (1 << 31) + 1]);
-    assert_eq!(run.call(None), Err(KernelError::ElementCountOverflow));
+    assert_eq!(
+        run.call(Target::Ipu21, None),
+        Err(KernelError::ElementCountOverflow)
+    );
 }
 
 #[test]
@@ -594,6 +610,7 @@ fn binding_checks_backing_strides_before_placement() {
                 })
                 .collect::<Vec<_>>();
             let bound = KernelRun::bind(
+                Target::Ipu21,
                 provenance,
                 MidOperationKind::Gelu,
                 vec![views[0].clone()],
@@ -606,7 +623,8 @@ fn binding_checks_backing_strides_before_placement() {
             if rows == 1 || columns == 16 {
                 let run = bound.unwrap();
                 let addresses = BTreeMap::from([(shards[0].id, 0x60000), (shards[1].id, 0x70000)]);
-                materialize_kernel_run(&run, &shards, &addresses, &BTreeMap::new()).unwrap();
+                materialize_kernel_run(Target::Ipu21, &run, &shards, &addresses, &BTreeMap::new())
+                    .unwrap();
             } else {
                 assert!(matches!(bound, Err(KernelError::FragmentedView { .. })));
             }
@@ -618,6 +636,7 @@ fn binding_checks_backing_strides_before_placement() {
     incompatible[1].tensor_type.format = output;
     assert!(matches!(
         KernelRun::bind(
+            Target::Ipu21,
             provenance,
             MidOperationKind::Gelu,
             vec![ShardView {
@@ -690,6 +709,7 @@ fn packing_call(
         })
         .collect::<Vec<_>>();
     KernelCall::select(
+        Target::Ipu21,
         &MidOperationKind::Rearrange {
             from: source.layout.clone(),
             to: target.layout.clone(),

@@ -6,6 +6,7 @@
 
 use crate::mid::MidOperationKind;
 use crate::storage::GeometryCache;
+use ipu_target::Target;
 mod compute;
 
 mod copy;
@@ -20,7 +21,7 @@ use crate::storage::ByteSpan;
 use crate::storage::StorageError;
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
-    LayoutError, MemoryClass, MidOperation, MidGraph, MidRepeat, MidValueId, PackingPolicy,
+    LayoutError, MemoryClass, MidGraph, MidOperation, MidRepeat, MidValueId, PackingPolicy,
     Precision, ShardExtent, TensorTiling, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,10 +58,12 @@ pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
 #[cfg(test)]
 pub(crate) fn expand_tiles(
+    target: Target,
     graph: &MidGraph,
     checkpoints: bool,
 ) -> ExpansionResult<Arc<TileGraph>> {
     expand_tiles_cached(
+        target,
         graph,
         checkpoints,
         false,
@@ -69,15 +72,17 @@ pub(crate) fn expand_tiles(
 }
 
 pub(crate) fn expand_tiles_cached(
+    target: Target,
     graph: &MidGraph,
     checkpoints: bool,
     reuse_cast_inputs: bool,
     cache: Arc<GeometryCache>,
 ) -> ExpansionResult<Arc<TileGraph>> {
+    let Target::Ipu21 = target;
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
-    let mut state = TileGraphBuilder::new(graph, Arc::clone(&cache))?;
+    let mut state = TileGraphBuilder::new(target, graph, Arc::clone(&cache))?;
     state.program.body = state.build_region(&graph.operations, checkpoints)?;
     for value in graph
         .inputs
@@ -88,7 +93,7 @@ pub(crate) fn expand_tiles_cached(
         state.value_views(value)?;
     }
     let mut program = state.program;
-    crate::low::passes::run(&mut program, reuse_cast_inputs)?;
+    crate::low::passes::run(target, &mut program, reuse_cast_inputs)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),
@@ -98,6 +103,7 @@ pub(crate) fn expand_tiles_cached(
 }
 
 struct TileGraphBuilder {
+    target: Target,
     cache: Arc<GeometryCache>,
     program: TileGraph,
     storage_groups: Vec<MidValueId>,
@@ -105,9 +111,10 @@ struct TileGraphBuilder {
 }
 
 impl TileGraphBuilder {
-    fn new(graph: &MidGraph, cache: Arc<GeometryCache>) -> ExpansionResult<Self> {
+    fn new(target: Target, graph: &MidGraph, cache: Arc<GeometryCache>) -> ExpansionResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
+            target,
             cache,
             program: TileGraph {
                 tile_count: graph.tile_count,
@@ -269,6 +276,7 @@ impl TileGraphBuilder {
         outputs: Vec<ShardView>,
     ) -> ExpansionResult<KernelRun> {
         Ok(KernelRun::bind(
+            self.target,
             provenance,
             kernel,
             inputs,

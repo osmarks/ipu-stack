@@ -7,10 +7,11 @@ use crate::low::storage::storage_location;
 use crate::low::*;
 use crate::mid::MidOperationKind;
 use crate::tensor::Precision;
+use ipu_target::Target;
 use std::collections::BTreeSet;
 
 #[tracing::instrument(skip_all)]
-pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
+pub(super) fn eliminate(target: Target, program: &mut TileGraph) -> ExpansionResult<()> {
     let uses = crate::low::uses::StorageUses::analyze(program);
     let root = |id: BlockValueId| uses.roots[id.index() as usize];
     let mut clears = vec![Vec::new(); uses.allocations.len()];
@@ -150,7 +151,7 @@ pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
         {
             continue;
         }
-        let call = run.call(None)?;
+        let call = run.call(target, None)?;
         for (operand, input) in run.inputs.iter().enumerate() {
             let readers = &clears[root(input.shard)];
             if readers.is_empty() {
@@ -390,9 +391,11 @@ mod tests {
                         body,
                     })));
             }
-            let before = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
-            eliminate(&mut program).unwrap();
-            let after = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
+            let before =
+                crate::estimate::scheduled_program_cycles(Target::Ipu21, &program, &[]).unwrap();
+            eliminate(Target::Ipu21, &mut program).unwrap();
+            let after =
+                crate::estimate::scheduled_program_cycles(Target::Ipu21, &program, &[]).unwrap();
             assert!(after.total < before.total);
             assert!(!has_clear(&program));
             assert!(program.requires_finite_scratch);
@@ -412,10 +415,11 @@ mod tests {
             };
             let mut executed = (*program).clone();
             executed.body.operations = vec![BlockOperation::Compute { tile: 0, run: *id }];
-            let cost = crate::estimate::scheduled_program_cycles(&executed, &[]).unwrap();
+            let cost =
+                crate::estimate::scheduled_program_cycles(Target::Ipu21, &executed, &[]).unwrap();
             assert_eq!(after.total, cost.total * u64::from(count));
             let mut again = (*program).clone();
-            eliminate(&mut again).unwrap();
+            eliminate(Target::Ipu21, &mut again).unwrap();
             assert_eq!(again, *program, "removal must be idempotent");
         }
     }
@@ -566,7 +570,7 @@ mod tests {
                 }
                 _ => {}
             }
-            eliminate(&mut program).unwrap();
+            eliminate(Target::Ipu21, &mut program).unwrap();
             assert_eq!(
                 has_clear(&program),
                 !(case <= 1 || case == 7 || case == 11),
@@ -578,7 +582,7 @@ mod tests {
     #[test]
     fn finite_padding_requires_zero_weights_and_no_other_consumers() {
         let mut program = fixture();
-        eliminate(&mut program).unwrap();
+        eliminate(Target::Ipu21, &mut program).unwrap();
         assert!(!has_clear(&program));
         assert!(program.requires_finite_scratch);
         for case in 0..8 {
@@ -620,7 +624,7 @@ mod tests {
                     graph.shards[1].extents[0].logical_end = 64;
                 }
             }
-            eliminate(&mut program).unwrap();
+            eliminate(Target::Ipu21, &mut program).unwrap();
             assert!(has_clear(&program), "case {case}");
         }
     }
@@ -641,9 +645,9 @@ mod tests {
         let mut movement = last.movement().clone();
         movement.destination = BlockValueId(1);
         *last = crate::kernel::CopyRun::bind(movement, &overwritten.shards).unwrap();
-        eliminate(&mut program).unwrap();
-        eliminate(&mut mixed).unwrap();
-        eliminate(&mut overwritten).unwrap();
+        eliminate(Target::Ipu21, &mut program).unwrap();
+        eliminate(Target::Ipu21, &mut mixed).unwrap();
+        eliminate(Target::Ipu21, &mut overwritten).unwrap();
         assert!(!has_clear(&program));
         assert!(has_clear(&mixed));
         assert!(has_clear(&overwritten));
@@ -664,7 +668,7 @@ mod tests {
             }
             append_copy(&mut program, 1, 3, if partial { 256 } else { 2048 });
             program.kernel_runs[1].inputs[1].shard = BlockValueId(3);
-            eliminate(&mut program).unwrap();
+            eliminate(Target::Ipu21, &mut program).unwrap();
             assert!(has_clear(&program), "partial={partial}");
         }
     }
@@ -707,7 +711,7 @@ mod tests {
                 .operations
                 .insert(0, BlockOperation::Exchange(ExchangePhaseId(0)));
             program.kernel_runs[1].inputs[1].shard = BlockValueId(3);
-            eliminate(&mut program).unwrap();
+            eliminate(Target::Ipu21, &mut program).unwrap();
             assert_eq!(has_clear(&program), case != 0, "case={case}");
         }
     }

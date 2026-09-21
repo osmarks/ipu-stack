@@ -1,5 +1,6 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
+use ipu_target::Target;
 use ipu_target::ipu21::memory::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
@@ -103,8 +104,9 @@ pub(crate) const HOST_SCRATCH_RANGE: (u32, u32) = (
         + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES,
 );
 
-pub fn place(program: &LowGraph) -> Result<Placement, PlacementError> {
+pub fn place(target: Target, program: &LowGraph) -> Result<Placement, PlacementError> {
     place_with_ranges(
+        target,
         program,
         &[
             HOST_SCRATCH_RANGE,
@@ -114,26 +116,31 @@ pub fn place(program: &LowGraph) -> Result<Placement, PlacementError> {
 }
 
 pub(crate) fn place_with_ranges(
+    target: Target,
     program: &LowGraph,
     available_ranges: &[(u32, u32)],
 ) -> Result<Placement, PlacementError> {
-    place_with_offset(program, available_ranges, 0)
+    place_with_offset(target, program, available_ranges, 0)
 }
 
 pub(crate) fn place_with_offset(
+    target: Target,
     program: &LowGraph,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
 ) -> Result<Placement, PlacementError> {
-    place_with_auxiliary(program, available_ranges, interleaved_offset, &[])
+    place_with_auxiliary(target, program, available_ranges, interleaved_offset, &[])
 }
 
 pub(crate) fn place_with_auxiliary(
+    target: Target,
     program: &LowGraph,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
     auxiliary: &[Vec<AuxiliaryRequest>],
 ) -> Result<Placement, PlacementError> {
+    let Target::Ipu21 = target;
+
     let started = std::time::Instant::now();
     if auxiliary
         .iter()
@@ -1256,7 +1263,7 @@ mod tests {
         let parameter = graph.parameter("p", [1, 128]).unwrap();
         let output = graph.gelu(parameter).unwrap();
         graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(1).with_input(
+        let config = PipelineConfig::new(Target::Ipu21, 1).with_input(
             parameter,
             TensorFormat {
                 precision: Precision::F16,
@@ -1270,7 +1277,7 @@ mod tests {
             crate::planner::SearchLimits::default(),
         )
         .unwrap();
-        let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+        let low = lower_to_tiles(&crate::expand_tiles(Target::Ipu21, &mid).unwrap(), false);
         let requests = [64, 128].map(|bytes| {
             vec![AuxiliaryRequest {
                 name: "samples".into(),
@@ -1281,7 +1288,8 @@ mod tests {
             }]
         });
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
-        let placement = place_with_auxiliary(&low, &[(base, base + 576)], 0, &requests).unwrap();
+        let placement =
+            place_with_auxiliary(Target::Ipu21, &low, &[(base, base + 576)], 0, &requests).unwrap();
         assert_ne!(
             placement.auxiliary_allocations[0][0].address,
             placement.auxiliary_allocations[1][0].address
@@ -1312,6 +1320,7 @@ mod tests {
         // would make an otherwise undersized data arena fit.
         assert!(
             place_with_auxiliary(
+                Target::Ipu21,
                 &low,
                 &[HOST_SCRATCH_RANGE, (base, base + 512)],
                 0,
@@ -1328,7 +1337,7 @@ mod tests {
             let parameter = graph.parameter("p", [8, 64]).unwrap();
             let output = graph.gelu(parameter).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(tiles).with_input(
+            let config = PipelineConfig::new(Target::Ipu21, tiles).with_input(
                 parameter,
                 TensorFormat {
                     precision: Precision::F16,
@@ -1342,7 +1351,7 @@ mod tests {
                 crate::planner::SearchLimits::default(),
             )
             .unwrap();
-            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            let low = lower_to_tiles(&crate::expand_tiles(Target::Ipu21, &mid).unwrap(), false);
             let analysis = analyze_allocations(&low).unwrap();
             let roots = low
                 .value_views(low.inputs[0].value)
@@ -1406,7 +1415,7 @@ mod tests {
             graph.set_outputs([input]).unwrap();
             let mut layout = Layout::row_sharded(1);
             layout.memory_class = class;
-            let config = PipelineConfig::new(1).with_input(
+            let config = PipelineConfig::new(Target::Ipu21, 1).with_input(
                 input,
                 TensorFormat {
                     precision: Precision::F16,
@@ -1420,8 +1429,8 @@ mod tests {
                 crate::planner::SearchLimits::default(),
             )
             .unwrap();
-            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-            let placed = place_with_ranges(&low, &available).unwrap();
+            let low = lower_to_tiles(&crate::expand_tiles(Target::Ipu21, &mid).unwrap(), false);
+            let placed = place_with_ranges(Target::Ipu21, &low, &available).unwrap();
             assert!(!placed.shard_addresses.is_empty());
             for &address in placed.shard_addresses.values() {
                 assert!(start <= address && address + 256 <= start + 4096);
@@ -1433,7 +1442,7 @@ mod tests {
                     .flatten()
                     .all(|&(a, b)| start <= a && b <= start + 4096)
             );
-            assert!(place_with_ranges(&low, &[(start, start + 4)]).is_err());
+            assert!(place_with_ranges(Target::Ipu21, &low, &[(start, start + 4)]).is_err());
         }
     }
 
@@ -1671,7 +1680,7 @@ mod tests {
             precision: Precision::F16,
             layout: Layout::row_sharded(4),
         };
-        let config = PipelineConfig::new(4).with_input(input, format);
+        let config = PipelineConfig::new(Target::Ipu21, 4).with_input(input, format);
         let candidate = crate::planner::plan(
             &graph,
             &crate::planner::boundary_layouts(&graph, &config),
@@ -1679,7 +1688,7 @@ mod tests {
             crate::planner::SearchLimits::default(),
         )
         .unwrap();
-        let mut program = (*crate::expand_tiles(&candidate).unwrap()).clone();
+        let mut program = (*crate::expand_tiles(Target::Ipu21, &candidate).unwrap()).clone();
         let work = program
             .body
             .operations
@@ -1717,7 +1726,7 @@ mod tests {
                 precision: Precision::F16,
                 layout: Layout::row_sharded(tiles),
             };
-            let config = PipelineConfig::new(tiles)
+            let config = PipelineConfig::new(Target::Ipu21, tiles)
                 .with_input(left, format.clone())
                 .with_input(right, format);
             let mut layouts = crate::planner::boundary_layouts(&graph, &config);
@@ -1736,10 +1745,10 @@ mod tests {
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];
             let low = lower_to_tiles(
-                &crate::expand_tiles(&mid).unwrap(),
+                &crate::expand_tiles(Target::Ipu21, &mid).unwrap(),
                 config.diagnostic_checkpoints,
             );
-            let placement = place(&low).unwrap();
+            let placement = place(Target::Ipu21, &low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {
                     low.value_views(value)

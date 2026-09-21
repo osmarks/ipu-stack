@@ -3,6 +3,7 @@
 use crate::kernel::abi::{
     FIRST_INPUT_REGISTER, LAST_VALUE_REGISTER, OUTPUT_REGISTER, RETURN_REGISTER,
 };
+use ipu_target::Target;
 use ipu_target::ipu21::instruction::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
@@ -255,11 +256,14 @@ pub struct PlacedExchangeRow {
 }
 
 pub fn emit(
+    target: Target,
     program: &TileProgram,
     symbols: &BTreeMap<String, u32>,
     host: &HostProgram,
     options: &CodegenOptions,
 ) -> Result<GeneratedProgram> {
+    let Target::Ipu21 = target;
+
     let exchange_rows = validate::program(program, host, options)?;
 
     let complete = symbol(symbols, COMPLETE_SYMBOL)?;

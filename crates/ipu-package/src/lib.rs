@@ -1,4 +1,5 @@
 use capnp::{message, serialize};
+use ipu_target::Target;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use tracing::{info, trace};
@@ -26,7 +27,6 @@ mod profile;
 pub use profile::*;
 
 pub const SCHEMA_VERSION: u32 = 5;
-pub const TARGET_IPU21: &str = "ipu21";
 // Compatibility exports; the defining owners are target and loader ABI.
 pub use ipu_target::ipu21::memory::{
     IPU21_EXECUTABLE_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
@@ -176,6 +176,7 @@ pub struct DebugRegion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Application {
+    pub target: Target,
     pub compiler_version: String,
     pub tiles: Vec<TileImage>,
     pub inputs: Vec<Binding>,
@@ -189,9 +190,10 @@ pub struct Application {
     pub debug_regions: Vec<DebugRegion>,
 }
 
-impl Default for Application {
-    fn default() -> Self {
+impl Application {
+    pub fn new(target: Target) -> Self {
         Self {
+            target,
             compiler_version: env!("CARGO_PKG_VERSION").into(),
             tiles: Vec::new(),
             inputs: Vec::new(),
@@ -209,6 +211,8 @@ impl Default for Application {
 
 impl Application {
     pub fn validate(&self) -> Result<(), PackageError> {
+        // This validator implements the IPU21 loader and memory contracts.
+        let Target::Ipu21 = self.target;
         if self.tiles.is_empty() {
             return Err(PackageError::Invalid("application has no tiles".into()));
         }
@@ -386,9 +390,10 @@ impl Application {
         let mut root = message.init_root::<application_capnp::application::Builder>();
         root.set_schema_version(SCHEMA_VERSION);
         root.set_compiler_version(&self.compiler_version);
-        root.set_target(TARGET_IPU21);
-        root.set_tile_memory_base(TILE_MEMORY_BASE);
-        root.set_tile_memory_size(TILE_MEMORY_SIZE);
+        root.set_target(self.target.name());
+        let memory = self.target.tile_memory();
+        root.set_tile_memory_base(memory.start);
+        root.set_tile_memory_size(memory.end - memory.start);
 
         write_tiles(
             root.reborrow().init_tiles(self.tiles.len() as u32),
@@ -456,16 +461,21 @@ impl Application {
         info!("reading application package");
         let reader = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = reader.get_root::<application_capnp::application::Reader>()?;
+        let target = root
+            .get_target()?
+            .to_str()?
+            .parse::<Target>()
+            .map_err(|_| PackageError::Invalid("unsupported package target".into()))?;
+        let memory = target.tile_memory();
         if root.get_schema_version() != SCHEMA_VERSION
-            || root.get_target()?.to_str()? != TARGET_IPU21
-            || root.get_tile_memory_base() != TILE_MEMORY_BASE
-            || root.get_tile_memory_size() != TILE_MEMORY_SIZE
+            || root.get_tile_memory_base() != memory.start
+            || root.get_tile_memory_size() != memory.end - memory.start
         {
             return Err(PackageError::Invalid("incompatible package header".into()));
         }
         let mut app = Application {
             compiler_version: root.get_compiler_version()?.to_str()?.into(),
-            ..Application::default()
+            ..Application::new(target)
         };
         app.tiles = read_tiles(root.get_tiles()?)?;
         app.inputs = read_bindings(root.get_inputs()?)?;
@@ -922,7 +932,7 @@ mod tests {
     use super::*;
 
     fn sample() -> Application {
-        let mut app = Application::default();
+        let mut app = Application::new(Target::Ipu21);
         app.tiles.push(TileImage {
             physical_tile: 0,
             entry_point: TILE_MEMORY_BASE,
@@ -972,6 +982,33 @@ mod tests {
         assert!(app.outputs[0].byte_len().is_err());
         assert!(app.output_binding("next").is_err());
         assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn package_header_rejects_unknown_targets_and_mismatched_memory() {
+        let target = Target::Ipu21;
+        let memory = target.tile_memory();
+        for bit in 0..32 {
+            for unknown_target in [false, true] {
+                let mut message = message::Builder::new_default();
+                let mut header = message.init_root::<application_capnp::application::Builder>();
+                header.set_schema_version(SCHEMA_VERSION);
+                header.set_target(if unknown_target {
+                    "unknown-ipu"
+                } else {
+                    target.name()
+                });
+                header.set_tile_memory_base(memory.start);
+                header.set_tile_memory_size((memory.end - memory.start) ^ (1 << bit));
+                let mut bytes = Vec::new();
+                serialize::write_message(&mut bytes, &message).unwrap();
+                let error = Application::read(bytes.as_slice()).unwrap_err();
+                assert!(
+                    matches!(error, PackageError::Invalid(ref reason) if reason ==
+                    if unknown_target { "unsupported package target" } else { "incompatible package header" })
+                );
+            }
+        }
     }
 
     #[test]
@@ -1135,7 +1172,7 @@ mod tests {
         for case in 0..64 {
             let tile_count = random.usize(1..=8);
             let prefix_bytes = random.usize(0..=8) * 4;
-            let mut app = Application::default();
+            let mut app = Application::new(Target::Ipu21);
             app.outputs.push(Binding {
                 name: "prefix".into(),
                 dtype: "u8".into(),

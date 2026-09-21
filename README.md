@@ -30,6 +30,15 @@ or a timing benchmark; see the [validation report](docs/SIGLIP_PRETRAINED_VALIDA
 - `ipu-tests`: hardware diagnostics, model benchmarks, and reference validation.
 - `ipu-cli`: compile, link, inspect, profile, load, and host-run commands.
 
+`ipu-target` owns architecture facts and runtime memory contracts.
+`PipelineConfig::new(target, tile_count)` selects the architecture for planning,
+costing, lowering and packaging. Direct tile-program packaging and
+`Toolchain::compile` also require a target; packages record it in their header.
+Only `Target::Ipu21` is implemented. IPU21 instruction/ABI implementations use
+exhaustive target dispatch, so adding another variant requires explicitly
+handling it rather than silently emitting IPU21 code. Hardware fixtures still
+use the C600 tile inventory.
+
 `device/` contains assembly runtime support and kernels. Generated kernels and
 operator implementations live in `ipu-codegen`.
 

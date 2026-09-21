@@ -1,5 +1,8 @@
 //! Package support sizing, address binding and final image emission.
 //! Tensor search, placement and exchange scheduling belong to the compiler driver.
+//! Support sizing and image emission currently implement the IPU21 runtime ABI;
+//! both explicitly dispatch the target before using that ABI's constants.
+use ipu_target::Target;
 use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::instruction::{encode_br_m, encode_setzi_m};
 use ipu_target::ipu21::memory::IPU21_DATA_BASE;
@@ -27,9 +30,10 @@ use crate::{
 };
 use crate::{PipelineConfig, Precision, TileGraph};
 use ipu_target::ipu21::runtime_layout::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, HOST_RUN_SYMBOL, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, RUNTIME_STATE_BASE,
-    RUNTIME_STATE_BYTES, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL,
+    APPLICATION_ENTRY_BYTES as ENTRY_BYTES, COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL,
+    HOST_RUN_SYMBOL, PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL,
+    RUNTIME_ENTRY_SYMBOL, RUNTIME_EXECUTABLE_START, RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES,
+    SAMPLE_CYCLE_SYMBOL, SUPPORT_START, WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL,
     WORKER_STACK_HEADROOM, WORKER_SYNC_CONTEXT_SYMBOL,
 };
 
@@ -46,14 +50,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::num::TryFromIntError;
 
-const ENTRY_BYTES: u32 = 8;
-const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
 const COMPLETION_ADDRESS: u32 = RUNTIME_STATE_BASE;
-const RUNTIME_EXECUTABLE_START: u32 = (RUNTIME_STATE_BASE
-    + RUNTIME_STATE_BYTES
-    + ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
-    - 1)
-    & !(ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE - 1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
@@ -211,7 +208,8 @@ pub(crate) fn emit_package(
     config: &PipelineConfig,
     invocations: u32,
 ) -> PackageBuildResult<Application> {
-    let topology = active_topology(program.tile_count)?;
+    let Target::Ipu21 = config.target;
+    let topology = active_topology(config.target, program.tile_count)?;
     let execution_topology = Topology::c600();
     let execution_tile_count = u16::try_from(execution_topology.tile_count())?;
     let objects = &support.objects;
@@ -263,6 +261,7 @@ pub(crate) fn emit_package(
         }
     }
     let mut host = host::plan(
+        config.target,
         &weights,
         &inputs,
         &outputs,
@@ -285,6 +284,7 @@ pub(crate) fn emit_package(
         )));
     }
     let finalizer = TileProgramLowering::new(
+        config.target,
         program,
         placement,
         exchanges,
@@ -347,6 +347,7 @@ pub(crate) fn emit_package(
             .zip(&host.programs)
             .map(|((tile_program, _), host)| {
                 Ok(emit(
+                    config.target,
                     tile_program,
                     &layout.symbols,
                     host,
@@ -376,6 +377,7 @@ pub(crate) fn emit_package(
         .collect::<Vec<_>>();
 
     let tile_build = TileBuildContext {
+        target: config.target,
         objects,
         kernel_plan,
         retained_runtime,
@@ -396,7 +398,7 @@ pub(crate) fn emit_package(
                 })
                 .collect::<PackageBuildResult<Vec<_>>>()
         })?;
-    let mut application = assemble_application(tiles, outputs, layout, host)?;
+    let mut application = assemble_application(config.target, tiles, outputs, layout, host)?;
     for (physical, program) in generated.iter().enumerate() {
         add_generated_debug_map(
             &mut application,
@@ -482,6 +484,7 @@ pub(crate) fn diagnostic_tensor(
 /// Common package metadata for graph lowering and explicit tile programs.
 /// Callers attach their bindings and generated-code debug maps before validation.
 fn assemble_application(
+    target: Target,
     mut tiles: Vec<TileImage>,
     mut outputs: Vec<Binding>,
     linked: &LinkedImage,
@@ -508,7 +511,7 @@ fn assemble_application(
             external_syncs: 0,
         }],
         host_exchange: host.protocol,
-        ..Application::default()
+        ..Application::new(target)
     };
     add_linked_debug_map(&mut application, linked);
     for (physical, segments) in host.segments.iter().enumerate() {
@@ -584,7 +587,9 @@ fn add_generated_debug_map(
     Ok(())
 }
 
-pub(crate) fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
+pub(crate) fn validate_tile_count(target: Target, tile_count: u32) -> PackageBuildResult<()> {
+    let Target::Ipu21 = target;
+
     let maximum = Topology::c600().tile_count() as u32;
     if tile_count == 0 || !tile_count.is_multiple_of(TILES_PER_BATCH as u32) || tile_count > maximum
     {
@@ -595,7 +600,9 @@ pub(crate) fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     Ok(())
 }
 
-pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
+pub(crate) fn active_topology(target: Target, tile_count: u16) -> PackageBuildResult<Topology> {
+    let Target::Ipu21 = target;
+
     Ok(Topology::new(
         (0..tile_count)
             .map(ipu_target::c600::logical_to_physical)
@@ -604,6 +611,7 @@ pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
 }
 
 struct TileBuildContext<'a> {
+    target: Target,
     objects: &'a [Vec<u8>],
     kernel_plan: &'a KernelObjects,
     retained_runtime: &'a [&'a str],
@@ -619,6 +627,7 @@ fn build_tile(
     context: &TileBuildContext<'_>,
 ) -> PackageBuildResult<TileImage> {
     let linked = link_runtime(
+        context.target,
         context.objects,
         logical_tile,
         context.code_address,
@@ -677,6 +686,7 @@ fn build_tile(
 }
 
 fn link_runtime(
+    target: Target,
     objects: &[Vec<u8>],
     physical_tile: u32,
     program_address: u32,
@@ -694,6 +704,7 @@ fn link_runtime(
     Ok(link(
         objects,
         &LinkOptions {
+            target,
             image_base: TILE_MEMORY_BASE,
             regions: vec![
                 (
@@ -854,7 +865,8 @@ mod tests {
             end: 0,
             staging_address: 0,
         };
-        let application = assemble_application(vec![], vec![], &linked, host).unwrap();
+        let application =
+            assemble_application(Target::Ipu21, vec![], vec![], &linked, host).unwrap();
         assert_eq!(application.debug_regions.len(), 1);
         let region = &application.debug_regions[0];
         assert_eq!(
@@ -894,7 +906,7 @@ mod tests {
             ],
             symbols: BTreeMap::new(),
         };
-        let mut memory = TileMemoryMap::new();
+        let mut memory = TileMemoryMap::new(Target::Ipu21);
         reserve_linked_image(&mut memory, &linked, "test code").unwrap();
         let extra = allocate_package_code(&mut memory, "extra code", 64, 8, 0).unwrap();
         assert_eq!(extra.range.start, base + 128);
@@ -938,7 +950,7 @@ mod tests {
                 },
             ],
         };
-        let mut memory = TileMemoryMap::new();
+        let mut memory = TileMemoryMap::new(Target::Ipu21);
         reserve_linked_image(&mut memory, &linked, "linked code").unwrap();
         assert!(
             memory
@@ -962,7 +974,7 @@ mod tests {
 
     #[test]
     fn runtime_state_tail_can_hold_data_but_never_code() {
-        let mut memory = TileMemoryMap::new();
+        let mut memory = TileMemoryMap::new(Target::Ipu21);
         memory
             .reserve("runtime state", RUNTIME_STATE_BASE..IPU21_DATA_BASE)
             .unwrap();

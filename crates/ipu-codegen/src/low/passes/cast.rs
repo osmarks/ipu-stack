@@ -5,9 +5,10 @@ use crate::kernel::cast::{CAST_PREFIX_BYTES, CastChunks};
 use crate::low::storage::shard_storage_bytes;
 use crate::low::*;
 use crate::{MidOperationKind, Precision};
+use ipu_target::Target;
 use std::collections::BTreeMap;
 
-pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
+pub(super) fn donate(architecture: Target, program: &mut TileGraph) -> ExpansionResult<()> {
     let mut uses = crate::low::uses::StorageUses::analyze(program);
     let roots = &uses.roots;
     let candidates = program
@@ -92,6 +93,7 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
                     .max(extent.start);
             }
             calls.push(KernelRun::bind(
+                architecture,
                 call.provenance,
                 call.kernel.clone(),
                 vec![input],
@@ -137,13 +139,13 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
 }
 #[cfg(test)]
 mod tests {
+    use crate::CopyPolicy;
     use crate::graph::{GraphInputKind, ValueId};
     use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat};
-    use crate::CopyPolicy;
     use crate::tensor::{AmpOrder, ElementOrder, Layout, TensorTiling, TensorType};
 
     use super::*;
-    use crate::{MidOperation, MidGraph, MidValue, MidValueId, OperandIndexing};
+    use crate::{MidGraph, MidOperation, MidValue, MidValueId, OperandIndexing};
 
     fn fixture(order: ElementOrder, shape: &[u32]) -> MidGraph {
         let mut layout = Layout::row_major(TensorTiling::replicated(1));
@@ -202,8 +204,14 @@ mod tests {
     }
 
     fn expand(mid: &MidGraph, enabled: bool) -> std::sync::Arc<TileGraph> {
-        crate::low::expand::expand_tiles_cached(mid, false, enabled, std::sync::Arc::default())
-            .unwrap()
+        crate::low::expand::expand_tiles_cached(
+            Target::Ipu21,
+            mid,
+            false,
+            enabled,
+            std::sync::Arc::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -221,7 +229,7 @@ mod tests {
                 cast + usize::from(after_cast),
                 BlockOperation::Checkpoint(checkpoint, 0),
             );
-            donate(&mut graph).unwrap();
+            donate(Target::Ipu21, &mut graph).unwrap();
             assert_eq!(
                 graph
                     .shards
@@ -229,10 +237,10 @@ mod tests {
                     .any(|shard| matches!(shard.definition, ShardDefinition::ShiftedAlias { .. })),
                 !after_cast
             );
-            crate::place(&crate::low::lower_to_tiles(
-                &std::sync::Arc::new(graph),
-                false,
-            ))
+            crate::place(
+                Target::Ipu21,
+                &crate::low::lower_to_tiles(&std::sync::Arc::new(graph), false),
+            )
             .unwrap();
         }
     }
@@ -256,7 +264,7 @@ mod tests {
                     bindings: vec![],
                     body: BlockRegion { operations: body },
                 })));
-            donate(&mut graph).unwrap();
+            donate(Target::Ipu21, &mut graph).unwrap();
             assert_eq!(
                 graph
                     .shards
@@ -264,10 +272,10 @@ mod tests {
                     .any(|shard| matches!(shard.definition, ShardDefinition::ShiftedAlias { .. })),
                 producer_inside
             );
-            crate::place(&crate::low::lower_to_tiles(
-                &std::sync::Arc::new(graph),
-                false,
-            ))
+            crate::place(
+                Target::Ipu21,
+                &crate::low::lower_to_tiles(&std::sync::Arc::new(graph), false),
+            )
             .unwrap();
         }
     }
@@ -367,6 +375,7 @@ mod tests {
         };
         graph.shards.push(extra);
         let call = KernelRun::bind(
+            Target::Ipu21,
             graph.kernel_runs[0].provenance,
             MidOperationKind::Gelu,
             vec![input],
@@ -381,7 +390,7 @@ mod tests {
             .body
             .operations
             .push(BlockOperation::Compute { tile, run });
-        donate(&mut graph).unwrap();
+        donate(Target::Ipu21, &mut graph).unwrap();
         for output in graph.value_views(MidValueId::from_index(2)) {
             let shard = &graph.shards[output.shard.index() as usize];
             assert_eq!(
@@ -389,10 +398,10 @@ mod tests {
                 shard.tile != tile
             );
         }
-        crate::place::place(&crate::low::lower_to_tiles(
-            &std::sync::Arc::new(graph),
-            false,
-        ))
+        crate::place::place(
+            Target::Ipu21,
+            &crate::low::lower_to_tiles(&std::sync::Arc::new(graph), false),
+        )
         .unwrap();
     }
 
@@ -496,7 +505,7 @@ mod tests {
                 !carried
             );
             let low = crate::low::lower_to_tiles(&graph, false);
-            crate::place::place(&low).unwrap();
+            crate::place::place(Target::Ipu21, &low).unwrap();
             assert_eq!(low.repeat_runs[0].count, 3);
         }
     }
@@ -510,7 +519,7 @@ mod tests {
             let mid = fixture(order, &shape);
             let graph = expand(&mid, true);
             let low = crate::low::lower_to_tiles(&graph, false);
-            let placement = crate::place::place(&low).unwrap();
+            let placement = crate::place::place(Target::Ipu21, &low).unwrap();
             let parameter = low.value_views(low.inputs[0].value)[0].shard;
             let output = low.value_views(low.outputs[0])[0].shard;
             let crate::ShardDefinition::ShiftedAlias {
@@ -540,6 +549,7 @@ mod tests {
                     shards[output.index() as usize].definition = crate::ShardDefinition::Staging;
                 }
                 let run = crate::KernelRun::bind(
+                    Target::Ipu21,
                     sample.provenance,
                     sample.kernel.clone(),
                     sample.inputs.clone(),
@@ -568,7 +578,7 @@ mod tests {
                 .iter()
                 .filter(|r| matches!(r.kernel, MidOperationKind::Cast { .. }))
             {
-                run.call(None).unwrap();
+                run.call(Target::Ipu21, None).unwrap();
                 let src = &run.inputs[0];
                 let dst = &run.outputs[0];
                 let spans = |v: &crate::ShardView| {
@@ -613,7 +623,7 @@ mod tests {
         let graph = expand(&mid, true);
         let low = crate::low::lower_to_tiles(&graph, false);
         assert_eq!(low.value_views(low.outputs[0]).len(), 2);
-        let placement = crate::place::place(&low).unwrap();
+        let placement = crate::place::place(Target::Ipu21, &low).unwrap();
         let casts = low
             .kernel_runs
             .iter()

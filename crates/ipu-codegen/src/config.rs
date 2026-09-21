@@ -38,9 +38,9 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    pub fn new(tile_count: u16) -> Self {
+    pub fn new(target: Target, tile_count: u16) -> Self {
         Self {
-            target: Target::Ipu21,
+            target,
             tile_count,
             tile_mapping: None,
             memory_profile_directory: None,
@@ -49,8 +49,8 @@ impl PipelineConfig {
             exchange_stream_words: None,
             exchange_table_budget_bytes: 80 * 1024,
             exchange_transfer_limit_per_tile: 16_384,
-            standard_memory_reservation_bytes: Target::Ipu21.support_reservation_bytes(),
-            tile_memory_budget_bytes: Target::Ipu21.planned_data_bytes(),
+            standard_memory_reservation_bytes: target.support_reservation_bytes(),
+            tile_memory_budget_bytes: target.planned_data_bytes(),
             profiling: false,
             diagnostic_checkpoints: false,
         }

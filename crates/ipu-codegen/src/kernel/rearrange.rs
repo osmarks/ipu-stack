@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::mid::MidOperationKind;
+use ipu_target::Target;
 
 // These indices are the device workers' ABI, not another layout representation.
 fn order_index(order: ElementOrder, unpack: bool) -> Option<u32> {
@@ -175,7 +176,7 @@ pub(super) fn call(
             };
             elements
                 .saturating_mul(per_element)
-                .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles)
+                .saturating_add(ipu_target::ipu21::costs::COSTS.kernel_launch_cycles)
         },
         |(_, cycles)| cycles,
     );
@@ -187,6 +188,7 @@ pub(crate) fn supports_row_major_population(order: ElementOrder) -> bool {
 }
 
 pub(crate) fn estimate(
+    target: Target,
     from: ElementOrder,
     input: TensorStorage<'_>,
     output: TensorStorage<'_>,
@@ -200,7 +202,8 @@ pub(crate) fn estimate(
         from: source,
         to: output.format.layout.clone(),
     };
-    KernelCall::select(&kernel, &[input], &[output], None).map_or(u64::MAX, |call| call.cycles)
+    KernelCall::select(target, &kernel, &[input], &[output], None)
+        .map_or(u64::MAX, |call| call.cycles)
 }
 
 /// Assembly selection is shared by build construction and geometry costing.
@@ -216,7 +219,7 @@ fn assembly(
     let elements = matrices
         .saturating_mul(physical_rows.into())
         .saturating_mul(physical_columns.into());
-    let launch = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles;
+    let launch = ipu_target::ipu21::costs::COSTS.kernel_launch_cycles;
     match (unpack, order) {
         (true, ElementOrder::Amp(AmpOrder::TransposedLeft)) => Some((
             "unpack_transposed_amp_f16.S",
