@@ -14,17 +14,69 @@ use crate::{
 
 fn partitions(extent: u32, tiles: u16) -> Vec<u16> {
     let maximum = extent.min(u32::from(tiles)) as u16;
-    let mut result = vec![maximum];
-    let mut n = 1u16;
-    while n < maximum {
-        result.push(n);
-        let Some(next) = n.checked_mul(2) else {
-            break;
-        };
-        n = next;
+    let mut result = Vec::new();
+    let mut previous = 0;
+    for n in 1..=maximum {
+        let width = extent.div_ceil(u32::from(n));
+        if width != previous {
+            result.push(n);
+            previous = width;
+        }
     }
-    result.sort_unstable();
     result
+}
+
+/// Local compute/storage frontier, before constructing boundary conversions.
+/// These are candidate seeds, not dominance claims about connected programs:
+/// the outer search still costs actual preparation and reduction layouts.
+fn grids(
+    m: u32,
+    n: u32,
+    k: u32,
+    row_grain: u32,
+    precision: Precision,
+    batches: u32,
+    tiles: u16,
+) -> Vec<[u16; 3]> {
+    let grain = if precision == Precision::F16 { 16 } else { 32 };
+    let mut frontier = Vec::<([u64; 4], [u16; 3])>::new();
+    for rows in partitions(m.div_ceil(row_grain), tiles) {
+        for columns in partitions(n.div_ceil(16), tiles / rows) {
+            for inner in partitions(k.div_ceil(grain), tiles / rows / columns) {
+                let r = m.div_ceil(row_grain).div_ceil(u32::from(rows)) * row_grain;
+                let c = n.div_ceil(16).div_ceil(u32::from(columns)) * 16;
+                let k = k.div_ceil(grain).div_ceil(u32::from(inner)) * grain;
+                let cost = |load| {
+                    if batches == 1 {
+                        crate::kernel::gemm::cycles(precision, load, k, c, r, 0)
+                    } else {
+                        crate::kernel::gemm::cycles(precision, load, grain, 16, r, 0)
+                            * u64::from(batches)
+                            * u64::from(k / grain)
+                            * u64::from(c / 16)
+                    }
+                };
+                let output = u64::from(r) * u64::from(c) * u64::from(batches) * 2;
+                let operands = u64::from(k)
+                    * (u64::from(r) + u64::from(c))
+                    * u64::from(batches)
+                    * precision.bytes();
+                let score = [
+                    cost(GemmWeightLoad::Interleaved),
+                    cost(GemmWeightLoad::Standard),
+                    operands + 3 * output,
+                    output * u64::from(inner),
+                ];
+                let dominates = |a: &[u64; 4], b: &[u64; 4]| a.iter().zip(b).all(|(a, b)| a <= b);
+                if frontier.iter().any(|(old, _)| dominates(old, &score)) {
+                    continue;
+                }
+                frontier.retain(|(old, _)| !dominates(&score, old));
+                frontier.push((score, [rows, columns, inner]));
+            }
+        }
+    }
+    frontier.into_iter().map(|(_, grid)| grid).collect()
 }
 
 /// Packed, unreplicated initial storage. Choose a balanced two-axis partition;
@@ -134,9 +186,32 @@ pub(super) fn generate(
     let sources = [&tensors[&op.inputs[0]], &tensors[&op.inputs[1]]];
     let mut candidates = Vec::new();
     for choice in choices(sources, shape, options, config.tile_count)? {
+        if choice.result.format.layout.tiling.tile_count > 1
+            && layouts.get(&origin).is_some_and(Option::is_some)
+            && choice
+                .result
+                .format
+                .layout
+                .shard_extents(&choice.result.shape)
+                .ok()
+                .is_none_or(|shards| {
+                    shards.iter().any(|(_, extents)| {
+                        extents
+                            .iter()
+                            .map(|e| u64::from(e.logical_end - e.start))
+                            .product::<u64>()
+                            % 2
+                            != 0
+                    })
+                })
+        {
+            // This boundary requests a redistribution of the result. The
+            // current copy path cannot gather an odd FP16 half-word tail.
+            continue;
+        }
         let mut operands = super::candidates::LiveValues::new();
         for (i, &id) in op.inputs.iter().enumerate() {
-            let mut tensor = choice.operands[i].clone();
+            let mut tensor = choice.operands[i ^ usize::from(choice.swapped)].clone();
             tensor.format.precision = sources[i].format.precision;
             // A repeated high operand imports one representation; append
             // prepares the second role internally when its layout differs.
@@ -171,8 +246,11 @@ pub(super) fn generate(
 
 /// One enumerated distributed GEMM assignment; no high bindings or search state.
 pub(super) struct GemmChoice {
+    /// Kernel operand order; swapped multiplication reverses the high inputs.
     pub operands: [TensorType; 2],
-    grid: [u16; 3],
+    result: TensorType,
+    reduction: Option<Layout>,
+    swapped: bool,
     inner_block: u32,
     output_columns: u32,
 }
@@ -194,63 +272,234 @@ pub(super) fn choices(
         }
     };
     let rank = shape.0.len();
-    let m = shape.0[rank - 2];
-    let n = shape.0[rank - 1];
     let k =
         sources[0].shape.0[sources[0].shape.0.len() - if options.transpose_left { 2 } else { 1 }];
     let grain = if precision == Precision::F16 { 16 } else { 32 };
     let mut candidates = Vec::new();
-    for rows in partitions(m, tile_count) {
-        for columns in partitions(n.div_ceil(16), tile_count / rows) {
-            for inner in partitions(k.div_ceil(grain), tile_count / rows / columns) {
-                let tiles = rows * columns * inner;
+    let mut batches = vec![(1u16, Vec::new())];
+    for axis in 0..rank - 2 {
+        // Copies cannot exchange fractions of a word at a batch boundary.
+        // Keep whole groups of matrices where a matrix has a sub-word tail.
+        let mut batch_grain = 1;
+        for (s, bytes) in sources
+            .iter()
+            .map(|s| (&s.shape, s.format.precision.bytes()))
+        {
+            if let Some(a) = (axis + s.0.len()).checked_sub(rank)
+                && s.0[a] != 1
+            {
+                let plane = s.0[a + 1..].iter().map(|&n| u64::from(n)).product::<u64>() * bytes;
+                batch_grain = batch_grain.max(if plane.is_multiple_of(4) {
+                    1
+                } else if plane.is_multiple_of(2) {
+                    2
+                } else {
+                    4
+                });
+            }
+        }
+        let blocks = if shape.0[axis].is_multiple_of(batch_grain) {
+            shape.0[axis] / batch_grain
+        } else {
+            1
+        };
+        batches = batches
+            .into_iter()
+            .flat_map(|(used, axes)| {
+                partitions(blocks, tile_count / used)
+                    .into_iter()
+                    .map(move |parts| {
+                        let mut axes = axes.clone();
+                        axes.push(AxisTiling::new(
+                            TensorAxis::FromEnd((rank - axis) as u16),
+                            parts,
+                            if parts == 1 { 1 } else { batch_grain },
+                            Padding::Reject,
+                        ));
+                        (used * parts, axes)
+                    })
+            })
+            .collect();
+    }
+    for swapped in [false, true] {
+        let (sources, transpose) = if swapped {
+            (
+                [sources[1], sources[0]],
+                [!options.transpose_right, !options.transpose_left],
+            )
+        } else {
+            (sources, [options.transpose_left, options.transpose_right])
+        };
+        let m = shape.0[rank - if swapped { 1 } else { 2 }];
+        let n = shape.0[rank - if swapped { 2 } else { 1 }];
+        // Swapping puts logical output columns on the kernel's row axis.
+        // Word-aligned boundaries permit subsequent row-major redistribution.
+        let row_grain = if swapped { 2 } else { 1 };
+        for (groups, batch_axes) in &batches {
+            let batch_size = batch_axes
+                .iter()
+                .map(|axis| {
+                    let extent = shape.0[axis.axis.resolve(rank).unwrap()];
+                    extent
+                        .div_ceil(axis.block_size)
+                        .div_ceil(u32::from(axis.partitions))
+                        * axis.block_size
+                })
+                .product::<u32>();
+            for [rows, columns, inner] in grids(
+                m,
+                n,
+                k,
+                row_grain,
+                precision,
+                batch_size,
+                tile_count / groups,
+            ) {
+                let tiles = rows * columns * inner * groups;
                 let kw = k.div_ceil(grain).div_ceil(u32::from(inner)) * grain;
                 let nw = n.div_ceil(16).div_ceil(u32::from(columns)) * 16;
                 if kw > u32::from(u16::MAX) {
                     continue;
                 }
-                let mut operands = [
-                    TensorType {
-                        shape: sources[0].shape.clone(),
-                        format: TensorFormat {
+                let mut orders = Vec::new();
+                for order in [
+                    [1, 2, 0],
+                    [1, 0, 2],
+                    [0, 2, 1],
+                    [0, 1, 2],
+                    [2, 0, 1],
+                    [2, 1, 0],
+                ] {
+                    let mut strides = [0; 3];
+                    let mut stride = 1;
+                    for axis in order {
+                        strides[axis] = if [rows, columns, inner][axis] == 1 {
+                            1
+                        } else {
+                            stride
+                        };
+                        stride *= [rows, columns, inner][axis];
+                    }
+                    if !orders.contains(&strides) {
+                        orders.push(strides);
+                    }
+                }
+                for strides in orders {
+                    let mut operands = std::array::from_fn(|i| {
+                        TensorType::new(
+                            sources[i].shape.0.clone(),
                             precision,
-                            layout: operand_layout(
-                                true,
-                                options.transpose_left,
-                                tiles,
-                                rows,
+                            operand_layout(
+                                i == 0,
+                                transpose[i],
+                                rows * columns * inner,
+                                [rows, columns][i],
                                 inner,
-                                columns,
+                                [columns, rows][i],
                                 kw,
                                 nw,
                             ),
-                        },
-                    },
-                    TensorType {
-                        shape: sources[1].shape.clone(),
-                        format: TensorFormat {
-                            precision,
-                            layout: operand_layout(
-                                false,
-                                options.transpose_right,
-                                tiles,
-                                columns,
-                                inner,
-                                rows,
-                                kw,
-                                nw,
-                            ),
-                        },
-                    },
-                ];
-                for class in [MemoryClass::Ipu21Interleaved, MemoryClass::Ipu21Standard] {
-                    operands[1].format.layout.memory_class = class;
-                    candidates.push(GemmChoice {
-                        operands: operands.clone(),
-                        grid: [rows, columns, inner],
-                        inner_block: kw,
-                        output_columns: nw,
+                        )
                     });
+                    let mut result = TensorType::new(
+                        shape.0.clone(),
+                        Precision::F16,
+                        operand_layout(true, swapped, tiles, rows, columns, 1, nw, nw),
+                    );
+                    if kw > grain {
+                        result.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+                    }
+                    for (operand, tensor) in operands
+                        .iter_mut()
+                        .chain(std::iter::once(&mut result))
+                        .enumerate()
+                    {
+                        let tiling = &mut tensor.format.layout.tiling;
+                        if operand != 1 {
+                            tiling.axes[0].block_size = row_grain;
+                            tiling.axes[0].padding_multiple = row_grain;
+                        }
+                        tiling.axes[0].tile_stride = Some(strides[usize::from(operand == 1)]);
+                        tiling.axes[1].tile_stride =
+                            Some(strides[if operand == 2 { 1 } else { 2 }]);
+                        let mut stride = rows * columns * inner;
+                        for axis in batch_axes {
+                            let axis = axis.clone().with_tile_stride(stride);
+                            stride *= axis.partitions;
+                            if axis
+                                .axis
+                                .resolve(tensor.shape.0.len())
+                                .ok()
+                                .is_some_and(|a| tensor.shape.0[a] != 1)
+                            {
+                                tiling.axes.push(axis);
+                            } else {
+                                tiling.replicas *= axis.partitions;
+                            }
+                        }
+                        tiling.tile_count = tiles;
+                    }
+                    let mut reductions = vec![None];
+                    if inner > 1 {
+                        reductions.clear();
+                        // Keep a compact gather, and scatter the final reduction
+                        // over either output axis when there is enough work.
+                        for (rp, cp) in [
+                            (rows, columns),
+                            (rows * inner, columns),
+                            (rows, columns * inner),
+                        ] {
+                            if u32::from(rp) > m || u32::from(cp) > n {
+                                continue;
+                            }
+                            let mut layout = result.format.layout.clone();
+                            layout.order = ElementOrder::RowMajor;
+                            layout.memory_class = MemoryClass::Ipu21Standard;
+                            layout.tiling.tile_count = rp * cp * groups;
+                            layout.tiling.axes[0].partitions = rp;
+                            layout.tiling.axes[1].partitions = cp;
+                            // Reduction storage is row-major; it does not inherit
+                            // the GEMM's padded column-panel width.
+                            layout.tiling.axes[1].block_size = 1;
+                            layout.tiling.axes[1].padding_multiple = 1;
+                            for axis in &mut layout.tiling.axes[..2] {
+                                if axis.axis == TensorAxis::FromEnd(1) {
+                                    axis.block_size = 8;
+                                    axis.padding_multiple = 8;
+                                    axis.shard_padding_multiple = 8;
+                                }
+                            }
+                            let row_fast = strides[0] < strides[1];
+                            layout.tiling.axes[0].tile_stride = Some(if row_fast { 1 } else { cp });
+                            layout.tiling.axes[1].tile_stride = Some(if row_fast { rp } else { 1 });
+                            let mut stride = rp * cp;
+                            for axis in &mut layout.tiling.axes[2..] {
+                                axis.tile_stride = Some(stride);
+                                stride *= axis.partitions;
+                            }
+                            if layout.resolve(shape).is_ok_and(|r| !r.has_empty_shards()) {
+                                reductions.push(Some(layout));
+                            }
+                        }
+                        result.shape.0.insert(0, u32::from(inner));
+                        result.format.layout.tiling.axes.push(
+                            AxisTiling::new(TensorAxis::FromStart(0), inner, 1, Padding::Reject)
+                                .with_tile_stride(strides[2]),
+                        );
+                    }
+                    for class in [MemoryClass::Ipu21Interleaved, MemoryClass::Ipu21Standard] {
+                        operands[1].format.layout.memory_class = class;
+                        for reduction in &reductions {
+                            candidates.push(GemmChoice {
+                                operands: operands.clone(),
+                                result: result.clone(),
+                                reduction: reduction.clone(),
+                                swapped,
+                                inner_block: kw,
+                                output_columns: nw,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -272,11 +521,18 @@ pub(super) fn append(
 ) -> crate::MidValueId {
     let GemmChoice {
         operands,
-        grid: [rows, columns, inner],
+        result: result_type,
+        reduction,
+        swapped,
         inner_block: kw,
         output_columns: nw,
     } = choice;
-    let (rows, columns, inner, kw, nw) = (*rows, *columns, *inner, *kw, *nw);
+    let (kw, nw) = (*kw, *nw);
+    let inputs = if *swapped {
+        [inputs[1], inputs[0]]
+    } else {
+        inputs
+    };
     let inputs = inputs
         .iter()
         .zip(operands)
@@ -314,41 +570,20 @@ pub(super) fn append(
         })
         .collect::<Vec<_>>();
     let rank = shape.0.len();
-    let mut result_type = TensorType {
-        shape: shape.clone(),
-        format: TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::amp_left_result_grid(
-                nw,
-                rows * columns,
-                rows,
-                columns,
-                crate::GridOrder::ColumnsFast,
-            ),
-        },
+    let mut result_type = result_type.clone();
+    let transpose = if *swapped {
+        [!options.transpose_right, !options.transpose_left]
+    } else {
+        [options.transpose_left, options.transpose_right]
     };
-    let mut partial_type = result_type.clone();
-    if inner > 1 {
-        partial_type.shape.0.insert(0, u32::from(inner));
-        partial_type.format.layout.tiling.tile_count *= inner;
-        for axis in &mut partial_type.format.layout.tiling.axes {
-            if axis.axis == TensorAxis::FromEnd(2) {
-                axis.tile_stride = Some(columns * inner);
-            }
-        }
-        partial_type.format.layout.tiling.axes.push(
-            AxisTiling::new(TensorAxis::FromStart(0), inner, 1, Padding::Reject)
-                .with_tile_stride(columns),
-        );
-    }
     let axes = GemmAxes {
-        left_inner: TensorAxis::FromEnd(if options.transpose_left { 2 } else { 1 }),
-        right_inner: TensorAxis::FromEnd(if options.transpose_right { 1 } else { 2 }),
-        output_column: TensorAxis::FromEnd(1),
+        left_inner: TensorAxis::FromEnd(if transpose[0] { 2 } else { 1 }),
+        right_inner: TensorAxis::FromEnd(if transpose[1] { 1 } else { 2 }),
+        output_column: TensorAxis::FromEnd(if *swapped { 2 } else { 1 }),
         valid_inner: None,
         valid_columns: None,
     };
-    let mut result = value(graph, origin, partial_type, OwnerMap::default());
+    let mut result = value(graph, origin, result_type.clone(), OwnerMap::default());
     graph.operations.push(MidOperation {
         source: Some(source),
         inputs,
@@ -374,11 +609,23 @@ pub(super) fn append(
         output_windows: Vec::new(),
         output_aliases: Vec::new(),
     });
-    if inner > 1 {
+    if let Some(layout) = reduction {
+        // Unpack on the producer tiles before distributing reduction slices.
+        // This preserves padded words across exchange instead of attempting
+        // to send clipped half-word tails of packed panels.
+        let mut prepared = result_type.clone();
+        prepared.format.layout.order = ElementOrder::RowMajor;
+        prepared.format.layout.memory_class = MemoryClass::Ipu21Standard;
+        for axis in &mut prepared.format.layout.tiling.axes {
+            if axis.axis == TensorAxis::FromEnd(1) {
+                axis.shard_padding_multiple = 8;
+            }
+        }
+        result = copy(graph, source, result, prepared, Vec::new());
+        let inner = result_type.shape.0.remove(0) as u16;
         // Row-major contributor stacks make the reduction's contiguous access
         // contract explicit. Packing/reduction fusion is a separate optimization.
-        result_type.format.layout.order = ElementOrder::RowMajor;
-        result_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
+        result_type.format.layout = layout.clone();
         let mut receive = result_type.clone();
         receive.shape.0.insert(0, 1);
         let seed = copy(graph, source, result, receive.clone(), Vec::new());

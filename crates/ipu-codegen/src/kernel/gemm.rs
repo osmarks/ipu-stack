@@ -102,7 +102,7 @@ pub(crate) fn invocations(
     Ok(calls)
 }
 
-fn cycles(
+pub(crate) fn cycles(
     multiply: Precision,
     weights: GemmWeightLoad,
     inner_block: u32,
@@ -261,6 +261,14 @@ pub(super) fn call(
     else {
         return Err(KernelError::RequirementMismatch);
     };
+    // Accumulation reads C through ld128 and the second load port of
+    // ld2xst64pace. Both require region 1; initialization alone only stores C.
+    let grain = if multiply == Precision::F16 { 16 } else { 32 };
+    if (mode == GemmKernelMode::Accumulate || inner_block > grain)
+        && output.format.layout.memory_class != crate::MemoryClass::Ipu21Interleaved
+    {
+        return Err(KernelError::RequirementMismatch);
+    }
     if multiply == Precision::F32
         || (matches!(multiply, Precision::F8F143 { .. })
             && (accumulate != AccumulationPrecision::F16

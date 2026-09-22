@@ -361,6 +361,11 @@ mod tests {
         }
         program.kernel_runs[1].inputs[1].extents = program.shards[1].extents.clone();
         program.kernel_runs[1].outputs[0].extents = program.shards[2].extents.clone();
+        program.shards[2].tensor_type.format.layout.memory_class =
+            crate::MemoryClass::Ipu21Interleaved;
+        Arc::make_mut(&mut program.kernel_runs[1].metadata)
+            .requirements
+            .outputs[0] = program.shards[2].tensor_type.format.clone();
         program
     }
 

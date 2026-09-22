@@ -5,6 +5,75 @@ use crate::planner::tests::gelu;
 use ipu_target::Target;
 
 #[test]
+fn large_gemm_catalogues_offer_head_splits_orders_and_reduce_scatter() {
+    for (groups, m, k, n, precision) in [
+        (1, 729, 1152, 4304, Precision::F8F143 { scale_exponent: -2 }),
+        (16, 729, 72, 729, Precision::F16),
+    ] {
+        let input = |shape| TensorType::new(shape, precision, Layout::row_sharded(1));
+        let a = input(vec![groups, m, k]);
+        let b = input(vec![groups, k, n]);
+        let start = std::time::Instant::now();
+        let choices = choices(
+            [&a, &b],
+            &TensorShape(vec![groups, m, n]),
+            GemmOptions::default(),
+            1472,
+        )
+        .unwrap();
+        eprintln!(
+            "G={groups} M={m} K={k} N={n}: {} choices in {:?}",
+            choices.len(),
+            start.elapsed()
+        );
+        assert!(choices.iter().any(|c| c.swapped));
+        assert!(choices.iter().any(|c| !c.swapped));
+        assert!(choices.iter().any(|c| c.operands.iter().any(|t| {
+            t.format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .any(|a| !a.partitions.is_power_of_two())
+        })));
+        assert!(
+            choices
+                .iter()
+                .any(|c| c.result.format.layout.tiling.axes[0].tile_stride
+                    < c.result.format.layout.tiling.axes[1].tile_stride)
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|c| c.result.format.layout.tiling.axes[0].tile_stride
+                    > c.result.format.layout.tiling.axes[1].tile_stride)
+        );
+        assert!(choices.iter().any(|c| {
+            c.reduction
+                .as_ref()
+                .is_some_and(|r| r.tiling.tile_count == c.result.format.layout.tiling.tile_count)
+        }));
+        if groups > 1 {
+            assert!(choices.iter().any(|c| {
+                c.result
+                    .format
+                    .layout
+                    .tiling
+                    .axes
+                    .iter()
+                    .any(|a| a.axis == TensorAxis::FromEnd(3) && u32::from(a.partitions) == groups)
+            }));
+        }
+        // Check every actual owner map, including broadcast input replicas.
+        for c in &choices {
+            for t in c.operands.iter().chain(std::iter::once(&c.result)) {
+                t.format.layout.resolve(&t.shape).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn gemm_construction_accepts_private_mid_results_without_high_nodes() {
     let mut rng = fastrand::Rng::with_seed(0x1a7e_24ed);
     for _ in 0..24 {
@@ -209,8 +278,10 @@ fn evaluate(candidate: &Candidate, data: &[Vec<f64>; 2], origins: &[ValueId]) ->
                                 };
                             }
                         }
-                        lc[lr] = c[c.len() - 2];
-                        rc0[rc] = c[c.len() - 1];
+                        let oc = axes.output_column.resolve(c.len()).unwrap();
+                        let or = 2 * c.len() - 3 - oc;
+                        lc[lr] = c[or];
+                        rc0[rc] = c[oc];
                         let mut sum = 0.0;
                         for k in le[li].start.max(re[ri].start)
                             ..le[li].logical_end.min(re[ri].logical_end)
@@ -506,7 +577,8 @@ fn randomized_distributed_gemms_match_dense_products_and_lower() {
                         {
                             panic!(
                                 "case={case}: first failure at {end}: {err:?} {:?}\n{:#?}",
-                                prefix.operations[end - 1], prefix.values
+                                prefix.operations[end - 1],
+                                prefix.values
                             );
                         }
                     }
