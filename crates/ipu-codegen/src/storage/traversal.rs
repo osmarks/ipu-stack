@@ -176,6 +176,55 @@ fn digits(shard: TensorStorage<'_>) -> StorageResult<Vec<Digit>> {
     Ok(dimensions)
 }
 
+/// Factor aligned rectangular partitions into physical storage axes. Costing
+/// uses the same ordering as byte traversal, without expanding tiles or spans.
+/// A cut through an inner packing digit needs finer geometry and returns None.
+pub(crate) fn physical_partition_axes(
+    format: &TensorFormat,
+    partitions: &[Vec<(u32, u32)>],
+) -> Option<Vec<Vec<(u32, u32)>>> {
+    let extents = partitions
+        .iter()
+        .enumerate()
+        .map(|(axis, bounds)| {
+            let end = bounds.iter().map(|&(_, end)| end).max()?;
+            Some(ShardExtent {
+                axis: axis as u16,
+                start: 0,
+                logical_end: end,
+                physical_end: end,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let dimensions = digits(TensorStorage {
+        format,
+        extents: &extents,
+    })
+    .ok()?;
+    dimensions
+        .iter()
+        .enumerate()
+        .map(|(index, digit)| {
+            let outer = dimensions[..index].iter().any(|d| d.axis == digit.axis);
+            if outer {
+                let period = digit.divisor.checked_mul(digit.count)?;
+                partitions[digit.axis]
+                    .iter()
+                    .all(|&(start, end)| start.is_multiple_of(period) && end.is_multiple_of(period))
+                    .then_some(vec![(0, digit.count)])
+            } else {
+                partitions[digit.axis]
+                    .iter()
+                    .map(|&(start, end)| {
+                        (start.is_multiple_of(digit.divisor) && end.is_multiple_of(digit.divisor))
+                            .then_some((start / digit.divisor, end / digit.divisor))
+                    })
+                    .collect()
+            }
+        })
+        .collect()
+}
+
 /// Partition into rectangles where `axis` is the outermost physical dimension:
 /// successive coordinates select consecutive, equally sized blocks. Dimensions
 /// physically outside that axis are visited separately. The axis is not split.

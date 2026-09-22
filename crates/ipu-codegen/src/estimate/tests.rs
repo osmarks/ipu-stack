@@ -66,7 +66,14 @@ fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
             offsets: offsets.clone(),
             view: None,
         };
-        let traffic = conversion_traffic(&graph.values[0], &graph.values[1], &mapping, 16).unwrap();
+        let traffic = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &mapping,
+            16,
+        )
+        .unwrap();
         let mut sources = vec![BTreeSet::new(); (rows * columns) as usize];
         for (tile, extents) in layout_extents(
             &graph.values[0].tensor_type.shape,
@@ -157,8 +164,14 @@ fn local_copy_cost_accumulates_all_shards_on_each_tile() {
         let mut output = input.clone();
         output.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
         let graph = copy_graph(input, output, 1);
-        let traffic =
-            conversion_traffic(&graph.values[0], &graph.values[1], &Default::default(), 1).unwrap();
+        let traffic = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            1,
+        )
+        .unwrap();
         assert_eq!(traffic.maximum_local_bytes, u64::from(rows * columns * 2));
         assert!(traffic.maximum_local_intersections >= u64::from(rows));
         let (cost, _, rows) =
@@ -185,8 +198,14 @@ fn remote_copy_charges_local_zero_extension_and_staging() {
         let output = TensorType::new([1, width + padding], Precision::F16, Layout::row_sharded(1));
         let mut graph = copy_graph(input, output, 2);
         graph.values[1].owners = crate::tensor::OwnerMap::rotated(1);
-        let traffic =
-            conversion_traffic(&graph.values[0], &graph.values[1], &Default::default(), 2).unwrap();
+        let traffic = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            2,
+        )
+        .unwrap();
         assert_eq!(traffic.maximum_local_bytes, u64::from(padding * 2));
         assert_eq!(
             traffic.exchange.maximum_payload_bytes(),
@@ -329,6 +348,7 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
                 tiles,
             );
             conversion_traffic(
+                Target::Ipu21,
                 &graph.values[0],
                 &graph.values[1],
                 &Default::default(),
@@ -336,8 +356,12 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
             )
             .unwrap()
         };
-        let fragmented = traffic(&fragmented_source);
-        let aligned = traffic(&aligned_source);
+        let mut fragmented = traffic(&fragmented_source);
+        let mut aligned = traffic(&aligned_source);
+        // This scalar oracle checks logical traffic, independently of the
+        // paired-lane estimate exercised by the pairing tests.
+        fragmented.paired_payload_bytes = 0;
+        aligned.paired_payload_bytes = 0;
 
         assert_eq!(
             fragmented,
@@ -374,6 +398,189 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
             "case {case}: {fragmented:?} {aligned:?}"
         );
     }
+}
+
+#[test]
+fn paired_broadcast_cost_tracks_physical_owners_and_sender_lane_contention() {
+    use crate::{AmpOrder, AxisTiling, OwnerMap, Padding, TensorTiling};
+    let mut random = fastrand::Rng::with_seed(0x70616972696e67);
+    for _ in 0..40 {
+        let shape = vec![32, 32 * random.u32(1..=8)];
+        let order = if random.bool() {
+            ElementOrder::Amp(AmpOrder::TransposedLeft)
+        } else {
+            ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                row_block: 32,
+                column_block: 16,
+            })
+        };
+        let input = TensorType::new(
+            shape,
+            Precision::F16,
+            Layout {
+                order,
+                memory_class: MemoryClass::Ipu21Standard,
+                tiling: TensorTiling {
+                    tile_count: 1,
+                    replicas: 1,
+                    axes: vec![],
+                },
+            },
+        );
+        let mut output = input.clone();
+        output.format.layout.tiling.tile_count = 2;
+        output.format.layout.tiling.replicas = 2;
+        let mut graph = copy_graph(input, output, 8);
+        graph.values[1].owners = OwnerMap::embedded(vec![2, 3]);
+        let paired = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            8,
+        )
+        .unwrap();
+        let paired_cost =
+            operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 8).unwrap();
+        assert_eq!(
+            paired.paired_payload_bytes * 2,
+            paired.exchange.maximum_payload_bytes()
+        );
+
+        // Same replicas and bytes, but no complete physical receiver pair.
+        graph.values[1].owners = OwnerMap::embedded(vec![2, 4]);
+        let ordinary = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            8,
+        )
+        .unwrap();
+        let ordinary_cost =
+            operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 8).unwrap();
+        assert_eq!(
+            ordinary.paired_payload_bytes,
+            ordinary.exchange.maximum_payload_bytes()
+        );
+        assert!(paired_cost.0.exchange < ordinary_cost.0.exchange);
+        assert_eq!(
+            paired_cost.2, ordinary_cost.2,
+            "pairing does not discount row storage"
+        );
+
+        // A local recipient is removed from the exchange, leaving an unpaired
+        // remote recipient even though the full destination group is paired.
+        graph.values[1].owners = OwnerMap::embedded(vec![0, 1]);
+        let local = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            local.paired_payload_bytes,
+            local.exchange.maximum_payload_bytes()
+        );
+
+        // Both members of a sender pair send independent panels. Pairing both
+        // cannot double aggregate bandwidth: it borrows the same two TX lanes.
+        for value in &mut graph.values {
+            value.tensor_type.shape.0.insert(0, 2);
+            value.tensor_type.format.layout.tiling.tile_count *= 2;
+            value
+                .tensor_type
+                .format
+                .layout
+                .tiling
+                .axes
+                .push(AxisTiling::new(
+                    TensorAxis::FromStart(0),
+                    2,
+                    1,
+                    Padding::Reject,
+                ));
+        }
+        graph.values[1].owners = OwnerMap::embedded(vec![4, 5, 6, 7]);
+        let busy = conversion_traffic(
+            Target::Ipu21,
+            &graph.values[0],
+            &graph.values[1],
+            &Default::default(),
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            busy.paired_payload_bytes,
+            busy.exchange.maximum_payload_bytes()
+        );
+    }
+}
+
+#[test]
+fn unaligned_broadcast_does_not_receive_paired_bandwidth() {
+    let input = TensorType::new(
+        [1, 3],
+        Precision::F16,
+        Layout::row_major(crate::TensorTiling {
+            tile_count: 1,
+            replicas: 1,
+            axes: vec![],
+        }),
+    );
+    let mut output = input.clone();
+    output.format.layout.tiling.tile_count = 2;
+    output.format.layout.tiling.replicas = 2;
+    let mut graph = copy_graph(input, output, 4);
+    graph.values[1].owners = crate::OwnerMap::embedded(vec![2, 3]);
+    let traffic = conversion_traffic(
+        Target::Ipu21,
+        &graph.values[0],
+        &graph.values[1],
+        &Default::default(),
+        4,
+    )
+    .unwrap();
+    assert_eq!(
+        traffic.paired_payload_bytes,
+        traffic.exchange.maximum_payload_bytes()
+    );
+
+    // A multiple-of-eight total is insufficient: each row's source address
+    // must also be aligned. These 8-byte runs have a 20-byte source stride.
+    graph.tile_count = 8;
+    for value in &mut graph.values {
+        value.tensor_type.shape = TensorShape(vec![6, 10]);
+    }
+    let output = &mut graph.values[1];
+    output.tensor_type.format.layout.tiling.tile_count = 6;
+    output
+        .tensor_type
+        .format
+        .layout
+        .tiling
+        .axes
+        .push(crate::AxisTiling::new(
+            TensorAxis::FromEnd(1),
+            3,
+            1,
+            crate::Padding::Reject,
+        ));
+    output.owners = crate::OwnerMap::embedded(vec![2, 3, 4, 5, 6, 7]);
+    let traffic = conversion_traffic(
+        Target::Ipu21,
+        &graph.values[0],
+        &graph.values[1],
+        &Default::default(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(
+        traffic.paired_payload_bytes,
+        traffic.exchange.maximum_payload_bytes()
+    );
 }
 
 #[test]

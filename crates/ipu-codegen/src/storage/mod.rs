@@ -10,6 +10,7 @@ pub(crate) use geometry::{
 mod traversal;
 pub(crate) use traversal::{
     ByteTraversal, StridedSpan, byte_traversal, contiguous_axis_blocks, panel_byte_traversal,
+    physical_partition_axes,
 };
 
 use crate::{

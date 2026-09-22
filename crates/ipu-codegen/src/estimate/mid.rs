@@ -469,6 +469,7 @@ pub(crate) fn operation_cost(
                 *policy
             };
             let traffic = conversion_traffic(
+                target,
                 &values[operation.inputs[0].index() as usize],
                 &values[operation.results[0].index() as usize],
                 mapping,
@@ -479,20 +480,20 @@ pub(crate) fn operation_cost(
                     if policy == crate::CopyPolicy::LocalKernel {
                         return None;
                     }
-                    price.exchange =
-                        super::cycles::exchange_endpoint_cycles(target, &traffic.exchange, 1);
+                    price.exchange = super::cycles::exchange_work_cycles(
+                        target,
+                        traffic.paired_payload_bytes,
+                        traffic.exchange.maximum_control_cycles(target),
+                    )
+                    .saturating_add(target.costs().exchange_phase_cycles);
                     let fragments = if mapping.is_identity() {
                         super::movement::grid_fragments(input, output).unwrap_or(0)
                     } else {
                         0
                     }
                     .max(traffic.exchange.maximum_fragments());
-                    let (fragment_cycles, footprint) = exchange_fragment_price(
-                        target,
-                        traffic.exchange.maximum_payload_bytes(),
-                        1,
-                        fragments,
-                    );
+                    let (fragment_cycles, footprint) =
+                        exchange_fragment_price(target, traffic.paired_payload_bytes, 1, fragments);
                     price.exchange = price.exchange.max(fragment_cycles);
                     rows = footprint;
                 }

@@ -10,6 +10,9 @@ pub(crate) struct ConversionTraffic {
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
     pub exchange: ExchangeEndpointTraffic,
+    /// Effective maximum lane work after eligible double-width multicasts.
+    /// Logical traffic above remains unchanged; controls and row sizes are not discounted.
+    pub paired_payload_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,6 +125,7 @@ fn add_endpoint_load(
 }
 
 pub(crate) fn conversion_traffic(
+    target: Target,
     input: &MidValue,
     output: &MidValue,
     mapping: &crate::CoordinateMapping,
@@ -154,7 +158,25 @@ pub(crate) fn conversion_traffic(
     let source_groups = groups(input, &[])?;
     let destination_groups = groups(output, &mapping.offsets)?;
     let element_bytes = input.tensor_type.format.precision.bytes();
-    let mut remote = HashMap::<(u16, Vec<(u32, u32)>), u64>::new();
+    let can_pair = mapping.is_identity()
+        && input.tensor_type.format.precision == output.tensor_type.format.precision
+        && input.tensor_type.format.layout.order == output.tensor_type.format.layout.order
+        && [&input.tensor_type, &output.tensor_type].iter().all(|t| {
+            t.format
+                .layout
+                .resolve(&t.shape)
+                .ok()
+                .is_some_and(|layout| {
+                    layout.axes().is_some_and(|axes| {
+                        axes.iter().all(|axis| {
+                            axis.partitions()
+                                .iter()
+                                .all(|e| e.logical_end == e.physical_end)
+                        })
+                    })
+                })
+        });
+    let mut remote = HashMap::<(u16, Vec<(u32, u32)>), (u64, Vec<u16>, bool)>::new();
     let mut local = HashMap::<u16, [u64; 4]>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
@@ -166,7 +188,17 @@ pub(crate) fn conversion_traffic(
             };
             let bytes = range_elements(&extents).saturating_mul(element_bytes);
             destination_bytes = destination_bytes.saturating_add(bytes);
-            intersections.push((extents, source_tiles, bytes));
+            let aligned = can_pair
+                && bytes.is_multiple_of(8)
+                && destination_tiles.len() >= 2
+                && paired_copy_aligned(
+                    &input.tensor_type,
+                    &output.tensor_type,
+                    source,
+                    destination,
+                    &extents,
+                );
+            intersections.push((extents, source_tiles, bytes, aligned));
         }
         // Coordinates outside the source are zero-filled by copy lowering.
         // They require local work even when every real value arrives remotely.
@@ -177,14 +209,18 @@ pub(crate) fn conversion_traffic(
             let mut remote_fragments = 0u64;
             let mut local_bytes = zero_bytes;
             let mut local_intersections = u64::from(zero_bytes != 0);
-            for &(ref extents, source_tiles, bytes) in &intersections {
+            for &(ref extents, source_tiles, bytes, aligned) in &intersections {
                 if source_tiles.binary_search(&destination_tile).is_ok() {
                     local_bytes = local_bytes.saturating_add(bytes);
                     local_intersections = local_intersections.saturating_add(1);
                 } else {
                     remote_bytes = remote_bytes.saturating_add(bytes);
                     remote_fragments = remote_fragments.saturating_add(1);
-                    remote.insert((source_tiles[0], extents.clone()), bytes);
+                    let entry = remote
+                        .entry((source_tiles[0], extents.clone()))
+                        .or_insert_with(|| (bytes, Vec::new(), true));
+                    entry.1.push(destination_tile);
+                    entry.2 &= aligned;
                 }
             }
             traffic
@@ -200,9 +236,42 @@ pub(crate) fn conversion_traffic(
             }
         }
     }
-    for ((source, _), bytes) in remote {
-        traffic.exchange.add_outgoing(source, bytes, 1);
+    for ((source, _), (bytes, _, _)) in &remote {
+        traffic.exchange.add_outgoing(*source, *bytes, 1);
     }
+    let Target::Ipu21 = target;
+    let topology = ipu_target::ipu21::fabric::Topology::c600();
+    let mut paired = traffic.exchange.clone();
+    for ((source, _), (bytes, mut receivers, aligned)) in remote {
+        if !aligned {
+            continue;
+        }
+        let Ok(partner) = topology.paired_logical(source) else {
+            continue;
+        };
+        if partner >= tile_count {
+            continue;
+        }
+        receivers.sort_unstable();
+        receivers.dedup();
+        if !receivers.iter().all(|&tile| {
+            topology
+                .paired_logical(tile)
+                .is_ok_and(|other| receivers.binary_search(&other).is_ok())
+        }) {
+            continue;
+        }
+        paired.outgoing_lanes[usize::from(source)].bytes -= bytes / 2;
+        paired.add_outgoing(partner, bytes / 2, 0);
+        for tile in receivers {
+            paired.incoming_tiles[usize::from(tile)].bytes -= bytes / 2;
+        }
+    }
+    // Borrowing a busy sender's partner can make pairing worse. The ordinary
+    // schedule is still available, so retain its estimate in that case.
+    traffic.paired_payload_bytes = paired
+        .maximum_payload_bytes()
+        .min(traffic.exchange.maximum_payload_bytes());
     for [destination, bytes, intersections, calls] in local.into_values() {
         traffic.maximum_destination_bytes = traffic.maximum_destination_bytes.max(destination);
         traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(bytes);
@@ -210,6 +279,58 @@ pub(crate) fn conversion_traffic(
         traffic.maximum_local_intersections = traffic.maximum_local_intersections.max(calls);
     }
     Some(traffic)
+}
+
+fn paired_copy_aligned(
+    input: &TensorType,
+    output: &TensorType,
+    source: &[(u32, u32)],
+    destination: &[(u32, u32)],
+    region: &[(u32, u32)],
+) -> bool {
+    use crate::storage::{TensorStorage, byte_traversal};
+    let extents = |bounds: &[(u32, u32)]| {
+        bounds
+            .iter()
+            .enumerate()
+            .map(|(axis, &(start, end))| crate::ShardExtent {
+                axis: axis as u16,
+                start,
+                logical_end: end,
+                physical_end: end,
+            })
+            .collect::<Vec<_>>()
+    };
+    let view = extents(region);
+    let left = extents(source);
+    let right = extents(destination);
+    let traversals = byte_traversal(
+        TensorStorage {
+            format: &input.format,
+            extents: &left,
+        },
+        &view,
+        true,
+    )
+    .and_then(|a| {
+        byte_traversal(
+            TensorStorage {
+                format: &output.format,
+                extents: &right,
+            },
+            &view,
+            true,
+        )
+        .map(|b| (a, b))
+    });
+    traversals
+        .ok()
+        .and_then(|(a, b)| a.regular_copy(&b))
+        .is_some_and(|(a, b)| {
+            [a, b]
+                .iter()
+                .all(|s| s.bytes != 0 && (s.offset | s.bytes | s.stride).is_multiple_of(8))
+        })
 }
 
 pub(super) fn layout_extents(

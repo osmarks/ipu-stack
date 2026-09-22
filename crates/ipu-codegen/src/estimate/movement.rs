@@ -2,7 +2,7 @@
 //! axis partitions, never their Cartesian product of tiles or byte spans.
 
 use super::*;
-use crate::{AmpOrder, ShardExtent};
+use crate::ShardExtent;
 #[cfg(test)]
 use ipu_target::Target;
 
@@ -41,34 +41,8 @@ pub(super) fn grid_fragments(input: &TensorType, output: &TensorType) -> Option<
     if source == destination {
         return Some(endpoint_fragments(&source, &destination, bytes));
     }
-    for axes in [&mut source, &mut destination] {
-        match input.format.layout.order {
-            ElementOrder::RowMajor => {}
-            ElementOrder::Amp(AmpOrder::Left) => {
-                let grain = input
-                    .format
-                    .layout
-                    .order
-                    .retained_linear_column_grain(input.format.precision)?;
-                let columns = axes.pop()?;
-                if columns
-                    .iter()
-                    .any(|&(start, end)| !start.is_multiple_of(grain) || !end.is_multiple_of(grain))
-                {
-                    return None;
-                }
-                axes.insert(
-                    0,
-                    columns
-                        .into_iter()
-                        .map(|(start, end)| (start / grain, end / grain))
-                        .collect(),
-                );
-                axes.push(vec![(0, grain)]);
-            }
-            _ => return None,
-        }
-    }
+    source = crate::storage::physical_partition_axes(&input.format, &source)?;
+    destination = crate::storage::physical_partition_axes(&output.format, &destination)?;
     Some(
         endpoint_fragments(&source, &destination, bytes).max(endpoint_fragments(
             &destination,
@@ -127,7 +101,7 @@ fn endpoint_fragments(own: &[Bounds], peer: &[Bounds], element_bytes: u64) -> u6
 mod tests {
     use super::*;
     use crate::storage::{TensorStorage, physical_byte_spans};
-    use crate::{AxisTiling, Padding, TensorAxis, TensorTiling};
+    use crate::{AmpOrder, AxisTiling, Padding, TensorAxis, TensorTiling};
 
     fn tensor(order: ElementOrder, rows: u16, columns: u16) -> TensorType {
         let mut layout = Layout::row_major(TensorTiling {
@@ -217,6 +191,47 @@ mod tests {
     }
 
     #[test]
+    fn randomized_packed_grids_match_expanded_transfers() {
+        let mut random = fastrand::Rng::with_seed(0x7061636b6564);
+        for _ in 0..120 {
+            let precision = if random.bool() {
+                Precision::F16
+            } else {
+                Precision::F8F143 { scale_exponent: -2 }
+            };
+            let order = match random.u8(0..4) {
+                0 => ElementOrder::Amp(AmpOrder::TransposedLeft),
+                1 => ElementOrder::Amp(AmpOrder::TransposedRight),
+                2 => ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                    row_block: 32,
+                    column_block: 16,
+                }),
+                _ => ElementOrder::BlockMajor(crate::BlockMajorOrder::TransposedMatrix {
+                    row_block: 32,
+                    column_block: 16,
+                }),
+            };
+            let shape = vec![2, 32 * random.u32(7..=15), 32 * random.u32(7..=15)];
+            let mut make = || {
+                let mut t = tensor(order, random.u16(1..=4), random.u16(1..=4));
+                t.shape = TensorShape(shape.clone());
+                t.format.precision = precision;
+                for axis in &mut t.format.layout.tiling.axes {
+                    axis.block_size = 32;
+                }
+                t
+            };
+            let input = make();
+            let output = make();
+            assert_eq!(
+                grid_fragments(&input, &output),
+                Some(expanded_maximum(&input, &output)),
+                "{input:?} -> {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn uneven_and_fp8_grids_match_expanded_spans() {
         for precision in [
             Precision::F8F143 { scale_exponent: -4 },
@@ -284,6 +299,7 @@ mod tests {
                 >= super::exchange_fragment_price(
                     Target::Ipu21,
                     conversion_traffic(
+                        Target::Ipu21,
                         &graph.values[0],
                         &graph.values[1],
                         &Default::default(),
