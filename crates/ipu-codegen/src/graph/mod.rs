@@ -118,6 +118,14 @@ pub enum OperationKind {
     Repeat(Repeat),
 }
 
+impl OperationKind {
+    /// Pointwise operations can preserve ownership and element order. Broadcast
+    /// compatibility must still be checked against their operand shapes.
+    pub(crate) fn is_elementwise(&self) -> bool {
+        matches!(self, Self::Add | Self::Gelu)
+    }
+}
+
 /// A contiguous logical window along one tensor axis.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AxisSlice {

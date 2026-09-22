@@ -420,8 +420,8 @@ fn neighbour_layouts_connect_gemm_and_elementwise_chains_without_importing_resid
                 );
             }
         }
-        // The consumer's required packed layout reaches the preceding GeLU,
-        // although neither the input nor the default output uses that layout.
+        // Every exposed consumer layout can be produced by the preceding GeLU.
+        // GEMM's private packed operands must not become graph boundaries.
         for consumer in &catalogue[1] {
             let required = &consumer.graph.values[consumer.bindings[&first].index() as usize];
             assert!(catalogue[0].iter().any(|producer| {
@@ -435,8 +435,10 @@ fn neighbour_layouts_connect_gemm_and_elementwise_chains_without_importing_resid
         };
         let graph = plan(&high, &layouts, &config, exact).unwrap();
         let mut constrained = layouts.clone();
-        for id in [first, middle] {
-            constrained.insert(id, Some(Layout::row_sharded(1)));
+        for (position, id) in [(0, first), (2, middle)] {
+            let candidate = &catalogue[position][0];
+            let output = &candidate.graph.values[candidate.graph.outputs[0].index() as usize];
+            constrained.insert(id, Some(output.tensor_type.format.layout.clone()));
         }
         let conventional = plan(&high, &constrained, &config, exact).unwrap();
         assert!(graph.estimated_cycles <= conventional.estimated_cycles);

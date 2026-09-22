@@ -301,6 +301,15 @@ fn explore<'a>(
             let mut alternatives = edges(high, position, &state.live, choices, config, scratch);
             if reverse {
                 alternatives.reverse();
+                // Exercise the chunked parallel construction contract against
+                // the same exhaustive oracle, including memory tradeoffs.
+                alternatives = alternatives
+                    .chunks(2)
+                    .map(|chunk| prune(chunk.to_vec(), config))
+                    .collect::<PlanningResult<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
             }
             let alternatives = prune(alternatives, config)?;
             search.extend(position, &state, &alternatives)?;

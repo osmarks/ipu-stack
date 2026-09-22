@@ -3,7 +3,7 @@
 
 use super::candidates::{BoundaryValue, Candidate};
 use super::construction::{copy, value};
-use super::{BoundaryLayouts, PlanningError, PlanningResult};
+use super::{PlanningError, PlanningResult};
 use crate::graph::{GemmOptions, HighGraph, ValueId};
 use crate::kernel::{AccumulationPrecision, GemmAxes, GemmKernelMode, GemmWeightLoad};
 use crate::mid::{MidOperation, MidOperationKind, OperandIndexing};
@@ -11,6 +11,10 @@ use crate::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, MemoryClass, OwnerMap, Padding,
     PipelineConfig, Precision, TensorAxis, TensorFormat, TensorShape, TensorTiling, TensorType,
 };
+use rayon::prelude::*;
+
+// Both supported multiply precisions currently produce FP16 mid values.
+pub(super) const OUTPUT_PRECISION: Precision = Precision::F16;
 
 fn partitions(extent: u32, tiles: u16) -> Vec<u16> {
     let maximum = extent.min(u32::from(tiles)) as u16;
@@ -127,82 +131,123 @@ fn operand_layout(
     }
 }
 
+#[tracing::instrument(name = "gemm_candidates", skip_all, fields(position))]
 pub(super) fn generate(
     high: &HighGraph,
     position: usize,
     tensors: &std::collections::BTreeMap<ValueId, TensorType>,
-    layouts: &BoundaryLayouts,
     config: &PipelineConfig,
     options: GemmOptions,
-    existing: &[Candidate],
+    offers: &std::collections::BTreeMap<ValueId, std::collections::BTreeSet<Layout>>,
 ) -> PlanningResult<Vec<Candidate>> {
-    // The grid enumeration is intrinsic to this GEMM. Neighbour layouts do
-    // not yet introduce additional direct-output implementations.
-    if !existing.is_empty() {
-        return Ok(Vec::new());
-    }
     let op = &high.operations()[position];
     let origin = op.results[0];
     let shape = high.value_shape(origin).unwrap();
     let sources = [&tensors[&op.inputs[0]], &tensors[&op.inputs[1]]];
-    let mut candidates = Vec::new();
-    for choice in choices(sources, shape, options, config.tile_count)? {
-        if choice.result.format.layout.tiling.tile_count > 1
-            && layouts.get(&origin).is_some_and(Option::is_some)
-            && choice
-                .result
-                .format
-                .layout
-                .shard_extents(&choice.result.shape)
-                .ok()
-                .is_none_or(|shards| {
-                    shards.iter().any(|(_, extents)| {
-                        extents
-                            .iter()
-                            .map(|e| u64::from(e.logical_end - e.start))
-                            .product::<u64>()
-                            % 2
-                            != 0
-                    })
+    let assignments = choices(sources, shape, options, config.tile_count)?
+        .into_iter()
+        .filter(|choice| {
+            // Each GEMM operand/result is a real tile-local allocation. A single
+            // one exceeding total tile capacity is infeasible regardless of
+            // boundaries, other live values, or placement. This is not a rank.
+            choice
+                .operands
+                .iter()
+                .chain([&choice.result])
+                .all(|tensor| {
+                    tensor
+                        .format
+                        .layout
+                        .resolve(&tensor.shape)
+                        .is_ok_and(|layout| {
+                            layout.maximum_tile_elements() * tensor.format.precision.bytes()
+                                <= config
+                                    .tile_memory_budget_bytes
+                                    .min(config.target.planned_data_bytes())
+                        })
                 })
-        {
-            // This boundary requests a redistribution of the result. The
-            // current copy path cannot gather an odd FP16 half-word tail.
-            continue;
-        }
-        let mut operands = super::candidates::LiveValues::new();
-        for (i, &id) in op.inputs.iter().enumerate() {
-            let mut tensor = choice.operands[i ^ usize::from(choice.swapped)].clone();
-            tensor.format.precision = sources[i].format.precision;
-            // A repeated high operand imports one representation; append
-            // prepares the second role internally when its layout differs.
-            operands.entry(id).or_insert(BoundaryValue {
-                tensor,
-                owners: OwnerMap::default(),
-            });
-        }
-        let mut candidate = Candidate::inputs(high, &operands, config.tile_count, position + 1);
-        let inputs = [
-            candidate.bindings[&op.inputs[0]],
-            candidate.bindings[&op.inputs[1]],
-        ];
-        let result = append(
-            &mut candidate.graph,
-            inputs,
-            &choice,
-            options,
-            shape,
-            op.id,
-            origin,
-            layouts.get(&origin).and_then(Option::as_ref),
-        );
-        candidate.bindings.insert(origin, result);
-        candidate.graph.outputs = vec![result];
-        if candidate.graph.validate().is_ok() {
-            candidates.push(candidate);
-        }
-    }
-    Ok(candidates)
+        })
+        .filter(|choice| {
+            // These boundaries require redistribution. Copies cannot yet gather
+            // an odd FP16 half-word tail from a distributed packed result.
+            choice.result.format.layout.tiling.tile_count == 1
+                || choice
+                    .result
+                    .format
+                    .layout
+                    .shard_extents(&choice.result.shape)
+                    .is_ok_and(|shards| {
+                        shards.iter().all(|(_, extents)| {
+                            extents
+                                .iter()
+                                .map(|e| u64::from(e.logical_end - e.start))
+                                .product::<u64>()
+                                .is_multiple_of(2)
+                        })
+                    })
+        })
+        .collect::<Vec<_>>();
+    let boundaries = offers[&op.inputs[0]]
+        .iter()
+        .flat_map(|left| {
+            offers[&op.inputs[1]].iter().flat_map(move |right| {
+                offers[&origin]
+                    .iter()
+                    .map(move |output| (left, right, output))
+            })
+        })
+        .filter(|(left, right, _)| op.inputs[0] != op.inputs[1] || left == right)
+        .collect::<Vec<_>>();
+    // Stream implementation graphs into the common frontier rather than retaining
+    // hundreds of thousands of graphs before pruning the fixed boundary groups.
+    let frontiers = boundaries
+        .into_par_iter()
+        .map(|(left, right, output)| {
+            let mut operands = super::candidates::LiveValues::new();
+            for (i, &id) in op.inputs.iter().enumerate() {
+                let mut tensor = sources[i].clone();
+                tensor.format.layout = [left, right][i].clone();
+                // A repeated high operand imports one representation; append
+                // prepares the second role internally when its layout differs.
+                operands.entry(id).or_insert(BoundaryValue {
+                    tensor,
+                    owners: OwnerMap::default(),
+                });
+            }
+            let template = Candidate::inputs(high, &operands, config.tile_count, position + 1);
+            let inputs = [
+                template.bindings[&op.inputs[0]],
+                template.bindings[&op.inputs[1]],
+            ];
+            // Dominance within a fixed boundary is compositional. Prune chunks
+            // independently, then merge their frontiers with the same search code.
+            // Chunking bounds worker memory; it does not limit the geometry search.
+            let chunks = assignments
+                .par_chunks(4096)
+                .map(|assignments| {
+                    let candidates = assignments.iter().map(|choice| {
+                        let mut candidate = template.clone();
+                        let result = append(
+                            &mut candidate.graph,
+                            inputs,
+                            choice,
+                            options,
+                            shape,
+                            op.id,
+                            origin,
+                            Some(output),
+                        );
+                        candidate.bindings.insert(origin, result);
+                        candidate.graph.outputs = vec![result];
+                        candidate
+                    });
+                    super::search::prune(candidates, config)
+                })
+                .collect::<PlanningResult<Vec<_>>>()?;
+            super::search::prune(chunks.into_iter().flatten(), config)
+        })
+        .collect::<PlanningResult<Vec<_>>>()?;
+    Ok(frontiers.into_iter().flatten().collect())
 }
 
 /// One enumerated distributed GEMM assignment; no high bindings or search state.
@@ -349,7 +394,7 @@ pub(super) fn choices(
                     });
                     let mut result = TensorType::new(
                         shape.0.clone(),
-                        Precision::F16,
+                        OUTPUT_PRECISION,
                         operand_layout(true, swapped, tiles, rows, columns, 1, nw, nw),
                     );
                     if kw > grain {

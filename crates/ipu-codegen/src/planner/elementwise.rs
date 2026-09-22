@@ -17,7 +17,6 @@ pub(super) fn generate(
     settings: &PipelineConfig,
     kind: MidOperationKind,
     offers: &BTreeMap<ValueId, BTreeSet<Layout>>,
-    existing: &[Candidate],
 ) -> PlanningResult<Vec<Candidate>> {
     let op = &high.operations()[position];
     let result = op.results[0];
@@ -42,19 +41,6 @@ pub(super) fn generate(
                 .iter()
                 .any(|later| high.operation_inputs(later).any(|v| v == result))
     });
-    let existing = existing
-        .iter()
-        .map(|candidate| {
-            (
-                candidate.end,
-                candidate.graph.values[candidate.graph.outputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .layout
-                    .clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
     let mut candidates = Vec::new();
     for (end, output, kind) in std::iter::once((position + 1, result, kind))
         .chain(fused.map(|next| (position + 2, next.results[0], MidOperationKind::BiasGelu)))
@@ -70,13 +56,9 @@ pub(super) fn generate(
                     .filter_map(|id| offers.get(id))
                     .flatten()
                     .cloned()
-                    .chain([Layout::row_sharded(settings.tile_count)])
                     .collect()
             });
         for layout in layouts {
-            if existing.contains(&(end, layout.clone())) {
-                continue;
-            }
             if layout.validate_tile_count(settings.tile_count).is_err()
                 || layout.resolve(shape).is_err()
             {
@@ -122,5 +104,5 @@ pub(super) fn generate(
             candidates.push(candidate);
         }
     }
-    Ok(candidates)
+    super::search::prune(candidates, settings)
 }
