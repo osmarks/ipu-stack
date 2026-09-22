@@ -1038,7 +1038,18 @@ fn main() -> Result<()> {
                         .as_ref()
                         .context("reference validation requires a newly compiled package")?,
                     arguments.timeout_seconds,
-                    ReferenceCheck::Elementwise((0.001, 0.02)),
+                    ReferenceCheck::Elementwise((
+                        // Small GEMM/GeLU rounding differences can cross FP8
+                        // thresholds before the MLP's second multiplication.
+                        if matches!(arguments.workload, Workload::MlpSmoke)
+                            && arguments.fp8_scale.is_some()
+                        {
+                            0.003
+                        } else {
+                            0.001
+                        },
+                        0.02,
+                    )),
                     false,
                     1,
                     None,
