@@ -102,7 +102,7 @@ pub(crate) fn invocations(
     Ok(calls)
 }
 
-pub(crate) fn cycles(
+fn cycles(
     multiply: Precision,
     weights: GemmWeightLoad,
     inner_block: u32,

@@ -26,57 +26,18 @@ fn partitions(extent: u32, tiles: u16) -> Vec<u16> {
     result
 }
 
-/// Local compute/storage frontier, before constructing boundary conversions.
-/// These are candidate seeds, not dominance claims about connected programs:
-/// the outer search still costs actual preparation and reduction layouts.
-fn grids(
-    m: u32,
-    n: u32,
-    k: u32,
-    row_grain: u32,
-    precision: Precision,
-    batches: u32,
-    tiles: u16,
-) -> Vec<[u16; 3]> {
-    let grain = if precision == Precision::F16 { 16 } else { 32 };
-    let mut frontier = Vec::<([u64; 4], [u16; 3])>::new();
-    for rows in partitions(m.div_ceil(row_grain), tiles) {
-        for columns in partitions(n.div_ceil(16), tiles / rows) {
-            for inner in partitions(k.div_ceil(grain), tiles / rows / columns) {
-                let r = m.div_ceil(row_grain).div_ceil(u32::from(rows)) * row_grain;
-                let c = n.div_ceil(16).div_ceil(u32::from(columns)) * 16;
-                let k = k.div_ceil(grain).div_ceil(u32::from(inner)) * grain;
-                let cost = |load| {
-                    if batches == 1 {
-                        crate::kernel::gemm::cycles(precision, load, k, c, r, 0)
-                    } else {
-                        crate::kernel::gemm::cycles(precision, load, grain, 16, r, 0)
-                            * u64::from(batches)
-                            * u64::from(k / grain)
-                            * u64::from(c / 16)
-                    }
-                };
-                let output = u64::from(r) * u64::from(c) * u64::from(batches) * 2;
-                let operands = u64::from(k)
-                    * (u64::from(r) + u64::from(c))
-                    * u64::from(batches)
-                    * precision.bytes();
-                let score = [
-                    cost(GemmWeightLoad::Interleaved),
-                    cost(GemmWeightLoad::Standard),
-                    operands + 3 * output,
-                    output * u64::from(inner),
-                ];
-                let dominates = |a: &[u64; 4], b: &[u64; 4]| a.iter().zip(b).all(|(a, b)| a <= b);
-                if frontier.iter().any(|(old, _)| dominates(old, &score)) {
-                    continue;
-                }
-                frontier.retain(|(old, _)| !dominates(&score, old));
-                frontier.push((score, [rows, columns, inner]));
+// Enumerate geometry only. Cost tradeoffs belong to search, where boundary
+// conversions and live tensors are available.
+fn grids([m, n, k]: [u32; 3], tiles: u16) -> Vec<[u16; 3]> {
+    let mut grids = Vec::new();
+    for rows in partitions(m, tiles) {
+        for columns in partitions(n, tiles / rows) {
+            for inner in partitions(k, tiles / rows / columns) {
+                grids.push([rows, columns, inner]);
             }
         }
     }
-    frontier.into_iter().map(|(_, grid)| grid).collect()
+    grids
 }
 
 /// Packed, unreplicated initial storage. Choose a balanced two-axis partition;
@@ -336,23 +297,8 @@ pub(super) fn choices(
         // Word-aligned boundaries permit subsequent row-major redistribution.
         let row_grain = if swapped { 2 } else { 1 };
         for (groups, batch_axes) in &batches {
-            let batch_size = batch_axes
-                .iter()
-                .map(|axis| {
-                    let extent = shape.0[axis.axis.resolve(rank).unwrap()];
-                    extent
-                        .div_ceil(axis.block_size)
-                        .div_ceil(u32::from(axis.partitions))
-                        * axis.block_size
-                })
-                .product::<u32>();
             for [rows, columns, inner] in grids(
-                m,
-                n,
-                k,
-                row_grain,
-                precision,
-                batch_size,
+                [m.div_ceil(row_grain), n.div_ceil(16), k.div_ceil(grain)],
                 tile_count / groups,
             ) {
                 let tiles = rows * columns * inner * groups;

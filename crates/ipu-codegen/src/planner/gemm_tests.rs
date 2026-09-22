@@ -5,6 +5,38 @@ use crate::planner::tests::gelu;
 use ipu_target::Target;
 
 #[test]
+fn grid_enumeration_preserves_every_feasible_local_geometry() {
+    let mut rng = fastrand::Rng::with_seed(0x6772_6964);
+    for _ in 0..128 {
+        let extents = std::array::from_fn(|_| rng.u32(1..=96));
+        let tiles = rng.u16(1..=16);
+        let geometry = |grid: [u16; 3]| {
+            std::array::from_fn::<_, 3, _>(|i| extents[i].div_ceil(u32::from(grid[i])))
+        };
+        let actual = grids(extents, tiles)
+            .into_iter()
+            .map(geometry)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut expected = std::collections::BTreeSet::new();
+        for m in 1..=tiles {
+            for n in 1..=tiles {
+                for k in 1..=tiles {
+                    if u32::from(m) * u32::from(n) * u32::from(k) <= u32::from(tiles)
+                        && [m, n, k]
+                            .iter()
+                            .zip(extents)
+                            .all(|(&p, e)| u32::from(p) <= e)
+                    {
+                        expected.insert(geometry([m, n, k]));
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected, "extents={extents:?}, tiles={tiles}");
+    }
+}
+
+#[test]
 fn large_gemm_catalogues_offer_head_splits_orders_and_reduce_scatter() {
     for (groups, m, k, n, precision) in [
         (1, 729, 1152, 4304, Precision::F8F143 { scale_exponent: -2 }),
