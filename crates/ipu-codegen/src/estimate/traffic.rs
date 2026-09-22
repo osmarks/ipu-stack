@@ -158,6 +158,39 @@ pub(crate) fn conversion_traffic(
     };
     let source_groups = groups(input, &[])?;
     let destination_groups = groups(output, &mapping.offsets)?;
+    // Index the least-overlapping axis of both sets. In particular, reductions
+    // request almost the entire contributor axis; indexing only by source shard
+    // width would choose that axis and still scan every contributor for each row.
+    // Sorted start coordinates and prefix maximum ends exclude disjoint boxes
+    // without enumerating every
+    // source/destination pair. Remaining axes still get the exact intersection
+    // check below, so the choice of index axis cannot change the estimate.
+    let axis = (0..input.tensor_type.shape.0.len()).min_by_key(|&axis| {
+        let source_widths = source_groups
+            .keys()
+            .map(|bounds| u64::from(bounds[axis].1 - bounds[axis].0))
+            .sum::<u64>();
+        let destination_widths = destination_groups
+            .keys()
+            .map(|bounds| u64::from(bounds[axis].1 - bounds[axis].0))
+            .sum::<u64>();
+        (u128::from(source_widths) * destination_groups.len() as u128
+            + u128::from(destination_widths) * source_groups.len() as u128)
+            / u128::from(input.tensor_type.shape.0[axis].max(1))
+    });
+    let mut source_groups = source_groups.into_iter().collect::<Vec<_>>();
+    let ends = if let Some(axis) = axis {
+        source_groups.sort_unstable_by_key(|(bounds, _)| bounds[axis].0);
+        source_groups
+            .iter()
+            .scan(0, |end, (bounds, _)| {
+                *end = (*end).max(bounds[axis].1);
+                Some(*end)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let element_bytes = input.tensor_type.format.precision.bytes();
     let can_pair = mapping.is_identity()
         && input.tensor_type.format.precision == output.tensor_type.format.precision
@@ -185,9 +218,17 @@ pub(crate) fn conversion_traffic(
     let mut local = HashMap::<u16, [u64; 4], foldhash::fast::FixedState>::default();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
-        let mut intersections = Vec::with_capacity(source_groups.len());
+        let sources = if let Some(axis) = axis {
+            let end =
+                source_groups.partition_point(|(bounds, _)| bounds[axis].0 < destination[axis].1);
+            let start = ends[..end].partition_point(|&end| end <= destination[axis].0);
+            &source_groups[start..end]
+        } else {
+            &source_groups[..]
+        };
+        let mut intersections = Vec::with_capacity(sources.len());
         let mut destination_bytes = 0u64;
-        for (source, source_tiles) in &source_groups {
+        for (source, source_tiles) in sources {
             let Some(extents) = intersect_ranges(source, destination) else {
                 continue;
             };
@@ -363,17 +404,20 @@ pub(super) fn intersect_ranges(
     left: &[(u32, u32)],
     right: &[(u32, u32)],
 ) -> Option<Vec<(u32, u32)>> {
-    if left.len() != right.len() {
+    if left.len() != right.len()
+        || left
+            .iter()
+            .zip(right)
+            .any(|(&(a, b), &(c, d))| a.max(c) >= b.min(d))
+    {
         return None;
     }
-    left.iter()
-        .zip(right)
-        .map(|(&(left_start, left_end), &(right_start, right_end))| {
-            let start = left_start.max(right_start);
-            let end = left_end.min(right_end);
-            (start < end).then_some((start, end))
-        })
-        .collect()
+    Some(
+        left.iter()
+            .zip(right)
+            .map(|(&(a, b), &(c, d))| (a.max(c), b.min(d)))
+            .collect(),
+    )
 }
 
 pub(super) fn range_elements(extents: &[(u32, u32)]) -> u64 {

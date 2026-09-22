@@ -90,7 +90,13 @@ fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
         let columns = rng.u32(4..=16) * 4;
         let offsets = vec![rng.u32(0..rows), rng.u32(0..columns / 4) * 4];
         let shape = [rows - offsets[0], columns - offsets[1]];
-        let mut layout = || {
+        let mut layout = |shape: [u32; 2]| {
+            if rng.bool() {
+                return Layout::logical_linear(
+                    rng.u16(1..=4.min((shape[0] * shape[1] / 4) as u16)),
+                    4,
+                );
+            }
             let mut tiling =
                 TensorTiling::sharded(TensorAxis::FromStart(rng.u16(0..2)), rng.u16(1..=4));
             tiling.replicas = rng.u16(1..=2);
@@ -98,8 +104,8 @@ fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
             Layout::row_major(tiling)
         };
         let mut graph = copy_graph(
-            TensorType::new([rows, columns], Precision::F16, layout()),
-            TensorType::new(shape, Precision::F16, layout()),
+            TensorType::new([rows, columns], Precision::F16, layout([rows, columns])),
+            TensorType::new(shape, Precision::F16, layout(shape)),
             16,
         );
         for value in &mut graph.values {

@@ -12,21 +12,24 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Storage boundaries favour dense elementwise access, either keeping complete
 /// rows together or distributing aligned contiguous intervals across the device.
 /// GEMM compute grids are deliberately absent: they are private implementations.
-fn default_layouts(tensor: &TensorType, tiles: u16) -> BTreeSet<crate::Layout> {
-    let elements = tensor.shape.elements();
-    let grain = (8 / tensor.format.precision.bytes()) as u32;
+fn default_layouts(
+    shape: &crate::TensorShape,
+    precision: crate::Precision,
+    tiles: u16,
+) -> BTreeSet<crate::Layout> {
+    let elements = shape.elements();
+    let grain = (8 / precision.bytes()) as u32;
     // Packed-to-row-major copies cannot yet split rows with sub-word tails.
     // Preserve complete matrices for these shapes rather than propose a default
     // which the physical copy implementation cannot realize.
-    if tensor.shape.0.len() > 1
-        && !(u64::from(*tensor.shape.0.last().unwrap()) * tensor.format.precision.bytes())
-            .is_multiple_of(4)
+    if shape.0.len() > 1
+        && !(u64::from(*shape.0.last().unwrap()) * precision.bytes()).is_multiple_of(4)
     {
         return BTreeSet::from([crate::Layout::row_sharded(1)]);
     }
     let mut grains = BTreeSet::from([grain]);
-    if let Some(&columns) = tensor.shape.0.last()
-        && tensor.shape.0.len() > 1
+    if let Some(&columns) = shape.0.last()
+        && shape.0.len() > 1
         && columns.is_multiple_of(grain)
     {
         grains.insert(columns);
@@ -37,11 +40,9 @@ fn default_layouts(tensor: &TensorType, tiles: u16) -> BTreeSet<crate::Layout> {
             let blocks = elements.div_ceil(u64::from(grain));
             let width = blocks.div_ceil(u64::from(tiles));
             let owners = blocks.div_ceil(width.max(1)).max(1) as u16;
-            if tensor.shape.0.len() > 1
-                && tensor.shape.0[..tensor.shape.0.len() - 2]
-                    .iter()
-                    .all(|&n| n == 1)
-                && grain == *tensor.shape.0.last().unwrap()
+            if shape.0.len() > 1
+                && shape.0[..shape.0.len() - 2].iter().all(|&n| n == 1)
+                && grain == *shape.0.last().unwrap()
             {
                 return crate::Layout::row_sharded(owners);
             }
@@ -64,7 +65,7 @@ mod tests {
             let tensor =
                 TensorType::new(shape, crate::Precision::F16, crate::Layout::row_sharded(1));
             let tiles = rng.u16(1..=1472);
-            let layouts = default_layouts(&tensor, tiles);
+            let layouts = default_layouts(&tensor.shape, tensor.format.precision, tiles);
             assert!((1..=2).contains(&layouts.len()));
             for layout in layouts {
                 assert_eq!(layout.tiling.replicas, 1);
@@ -177,20 +178,17 @@ pub(super) fn catalogue(
             return Err(PlanningError::Unimplemented("operator candidates"));
         };
         for &output in &op.results {
-            let tensor = TensorType::new(
-                high.value_shape(output).unwrap().0.clone(),
-                precision,
-                crate::Layout::row_sharded(1),
-            );
-            offers.insert(
+            let shape = high.value_shape(output).unwrap();
+            let layouts = choices
+                .get(&output)
+                .and_then(Option::as_ref)
+                .map(|layout| BTreeSet::from([layout.clone()]))
+                .unwrap_or_else(|| default_layouts(shape, precision, settings.tile_count));
+            tensors.insert(
                 output,
-                choices
-                    .get(&output)
-                    .and_then(Option::as_ref)
-                    .map(|layout| BTreeSet::from([layout.clone()]))
-                    .unwrap_or_else(|| default_layouts(&tensor, settings.tile_count)),
+                TensorType::new(shape.0.clone(), precision, layouts.first().unwrap().clone()),
             );
-            tensors.insert(output, tensor);
+            offers.insert(output, layouts);
         }
     }
     // Propagate only through layout-preserving operations, before constructing

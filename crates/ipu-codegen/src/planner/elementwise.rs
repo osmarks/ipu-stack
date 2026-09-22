@@ -45,26 +45,13 @@ pub(super) fn generate(
     for (end, output, kind) in std::iter::once((position + 1, result, kind))
         .chain(fused.map(|next| (position + 2, next.results[0], MidOperationKind::BiasGelu)))
     {
-        let layouts = choices
-            .get(&output)
-            .and_then(Option::as_ref)
-            .map(|layout| BTreeSet::from([layout.clone()]))
-            .unwrap_or_else(|| {
-                op.inputs
-                    .iter()
-                    .chain([&output])
-                    .filter_map(|id| offers.get(id))
-                    .flatten()
-                    .cloned()
-                    .collect()
-            });
-        for layout in layouts {
+        for layout in &offers[&output] {
             if layout.validate_tile_count(settings.tile_count).is_err()
                 || layout.resolve(shape).is_err()
             {
                 continue;
             }
-            let tensor = TensorType::new(shape.0.clone(), Precision::F16, layout);
+            let tensor = TensorType::new(shape.0.clone(), Precision::F16, layout.clone());
             let operands = op
                 .inputs
                 .iter()

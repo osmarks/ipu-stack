@@ -6,8 +6,8 @@ boundary layout vocabulary is established before implementation construction:
 - Activations offer unreplicated row-major storage with whole-row ownership,
   and dense contiguous intervals aligned to eight bytes. Whole rows suit
   row-wise consumers; contiguous intervals balance pointwise work and memory.
-- Both use as many nonempty owners as the tensor and configured tile count
-  permit. Whole-row ownership spans batch dimensions as well as matrix rows.
+- Both distribute storage up to the configured tile count, avoiding empty
+  owners. Whole-row ownership spans batch dimensions as well as matrix rows.
 - Explicit layout constraints remain constraints. Imported formats remain
   available. Unconfigured GEMM parameters retain the existing compact packed
   format; compute-grid replicas are preparation storage, not resident defaults.
@@ -39,3 +39,9 @@ maximum absolute error. These are compiler timings, not device cycle counts.
 The full-size SigLIP candidate enumeration still spends substantial time costing
 copy/exchange geometry; the small-workload speedup does not establish full-size
 planning scalability or device performance.
+
+The full 1472-tile FP8 SigLIP MLP did not finish its first GEMM catalogue within
+a five-minute bounded run using 56 Rayon threads. This includes interval indexing
+of copy-traffic intersections; the cost model is unchanged. There is no new
+full-size device timing. Bounding graph boundaries removes the state multiplier,
+but exhaustive detailed internal-plan costing remains impractical here.
