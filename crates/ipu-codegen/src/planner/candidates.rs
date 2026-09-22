@@ -162,45 +162,9 @@ pub(super) fn catalogue(
         }
     }
     for alternatives in &mut catalogue {
-        let mut retained = Vec::<Candidate>::new();
-        let mut buckets =
-            std::collections::HashMap::<_, Vec<usize>, foldhash::fast::FixedState>::default();
-        for mut candidate in alternatives.drain(..) {
-            // Compare complete graphs only within identical boundary signatures.
-            // Different private implementations remain distinct here; their
-            // memory tradeoffs depend on the state to which search connects them.
-            let ports = candidate
-                .graph
-                .inputs
-                .iter()
-                .map(|input| input.value)
-                .chain(candidate.graph.outputs.iter().copied())
-                .map(|id| {
-                    let value = &candidate.graph.values[id.index() as usize];
-                    (
-                        value.origin,
-                        value.tensor_type.clone(),
-                        value.owners.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let bucket = buckets
-                .entry((candidate.end, candidate.graph.inputs.len(), ports))
-                .or_default();
-            // Check kernel/cost-model support once, before search. Memory
-            // dominance is evaluated after connection: an imported parameter
-            // requirement may become either resident storage or scratch.
-            if candidate.graph.refresh_estimates(settings.target).is_none() {
-                continue;
-            }
-            if !bucket.iter().any(|&i| {
-                retained[i].graph == candidate.graph && retained[i].bindings == candidate.bindings
-            }) {
-                bucket.push(retained.len());
-                retained.push(candidate);
-            }
-        }
-        *alternatives = retained;
+        // Check kernel/cost-model support once. Search owns all pruning.
+        alternatives
+            .retain_mut(|candidate| candidate.graph.refresh_estimates(settings.target).is_some());
     }
     Ok(catalogue)
 }

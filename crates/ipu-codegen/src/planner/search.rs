@@ -14,6 +14,137 @@ use crate::tensor::{OwnerMap, TensorType};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
+/// Compare private implementations once, before multiplying by incoming states.
+/// Equal ports imply equal connection choices; different ports are never ranked
+/// against one another here. Check both borrowed and converted operands because
+/// connection can turn a resident parameter into temporary preparation storage.
+pub(super) fn prune(
+    candidates: Vec<Candidate>,
+    settings: &PipelineConfig,
+) -> PlanningResult<Vec<Candidate>> {
+    let mut buckets = HashMap::<_, Vec<(usize, Candidate)>, foldhash::fast::FixedState>::default();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let ports = candidate
+            .graph
+            .inputs
+            .iter()
+            .map(|i| i.value)
+            .chain(candidate.graph.outputs.iter().copied())
+            .map(|id| {
+                let value = &candidate.graph.values[id.index() as usize];
+                (
+                    value.origin,
+                    value.tensor_type.clone(),
+                    value.owners.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        buckets
+            .entry((candidate.end, candidate.graph.inputs.len(), ports))
+            .or_default()
+            .push((index, candidate));
+    }
+    let mut retained = Vec::new();
+    let mut costs = crate::estimate::CopyCosts::default();
+    for mut bucket in buckets.into_values() {
+        if bucket.len() == 1 {
+            retained.append(&mut bucket);
+            continue;
+        }
+        let mut frontier = Vec::<(usize, Candidate, Vec<Memory>)>::new();
+        costs.clear();
+        for (index, mut candidate) in bucket {
+            if frontier.iter().any(|(_, old, _)| {
+                old.graph == candidate.graph && old.bindings == candidate.bindings
+            }) {
+                continue;
+            }
+            if candidate
+                .graph
+                .operations
+                .iter()
+                .any(|op| !op.output_aliases.is_empty())
+            {
+                return Err(PlanningError::Unimplemented("aliased DP fragments"));
+            }
+            let mut graph = candidate.graph.clone();
+            if graph
+                .inputs
+                .iter()
+                .any(|i| graph.outputs.contains(&i.value))
+            {
+                retained.push((index, candidate));
+                continue;
+            }
+            // Record each imported allocation's requirements independently of
+            // peaks. Larger operand padding could enlarge the common connection
+            // prefix even if hidden under an implementation's private peak.
+            for input in &mut graph.inputs {
+                input.kind = GraphInputKind::Parameter;
+            }
+            let mut profiles = Vec::new();
+            loop {
+                let mut memory = Memory::default();
+                let (cycles, _) = crate::estimate::analyze_observed(
+                    settings.target,
+                    &graph,
+                    &BTreeMap::new(),
+                    &mut memory,
+                    &mut costs,
+                )
+                .ok_or(PlanningError::InvalidFragment("uncostable mid fragment"))?;
+                candidate.graph.estimated_cycles = cycles.total;
+                profiles.push(memory);
+                // Ternary enumeration: resident, transient, or retained host
+                // operand. This also covers residuals and converted parameters.
+                let mut next = false;
+                for input in &mut graph.inputs {
+                    if input.kind == GraphInputKind::Parameter {
+                        input.kind = GraphInputKind::Host;
+                        graph.outputs.retain(|&id| id != input.value);
+                        next = true;
+                        break;
+                    }
+                    if !graph.outputs.contains(&input.value) {
+                        graph.outputs.push(input.value);
+                        next = true;
+                        break;
+                    }
+                    graph.outputs.retain(|&id| id != input.value);
+                    input.kind = GraphInputKind::Parameter;
+                }
+                if !next {
+                    break;
+                }
+            }
+            let dominates = |a: &[Memory], b: &[Memory]| {
+                a[0].parameters == b[0].parameters && a.iter().zip(b).all(|(a, b)| a.dominates(b))
+            };
+            if frontier.iter().any(|(_, old, memory)| {
+                old.graph.estimated_cycles <= candidate.graph.estimated_cycles
+                    && dominates(memory, &profiles)
+            }) {
+                continue;
+            }
+            frontier.retain(|(_, old, memory)| {
+                !(candidate.graph.estimated_cycles <= old.graph.estimated_cycles
+                    && dominates(&profiles, memory))
+            });
+            frontier.push((index, candidate, profiles));
+        }
+        retained.extend(
+            frontier
+                .into_iter()
+                .map(|(index, candidate, _)| (index, candidate)),
+        );
+    }
+    retained.sort_unstable_by_key(|(index, _)| *index);
+    Ok(retained
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect())
+}
+
 /// Connect one implementation to a live boundary. At first use a parameter may
 /// keep its baseline home or adopt the required representation. A preparation
 /// copy does not replace that home. Unrelated live values pass through the

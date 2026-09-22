@@ -302,6 +302,7 @@ fn explore<'a>(
             if reverse {
                 alternatives.reverse();
             }
+            let alternatives = prune(alternatives, config)?;
             search.extend(position, &state, &alternatives)?;
         }
     }
@@ -650,6 +651,21 @@ fn randomized_memory_tradeoffs_match_exhaustive_paths() {
             (small, rng.usize(1..=3), MemoryClass::Ipu21Standard),
             (large / 2, 1, MemoryClass::Ipu21Interleaved),
         ];
+        // Ensure the early pass does real work, not just preserve the oracle
+        // result by retaining everything. Extra unused GeLUs add both cycles
+        // and scratch without changing the boundary or numerical result.
+        let (initial_graph, bindings) = initial(&high, &config);
+        let live = live_at(&high, 0, &initial_graph, &bindings);
+        let redundant = edges(
+            &high,
+            0,
+            &live,
+            &choices,
+            &config,
+            &[scratch[0], (large, 4, MemoryClass::Ipu21Standard)],
+        );
+        let count = redundant.len();
+        assert!(prune(redundant, &config).unwrap().len() < count);
         let complete = enumerate(&high, &choices, &config, &scratch);
         let fastest = complete.iter().min_by_key(|g| g.estimated_cycles).unwrap();
         let smallest = complete.iter().min_by_key(|g| g.peak_memory.total).unwrap();

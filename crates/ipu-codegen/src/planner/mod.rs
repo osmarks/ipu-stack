@@ -84,9 +84,10 @@ pub(crate) fn plan(
 ) -> PlanningResult<MidGraph> {
     let mut search = Search::new(graph, layouts, settings, limits)?;
     let catalogue = candidates::catalogue(graph, layouts, settings)?;
-    for (position, candidates) in catalogue.iter().enumerate() {
+    for (position, candidates) in catalogue.into_iter().enumerate() {
+        let candidates = search::prune(candidates, settings)?;
         for state in search.take_states(position) {
-            search.extend(position, &state, candidates)?;
+            search.extend(position, &state, &candidates)?;
         }
     }
     search.finish()

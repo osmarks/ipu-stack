@@ -5,6 +5,39 @@ use crate::planner::tests::gelu;
 use ipu_target::Target;
 
 #[test]
+#[ignore = "large catalogue measurement; run explicitly in release mode"]
+fn report_mlp_boundary_diversity() {
+    for (k, n) in [(1152, 4304), (4304, 1152)] {
+        let precision = Precision::F8F143 { scale_exponent: -2 };
+        let input = |shape| TensorType::new(shape, precision, Layout::row_sharded(1));
+        let a = input(vec![1, 729, k]);
+        let b = input(vec![1, k, n]);
+        let assignments = choices(
+            [&a, &b],
+            &TensorShape(vec![1, 729, n]),
+            GemmOptions::default(),
+            1472,
+        )
+        .unwrap();
+        let mut boundaries = std::collections::HashSet::<_, foldhash::fast::FixedState>::default();
+        for c in &assignments {
+            let operands = if c.swapped {
+                [c.operands[1].clone(), c.operands[0].clone()]
+            } else {
+                c.operands.clone()
+            };
+            let output = c.reduction.as_ref().unwrap_or(&c.result.format.layout);
+            boundaries.insert((operands, output.clone()));
+        }
+        eprintln!(
+            "MLP 729x{k}x{n}: {} assignments, {} distinct boundaries",
+            assignments.len(),
+            boundaries.len()
+        );
+    }
+}
+
+#[test]
 fn grid_enumeration_preserves_every_feasible_local_geometry() {
     let mut rng = fastrand::Rng::with_seed(0x6772_6964);
     for _ in 0..128 {
