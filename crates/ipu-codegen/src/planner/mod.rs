@@ -86,9 +86,7 @@ pub(crate) fn plan(
     let catalogue = candidates::catalogue(graph, layouts, settings)?;
     for (position, candidates) in catalogue.iter().enumerate() {
         for state in search.take_states(position) {
-            for candidate in candidates {
-                search.extend(position, &state, candidate)?;
-            }
+            search.extend(position, &state, candidates)?;
         }
     }
     search.finish()

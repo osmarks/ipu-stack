@@ -70,7 +70,7 @@ pub enum PackingPolicy {
 
 /// Map output coordinates back to the source: first add the window offsets,
 /// then apply the optional factor-axis view. Layout/storage order is separate.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CoordinateMapping {
     pub offsets: Vec<u32>,
     pub view: Option<AxisFactorView>,

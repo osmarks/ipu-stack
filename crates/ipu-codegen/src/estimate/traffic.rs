@@ -138,7 +138,8 @@ pub(crate) fn conversion_traffic(
         return None;
     }
     let groups = |value: &MidValue, offsets: &[u32]| {
-        let mut groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+        let mut groups =
+            HashMap::<Vec<(u32, u32)>, Vec<u16>, foldhash::fast::FixedState>::default();
         for (tile, mut extents) in
             layout_extents(&value.tensor_type.shape, &value.tensor_type.format.layout)?
         {
@@ -176,8 +177,12 @@ pub(crate) fn conversion_traffic(
                     })
                 })
         });
-    let mut remote = HashMap::<(u16, Vec<(u32, u32)>), (u64, Vec<u16>, bool)>::new();
-    let mut local = HashMap::<u16, [u64; 4]>::new();
+    let mut remote = HashMap::<
+        (u16, Vec<(u32, u32)>),
+        (u64, Vec<u16>, bool),
+        foldhash::fast::FixedState,
+    >::default();
+    let mut local = HashMap::<u16, [u64; 4], foldhash::fast::FixedState>::default();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
         let mut intersections = Vec::with_capacity(source_groups.len());

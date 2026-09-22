@@ -37,6 +37,51 @@ pub(super) fn copy_graph(input: TensorType, output: TensorType, tiles: u16) -> c
 }
 
 #[test]
+fn cached_copy_prices_match_uncached_geometry_variants() {
+    let mut rng = fastrand::Rng::with_seed(0xcac4_e5);
+    let mut cache = CopyCosts::default();
+    for _ in 0..64 {
+        let shape = [rng.u32(4..=12), rng.u32(1..=8) * 8];
+        let base = copy_graph(
+            TensorType::new(shape, Precision::F16, Layout::row_sharded(rng.u16(1..=4))),
+            TensorType::new(shape, Precision::F16, Layout::row_sharded(rng.u16(1..=4))),
+            8,
+        );
+        for variant in [0, 1, 2, 3, 4, 5, 0] {
+            let mut graph = base.clone();
+            let MidOperationKind::Copy {
+                mapping,
+                policy,
+                packing,
+            } = &mut graph.operations[0].kind
+            else {
+                unreachable!()
+            };
+            match variant {
+                1 => graph.values[0].owners = crate::OwnerMap::rotated(1),
+                2 => graph.values[1].owners = crate::OwnerMap::rotated(1),
+                3 => mapping.offsets = vec![1, 0],
+                4 => *policy = crate::CopyPolicy::StageLogicalThenTransform,
+                5 => *packing = crate::PackingPolicy::Direct,
+                _ => {}
+            }
+            let expected =
+                operation_cost(Target::Ipu21, &graph.operations[0], &graph.values, 8).unwrap();
+            let (actual, memory) =
+                analyze_observed(Target::Ipu21, &graph, &BTreeMap::new(), &mut (), &mut cache)
+                    .unwrap();
+            assert_eq!(actual, expected.0);
+            assert_eq!(
+                memory,
+                analyze_mid(Target::Ipu21, &graph, &BTreeMap::new())
+                    .unwrap()
+                    .1
+            );
+        }
+    }
+}
+
+#[test]
 fn randomized_copy_traffic_matches_scalar_ownership_and_crops() {
     use crate::{CoordinateMapping, TensorTiling};
     let mut rng = fastrand::Rng::with_seed(0xc09f_ee21);

@@ -7,6 +7,21 @@ use ipu_target::Target;
 
 use crate::MidGraph;
 
+/// Copy prices depend on geometry, not value IDs or path history. Search owns
+/// this cache for one boundary; liveness and allocation accounting are not cached.
+pub(crate) type CopyCosts = std::collections::HashMap<
+    (
+        Target,
+        u16,
+        [(crate::TensorType, crate::OwnerMap); 2],
+        crate::CoordinateMapping,
+        crate::CopyPolicy,
+        crate::PackingPolicy,
+    ),
+    Option<(ProgramCycles, MemoryUsage, u64)>,
+    foldhash::fast::FixedState,
+>;
+
 /// Price complete replacement sequences with the same overflow and missing-cost rules.
 pub(crate) fn operation_cycles<'a>(
     target: Target,
@@ -25,7 +40,7 @@ pub(crate) fn analyze(
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    analyze_observed(target, program, copies, &mut ())
+    analyze_observed(target, program, copies, &mut (), &mut CopyCosts::default())
 }
 
 /// The normal estimator uses the zero-cost observer. Diagnostics record the
@@ -66,8 +81,9 @@ pub(crate) fn analyze_observed(
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
+    costs: &mut CopyCosts,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    analyze_storage::<true, _>(target, program, copies, observer)
+    analyze_storage::<true, _>(target, program, copies, observer, costs)
 }
 
 /// A fitting upper bound needs no refinement. Every failed capacity screen is
@@ -77,7 +93,13 @@ pub(crate) fn analyze_with_budget(
     copies: &BTreeMap<MidValueId, u32>,
     config: &crate::PipelineConfig,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let bound = analyze_storage::<false, _>(config.target, program, copies, &mut ())?;
+    let bound = analyze_storage::<false, _>(
+        config.target,
+        program,
+        copies,
+        &mut (),
+        &mut CopyCosts::default(),
+    )?;
     if bound.1.fits_with_budget(
         config.target,
         config.standard_memory_reservation_bytes,
@@ -94,6 +116,7 @@ fn analyze_storage<const PER_TILE: bool, O: MemoryObserver>(
     program: &MidGraph,
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut O,
+    costs: &mut CopyCosts,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
     let mut steps = Vec::new();
     fn flatten<'a>(
@@ -336,8 +359,32 @@ fn analyze_storage<const PER_TILE: bool, O: MemoryObserver>(
         for value in operation.inputs.iter().chain(&operation.results) {
             live[roots[value.index() as usize]] = true;
         }
-        let (price, scratch, row_bytes) =
-            operation_cost(target, operation, &program.values, program.tile_count)?;
+        let (price, scratch, row_bytes) = if let MidOperationKind::Copy {
+            mapping,
+            policy,
+            packing,
+        } = &operation.kind
+            && operation.output_windows.is_empty()
+        {
+            let tensors = [operation.inputs[0], operation.results[0]].map(|id| {
+                let value = &program.values[id.index() as usize];
+                (value.tensor_type.clone(), value.owners.clone())
+            });
+            *costs
+                .entry((
+                    target,
+                    program.tile_count,
+                    tensors,
+                    mapping.clone(),
+                    *policy,
+                    *packing,
+                ))
+                .or_insert_with(|| {
+                    operation_cost(target, operation, &program.values, program.tile_count)
+                })
+        } else {
+            operation_cost(target, operation, &program.values, program.tile_count)
+        }?;
         tracing::debug!(index, source = ?operation.source, count,
             cycles = price.total, exchange = price.exchange,
             "estimated mid operation");

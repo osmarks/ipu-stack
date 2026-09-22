@@ -148,6 +148,7 @@ pub(super) struct Search<'a> {
     /// Unconstrained parameter -> first consumer boundary. Defaults are ranking
     /// reservations until this boundary, not hard per-tile capacity charges.
     first_use: BTreeMap<ValueId, usize>,
+    copy_costs: crate::estimate::CopyCosts,
 }
 
 impl<'a> Search<'a> {
@@ -243,6 +244,7 @@ impl<'a> Search<'a> {
             &initial.graph,
             &BTreeMap::new(),
             &mut memory,
+            &mut crate::estimate::CopyCosts::default(),
         )
         .ok_or(PlanningError::InvalidFragment("initial storage"))?;
         initial.graph.peak_memory = peak;
@@ -265,6 +267,7 @@ impl<'a> Search<'a> {
             states,
             initial,
             first_use,
+            copy_costs: crate::estimate::CopyCosts::default(),
         })
     }
 
@@ -276,6 +279,7 @@ impl<'a> Search<'a> {
     }
 
     pub fn take_states(&mut self, position: usize) -> Vec<State> {
+        self.copy_costs.clear();
         let mut states = std::mem::take(&mut self.states[position])
             .into_iter()
             .filter(|(_, paths)| !paths.is_empty())
@@ -298,27 +302,51 @@ impl<'a> Search<'a> {
         &mut self,
         position: usize,
         state: &State,
-        implementation: &Candidate,
+        implementations: &[Candidate],
     ) -> PlanningResult<()> {
-        for candidate in connect(
-            self.high,
-            position,
-            &state.live,
-            implementation,
-            &self.selectable_parameters(position),
-            self.settings,
-        )? {
-            self.record(position, state, candidate)?;
+        let selectable = self.selectable_parameters(position);
+        let mut edges =
+            HashMap::<_, Vec<(Candidate, Memory)>, foldhash::fast::FixedState>::default();
+        for implementation in implementations {
+            for candidate in connect(
+                self.high,
+                position,
+                &state.live,
+                implementation,
+                &selectable,
+                self.settings,
+            )? {
+                let (candidate, live, memory) = self.evaluate(position, candidate)?;
+                // This comparison includes conversions, residual liveness and
+                // the chosen parameter homes. Componentwise memory dominance
+                // survives merging with every history of this incoming state.
+                let frontier = edges.entry((candidate.end, live)).or_default();
+                if frontier.iter().any(|(old, usage)| {
+                    old.graph.estimated_cycles <= candidate.graph.estimated_cycles
+                        && usage.dominates(&memory)
+                }) {
+                    continue;
+                }
+                frontier.retain(|(old, usage)| {
+                    !(candidate.graph.estimated_cycles <= old.graph.estimated_cycles
+                        && memory.dominates(usage))
+                });
+                frontier.push((candidate, memory));
+            }
+        }
+        for ((_, live), frontier) in edges {
+            for (candidate, memory) in frontier {
+                self.record(position, state, candidate, live.clone(), memory)?;
+            }
         }
         Ok(())
     }
 
-    fn record(
+    fn evaluate(
         &mut self,
         position: usize,
-        state: &State,
         mut candidate: Candidate,
-    ) -> PlanningResult<()> {
+    ) -> PlanningResult<(Candidate, LiveValues, Memory)> {
         if candidate.end <= position || candidate.end > self.high.operations().len() {
             return Err(PlanningError::InvalidFragment(
                 "edge does not advance within graph",
@@ -362,11 +390,23 @@ impl<'a> Search<'a> {
             &candidate.graph,
             &BTreeMap::new(),
             &mut local,
+            &mut self.copy_costs,
         )
         .ok_or(PlanningError::InvalidFragment("uncostable mid fragment"))?;
         candidate.graph.estimated_cycles = cycles.total;
         candidate.graph.estimated_exchange_cycles = cycles.exchange;
         candidate.graph.peak_memory = peak;
+        Ok((candidate, live, local))
+    }
+
+    fn record(
+        &mut self,
+        position: usize,
+        state: &State,
+        candidate: Candidate,
+        live: LiveValues,
+        local: Memory,
+    ) -> PlanningResult<()> {
         let end = candidate.end;
         let candidate = Rc::new(candidate);
         let paths = self.states[end].entry(live).or_default();

@@ -4,7 +4,7 @@ pub mod c600;
 pub mod ipu21;
 
 /// Architecture selected for compilation. Board tile inventory is separate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     Ipu21,
 }

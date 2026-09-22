@@ -236,7 +236,13 @@ fn profile(
         }
     }
     let mut timeline = Timeline::default();
-    let (_, peak) = mid::analyze_observed(config.target, &program, copies, &mut timeline)?;
+    let (_, peak) = mid::analyze_observed(
+        config.target,
+        &program,
+        copies,
+        &mut timeline,
+        &mut mid::CopyCosts::default(),
+    )?;
     let names = names(graph);
     for value in &mut timeline.values {
         (value.name, value.group) = names.get(&value.origin).cloned().unwrap_or_else(|| {
@@ -373,7 +379,14 @@ mod tests {
         )
         .unwrap();
         let mut timeline = Timeline::default();
-        mid::analyze_observed(Target::Ipu21, &program, &BTreeMap::new(), &mut timeline).unwrap();
+        mid::analyze_observed(
+            Target::Ipu21,
+            &program,
+            &BTreeMap::new(),
+            &mut timeline,
+            &mut mid::CopyCosts::default(),
+        )
+        .unwrap();
         let parameter = program
             .inputs
             .iter()

@@ -17,7 +17,7 @@ mod mid;
 pub(crate) use mid::operation_cost;
 mod program;
 pub(crate) use mid::{
-    MemoryObserver, analyze as analyze_mid, analyze_observed, analyze_with_budget,
+    CopyCosts, MemoryObserver, analyze as analyze_mid, analyze_observed, analyze_with_budget,
     operation_cycles, region_program,
 };
 #[cfg(test)]

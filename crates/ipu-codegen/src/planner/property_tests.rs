@@ -302,9 +302,7 @@ fn explore<'a>(
             if reverse {
                 alternatives.reverse();
             }
-            for candidate in alternatives {
-                search.record(position, &state, candidate)?;
-            }
+            search.extend(position, &state, &alternatives)?;
         }
     }
     Ok(search)
